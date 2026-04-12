@@ -1,35 +1,35 @@
 mod autosell;
 mod config;
 mod consensus;
+mod filter;
 mod grpc;
 mod groups;
 mod processor;
+mod scanner;
 mod telegram;
 mod tx;
 mod utils;
 
 use anyhow::Result;
-use dashmap::DashMap;
 use solana_client::rpc_client::RpcClient;
 use solana_sdk::pubkey::Pubkey;
 use spl_associated_token_account::get_associated_token_address;
 use std::str::FromStr;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::{mpsc, Semaphore};
-use tracing::{debug, error, info, warn};
+use tracing::{error, info, warn};
 
-use autosell::{AutoSellManager, Position, SellAccountSnapshot, SellReason, SellSignal};
+use autosell::{AutoSellManager, Position, SellAccountSnapshot, SellSignal};
 use config::AppConfig;
-use consensus::engine::{BuySignal, ConsensusTrigger};
-use consensus::ConsensusEngine;
-use grpc::{AccountSubscriber, AccountUpdate, AtaBalanceCache, BondingCurveCache, GrpcSubscriber};
-use groups::{CopyGroup, GroupManager};
+use filter::BuySignal as SniperBuySignal;
+use grpc::{AccountSubscriber, AccountUpdate, AtaBalanceCache, BondingCurveCache};
+use groups::CopyGroup;
 use processor::prefetch::PrefetchCache;
 use processor::pumpfun::PumpfunProcessor;
-use processor::DetectedTrade;
-use telegram::{TgBot, TgEvent, TgNotifier, TgStats};
+use scanner::ScannerEvent;
+use telegram::{TgEvent, TgNotifier, TgStats};
 use tx::{
     blockhash,
     builder::TxBuilder,
@@ -38,9 +38,6 @@ use tx::{
     sender::TxSender,
 };
 use utils::sol_price::SolUsdPrice;
-
-type SignatureCache = Arc<DashMap<String, Instant>>;
-type GroupMintDedup = Arc<DashMap<String, Instant>>;
 
 const BLOCKHASH_REFRESH_MS: u64 = 120;
 const PREFETCH_WAIT_MS: u64 = 8;
@@ -68,19 +65,19 @@ async fn main() -> Result<()> {
     init_logging();
 
     info!("==============================================");
-    info!("   Solana 跟单交易系统 v1.6.19");
-    info!("   RabbitStream pre-exec + Group Copy Trading");
+    info!("   Solana Pump.fun 扫链狙击系统 v1.6.20");
+    info!("   Yellowstone Scanner + 四层过滤 + 现有执行层");
     info!("==============================================");
 
-    let config = AppConfig::from_env()?;
-    let group_manager = GroupManager::load_or_default(&config);
-    let target_wallets = group_manager.all_target_wallets();
+    let config = Arc::new(AppConfig::from_env()?);
+    let sniper_group = CopyGroup::from_app_config(config.as_ref());
 
     info!("交易钱包: {}", config.pubkey);
     info!(
-        "组合数: {} | 目标钱包数: {}",
-        group_manager.all_groups().len(),
-        target_wallets.len(),
+        "扫链节点: {} | SmartMoney 阈值: {} | 打分阈值: {}",
+        config.scanner_grpc_url,
+        config.smart_money_threshold,
+        config.filter_min_score,
     );
 
     let rpc_client = Arc::new(RpcClient::new_with_commitment(
@@ -92,7 +89,7 @@ async fn main() -> Result<()> {
     info!("SOL balance: {:.4}", balance as f64 / 1e9);
 
     let blockhash_cache = blockhash::init_blockhash_cache(&rpc_client).await?;
-    let _bh_task = blockhash_cache.start_refresh_task(
+    let _blockhash_task = blockhash_cache.start_refresh_task(
         rpc_client.clone(),
         Duration::from_millis(BLOCKHASH_REFRESH_MS),
     );
@@ -115,18 +112,14 @@ async fn main() -> Result<()> {
     ));
     let buy_exec_limiter = Arc::new(Semaphore::new(BUY_EXECUTOR_PARALLELISM));
     let pumpfun = Arc::new(PumpfunProcessor::new(rpc_client.clone()));
-    let consensus_engine = Arc::new(ConsensusEngine::new());
-    let _cleanup_task = consensus_engine.start_cleanup_task();
-
     let auto_sell_manager = Arc::new(AutoSellManager::new(
-        config.clone(),
+        config.as_ref().clone(),
         bc_cache.clone(),
         rpc_client.clone(),
         sol_usd.clone(),
     ));
-
-    let is_running = Arc::new(AtomicBool::new(false));
     let tg_stats = Arc::new(TgStats::new());
+    let tg_notifier = TgNotifier::noop();
 
     let account_subscriber = Arc::new(AccountSubscriber::new(
         config.grpc_account_url.clone(),
@@ -135,23 +128,13 @@ async fn main() -> Result<()> {
         ata_cache.clone(),
     ));
 
-    let sig_cache: SignatureCache = Arc::new(DashMap::new());
-    let mint_dedup: GroupMintDedup = Arc::new(DashMap::new());
-
-    let (trade_tx, mut trade_rx) = mpsc::unbounded_channel::<DetectedTrade>();
-    let (consensus_tx, mut consensus_rx) = mpsc::unbounded_channel::<ConsensusTrigger>();
+    let (scanner_tx, scanner_rx) = mpsc::channel::<ScannerEvent>(4096);
+    let (buy_signal_tx, mut buy_signal_rx) = mpsc::channel::<SniperBuySignal>(256);
     let (sell_signal_tx, mut sell_signal_rx) = mpsc::unbounded_channel::<SellSignal>();
     let (account_update_tx, account_update_rx) = mpsc::unbounded_channel::<AccountUpdate>();
 
-    let (tg_event_tx, tg_event_rx) = mpsc::unbounded_channel::<telegram::TgEvent>();
-    let tg_notifier = if config.telegram_bot_token.is_some() && config.telegram_chat_id.is_some() {
-        TgNotifier::from_sender(tg_event_tx)
-    } else {
-        TgNotifier::noop()
-    };
-
     let sell_executor = Arc::new(SellExecutor::new(
-        config.clone(),
+        config.as_ref().clone(),
         rpc_client.clone(),
         pumpfun.clone(),
         tx_sender.clone(),
@@ -164,73 +147,27 @@ async fn main() -> Result<()> {
         tg_notifier.clone(),
     ));
 
-    if let Some(bot_token) = config.telegram_bot_token.clone() {
-        if let Some(chat_id) = config.telegram_chat_id.clone() {
-            let tg_bot = TgBot::from_parts(
-                config.clone(),
-                group_manager.clone(),
-                auto_sell_manager.clone(),
-                consensus_engine.clone(),
-                sell_signal_tx.clone(),
-                sell_executor.clone(),
-                is_running.clone(),
-                tg_stats.clone(),
-                sol_usd.clone(),
-                tg_event_rx,
-            );
-            info!("Telegram bot enabled for chat {}", chat_id);
-            tokio::spawn(async move {
-                let _ = bot_token;
-                tg_bot.run().await;
-            });
-        }
-    }
-
     if config.auto_sell_enabled {
         let _grpc_monitor =
             auto_sell_manager.start_grpc_monitor(account_update_rx, sell_signal_tx.clone());
         let _fallback_monitor = auto_sell_manager.start_fallback_monitor(sell_signal_tx.clone());
     }
 
-    let sig_cache_clone = sig_cache.clone();
-    tokio::spawn(async move {
-        loop {
-            tokio::time::sleep(Duration::from_secs(5)).await;
-            sig_cache_clone.retain(|_, value| value.elapsed() < Duration::from_secs(10));
-        }
-    });
-
-    let prefetch_clone = prefetch_cache.clone();
+    let prefetch_cleanup = prefetch_cache.clone();
     tokio::spawn(async move {
         loop {
             tokio::time::sleep(Duration::from_secs(30)).await;
-            prefetch_clone.cleanup(300);
+            prefetch_cleanup.cleanup(300);
         }
     });
 
-    let grpc_sub = GrpcSubscriber::new(
-        config.grpc_url.clone(),
-        config.grpc_token.clone(),
-        target_wallets.clone(),
-    );
-    let trade_tx_clone = trade_tx.clone();
+    let account_subscriber_task = account_subscriber.clone();
+    let account_update_tx_task = account_update_tx.clone();
     tokio::spawn(async move {
         loop {
-            match grpc_sub.subscribe(trade_tx_clone.clone()).await {
-                Ok(()) => warn!("gRPC trade stream closed, reconnecting"),
-                Err(err) => error!("gRPC trade stream error: {}", err),
-            }
-            tokio::time::sleep(Duration::from_secs(2)).await;
-        }
-    });
-
-    let acct_sub_clone = account_subscriber.clone();
-    let acct_update_tx_clone = account_update_tx.clone();
-    tokio::spawn(async move {
-        loop {
-            match acct_sub_clone.subscribe(acct_update_tx_clone.clone()).await {
-                Ok(()) => warn!("gRPC account stream closed, reconnecting"),
-                Err(err) => error!("gRPC account stream error: {}", err),
+            match account_subscriber_task.subscribe(account_update_tx_task.clone()).await {
+                Ok(()) => warn!("账户订阅流关闭，准备重连"),
+                Err(err) => error!("账户订阅流异常: {}", err),
             }
             tokio::time::sleep(Duration::from_secs(2)).await;
         }
@@ -243,258 +180,107 @@ async fn main() -> Result<()> {
         }
     });
 
-    let exec_config = config.clone();
-    let exec_rpc = rpc_client.clone();
-    let exec_pumpfun = pumpfun.clone();
-    let exec_blockhash = blockhash_cache.clone();
-    let exec_tx_sender = tx_sender.clone();
-    let exec_sol_usd = sol_usd.clone();
-    let exec_auto_sell = auto_sell_manager.clone();
-    let exec_prefetch = prefetch_cache.clone();
-    let exec_bc_cache = bc_cache.clone();
-    let exec_ata_cache = ata_cache.clone();
-    let exec_acct_sub = account_subscriber.clone();
-    let exec_tg = tg_notifier.clone();
-    let exec_tg_stats = tg_stats.clone();
-    let exec_mint_dedup = mint_dedup.clone();
-    let exec_buy_limiter = buy_exec_limiter.clone();
-    let exec_group_manager = group_manager.clone();
+    let scanner_cfg = config.clone();
+    let scanner_tx_task = scanner_tx.clone();
     tokio::spawn(async move {
-        while let Some(trigger) = consensus_rx.recv().await {
-            let dedup_key = group_mint_key(&trigger.group_id, &trigger.token_mint);
-            if exec_mint_dedup.contains_key(&dedup_key) {
-                continue;
-            }
-            exec_mint_dedup.insert(dedup_key, Instant::now());
-
-            exec_tg.send(TgEvent::ConsensusReached {
-                group_name: trigger.group_name.clone(),
-                mint: trigger.token_mint,
-                wallets: trigger.wallets.clone(),
-            });
-
-            let Some(group) = exec_group_manager.get_group(&trigger.group_id) else {
-                warn!("Missing group for consensus trigger: {}", trigger.group_id);
-                continue;
-            };
-
-            let cfg = exec_config.clone();
-            let rpc = exec_rpc.clone();
-            let pf = exec_pumpfun.clone();
-            let bh = exec_blockhash.clone();
-            let sender = exec_tx_sender.clone();
-            let sol = exec_sol_usd.clone();
-            let auto_sell = exec_auto_sell.clone();
-            let prefetch = exec_prefetch.clone();
-            let bc = exec_bc_cache.clone();
-            let ata = exec_ata_cache.clone();
-            let acct_sub = exec_acct_sub.clone();
-            let tg = exec_tg.clone();
-            let stats = exec_tg_stats.clone();
-            let limiter = exec_buy_limiter.clone();
-            let trigger_mint = trigger.token_mint;
-            let trigger_wallets = trigger.wallets.clone();
-            let trigger_detected_at = trigger.triggered_at;
-            tokio::spawn(async move {
-                let _permit = limiter.acquire_owned().await.expect("buy semaphore closed");
-                execute_buy(
-                    &group,
-                    &trigger_mint,
-                    &trigger_wallets,
-                    trigger_detected_at,
-                    &[],
-                    &cfg,
-                    &rpc,
-                    &pf,
-                    &bh,
-                    &sender,
-                    &sol,
-                    &auto_sell,
-                    &prefetch,
-                    &bc,
-                    &ata,
-                    &acct_sub,
-                    &tg,
-                    &stats,
-                )
-                .await;
-            });
+        if let Err(err) = scanner::geyser::start(scanner_cfg, scanner_tx_task).await {
+            error!("扫链层退出: {}", err);
         }
     });
 
-    if is_running.load(Ordering::Relaxed) {
-        info!("Main loop active");
-    } else {
-        info!("Main loop idle, waiting for TG /start");
-    }
-
-    let shutdown_token = config.telegram_bot_token.clone();
-    let shutdown_chat = config.telegram_chat_id.clone();
+    let filter_cfg = config.clone();
+    let filter_rpc = rpc_client.clone();
     tokio::spawn(async move {
-        let ctrl_c = tokio::signal::ctrl_c();
-        #[cfg(unix)]
-        let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
-            .expect("failed to create SIGTERM handler");
-        #[cfg(unix)]
-        tokio::select! {
-            _ = ctrl_c => {},
-            _ = sigterm.recv() => {},
+        if let Err(err) = filter::run(filter_cfg, filter_rpc, scanner_rx, buy_signal_tx).await {
+            error!("过滤层退出: {}", err);
+        }
+    });
+
+    info!("主流程已启动，等待扫描事件与 BuySignal");
+
+    while let Some(signal) = buy_signal_rx.recv().await {
+        tg_stats.buy_attempts.fetch_add(1, Ordering::Relaxed);
+
+        let Ok(token_mint) = Pubkey::from_str(&signal.token.mint) else {
+            warn!("执行层：mint 无效，跳过 {}", signal.token.mint);
+            continue;
         };
-        #[cfg(not(unix))]
-        ctrl_c.await.ok();
 
-        if let (Some(token), Some(chat)) = (&shutdown_token, &shutdown_chat) {
-            telegram::send_shutdown_notification(token, chat).await;
-        }
-        std::process::exit(0);
-    });
-
-    while let Some(trade) = trade_rx.recv().await {
-        if !is_running.load(Ordering::Relaxed) {
-            continue;
-        }
-
-        tg_stats.grpc_events.fetch_add(1, Ordering::Relaxed);
-
-        if sig_cache.contains_key(&trade.signature) {
-            continue;
-        }
-        sig_cache.insert(trade.signature.clone(), Instant::now());
-
-        let matching_groups = group_manager.groups_for_wallet(&trade.source_wallet);
-        if matching_groups.is_empty() {
-            continue;
-        }
-
-        let token_info = extract_token_info(&trade);
-        if token_info.is_none() {
-            continue;
-        }
-        let (token_mint, token_program) = token_info.unwrap();
-
-        if group_manager.is_blocked(&token_mint) {
-            info!("Blocked mint skipped: {}", &token_mint.to_string()[..12]);
-            continue;
-        }
-
-        if !trade.is_buy {
-            for group in matching_groups {
-                consensus_engine.revoke_signal(&group.id, &token_mint, &trade.source_wallet);
-                if !group.follow_sell_mode() {
-                    continue;
-                }
-
-                if let Some(position) =
-                    auto_sell_manager.get_position_by_group_mint(&group.id, &token_mint)
-                {
-                    if position.can_sell() {
-                        let _ = sell_signal_tx.send(SellSignal {
-                            position_key: position.key(),
-                            group_name: group.name.clone(),
-                            reason: SellReason::FollowSell,
-                            current_price: position.current_price,
-                            pnl_percent: position.pnl_percent(),
-                        });
-                    }
-                }
-            }
-            continue;
-        }
+        info!(
+            "执行层：收到 BuySignal | mint={} | symbol={} | score={} | sm={} | sol={:.2} | latency={}ms",
+            signal.token.mint,
+            signal.token.symbol,
+            signal.score,
+            signal.sm_count,
+            signal.sm_sol_total,
+            signal.latency_ms,
+        );
 
         let prefetched = prefetch_cache.prefetch_token(
             &token_mint,
-            &token_program,
-            &trade.instruction_accounts,
-            &trade.source_wallet,
-            &config,
+            &signal.trigger_trade.token_program,
+            &signal.trigger_trade.instruction_accounts,
+            &signal.trigger_trade.buyer,
+            config.as_ref(),
         );
         account_subscriber.track_bonding_curve(token_mint, prefetched.bonding_curve);
         account_subscriber.track_ata(token_mint, prefetched.user_ata);
 
         if bc_cache.get(&token_mint).is_none() {
             let pf = pumpfun.clone();
-            let bc = prefetched.bonding_curve;
+            let bonding_curve = prefetched.bonding_curve;
             let mint_copy = token_mint;
             let bc_cache_copy = bc_cache.clone();
             tokio::spawn(async move {
-                if let Ok(state) = pf.prefetch_bonding_curve(&bc).await {
+                if let Ok(state) = pf.prefetch_bonding_curve(&bonding_curve).await {
                     bc_cache_copy.update(&mint_copy, state);
                 }
             });
         }
 
-        for group in matching_groups {
-            if group.min_target_buy_lamports() > 0
-                && trade.sol_amount_lamports > 0
-                && trade.sol_amount_lamports < group.min_target_buy_lamports()
-            {
-                continue;
-            }
+        let cfg = config.as_ref().clone();
+        let rpc = rpc_client.clone();
+        let pf = pumpfun.clone();
+        let bh = blockhash_cache.clone();
+        let sender = tx_sender.clone();
+        let sol = sol_usd.clone();
+        let auto_sell = auto_sell_manager.clone();
+        let prefetch = prefetch_cache.clone();
+        let bc = bc_cache.clone();
+        let ata = ata_cache.clone();
+        let acct_sub = account_subscriber.clone();
+        let tg = tg_notifier.clone();
+        let stats = tg_stats.clone();
+        let limiter = buy_exec_limiter.clone();
+        let group = sniper_group.clone();
+        let wallets = vec![signal.trigger_trade.buyer];
+        let target_instruction_data = signal.trigger_trade.instruction_data.clone();
+        let detected_at = signal.trigger_trade.detected_at;
 
-            if group.consensus_min_wallets <= 1 {
-                let dedup_key = group_mint_key(&group.id, &token_mint);
-                if mint_dedup.contains_key(&dedup_key) {
-                    continue;
-                }
-                mint_dedup.insert(dedup_key, Instant::now());
-
-                let cfg = config.clone();
-                let rpc = rpc_client.clone();
-                let pf = pumpfun.clone();
-                let bh = blockhash_cache.clone();
-                let sender = tx_sender.clone();
-                let sol = sol_usd.clone();
-                let auto_sell = auto_sell_manager.clone();
-                let prefetch = prefetch_cache.clone();
-                let bc = bc_cache.clone();
-                let ata = ata_cache.clone();
-                let acct_sub = account_subscriber.clone();
-                let tg = tg_notifier.clone();
-                let stats = tg_stats.clone();
-                let limiter = buy_exec_limiter.clone();
-                let trade_wallet = trade.source_wallet;
-                let target_instruction_data = trade.instruction_data.clone();
-                let group_clone = group.clone();
-                tokio::spawn(async move {
-                    let _permit = limiter.acquire_owned().await.expect("buy semaphore closed");
-                    execute_buy(
-                        &group_clone,
-                        &token_mint,
-                        &[trade_wallet],
-                        trade.detected_at,
-                        &target_instruction_data,
-                        &cfg,
-                        &rpc,
-                        &pf,
-                        &bh,
-                        &sender,
-                        &sol,
-                        &auto_sell,
-                        &prefetch,
-                        &bc,
-                        &ata,
-                        &acct_sub,
-                        &tg,
-                        &stats,
-                    )
-                    .await;
-                });
-            } else {
-                consensus_engine.submit_signal(
-                    BuySignal {
-                        group_id: group.id.clone(),
-                        group_name: group.name.clone(),
-                        token_mint,
-                        wallet: trade.source_wallet,
-                        detected_at: Instant::now(),
-                        signature: trade.signature.clone(),
-                        consensus_min_wallets: group.consensus_min_wallets,
-                        consensus_timeout_secs: group.consensus_timeout_secs,
-                    },
-                    &consensus_tx,
-                );
-            }
-        }
+        tokio::spawn(async move {
+            let _permit = limiter.acquire_owned().await.expect("buy semaphore closed");
+            execute_buy(
+                &group,
+                &token_mint,
+                &wallets,
+                detected_at,
+                &target_instruction_data,
+                &cfg,
+                &rpc,
+                &pf,
+                &bh,
+                &sender,
+                &sol,
+                &auto_sell,
+                &prefetch,
+                &bc,
+                &ata,
+                &acct_sub,
+                &tg,
+                &stats,
+            )
+            .await;
+        });
     }
 
     Ok(())
@@ -681,7 +467,6 @@ async fn execute_buy(
                                 &sig_str[..16.min(sig_str.len())],
                             );
 
-                            tg_stats.buy_attempts.fetch_add(1, Ordering::Relaxed);
                             tg.send(TgEvent::BuySubmitted {
                                 group_name: group.name.clone(),
                                 mint: *mint,
@@ -739,28 +524,6 @@ async fn execute_buy(
             warn!("Buy skipped [{}] {}: {}", group.name, &mint.to_string()[..12], err);
         }
     }
-}
-
-fn group_mint_key(group_id: &str, mint: &Pubkey) -> String {
-    format!("{}:{}", group_id, mint)
-}
-
-fn extract_token_info(trade: &DetectedTrade) -> Option<(Pubkey, Pubkey)> {
-    if let Some(mint) = trade.token_mint {
-        let token_program =
-            Pubkey::from_str("TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA").ok()?;
-        return Some((mint, token_program));
-    }
-
-    if trade.instruction_accounts.len() >= 9 {
-        let mint = trade.instruction_accounts[2];
-        let token_program = trade.instruction_accounts[8];
-        if !utils::ata::is_system_address(&mint) {
-            return Some((mint, token_program));
-        }
-    }
-
-    None
 }
 
 fn init_logging() {

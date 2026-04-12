@@ -21,6 +21,21 @@ pub struct AppConfig {
     /// 不设置时回退到 SHYFT_GRPC_URL / GRPC_ACCOUNT_URL；再退到旧的 GRPC_URL
     pub grpc_account_url: String,
     pub grpc_account_token: Option<String>,
+    /// Pump.fun 扫链专用 Yellowstone gRPC
+    pub scanner_grpc_url: String,
+    pub scanner_grpc_token: Option<String>,
+    /// 过滤层 Creator/地址画像查询
+    pub helius_api_key: Option<String>,
+    /// 过滤层本地状态
+    pub filter_db_path: String,
+    pub smart_money_file: String,
+    pub creator_blacklist_file: String,
+    pub filter_hot_reload_secs: u64,
+    pub smart_money_window_secs: u64,
+    pub smart_money_threshold: usize,
+    pub smart_money_max_buys: usize,
+    pub filter_min_score: u32,
+    pub scanner_idle_timeout_secs: u64,
 
     // Wallet
     pub keypair: std::sync::Arc<Keypair>,
@@ -86,14 +101,17 @@ impl AppConfig {
         let keypair = parse_keypair(&private_key_str)?;
         let pubkey = keypair.pubkey();
 
-        let target_wallets_str =
-            std::env::var("TARGET_WALLETS").context("TARGET_WALLETS not set")?;
-        let target_wallets: Vec<Pubkey> = target_wallets_str
-            .split(',')
-            .filter(|s| !s.trim().is_empty())
-            .map(|s| Pubkey::from_str(s.trim()))
-            .collect::<Result<Vec<_>, _>>()
-            .context("Invalid TARGET_WALLETS")?;
+        let target_wallets: Vec<Pubkey> = std::env::var("TARGET_WALLETS")
+            .ok()
+            .map(|raw| {
+                raw.split(',')
+                    .filter(|s| !s.trim().is_empty())
+                    .map(|s| Pubkey::from_str(s.trim()))
+                    .collect::<Result<Vec<_>, _>>()
+            })
+            .transpose()
+            .context("Invalid TARGET_WALLETS")?
+            .unwrap_or_default();
 
         Ok(Self {
             rpc_url: env_or("RPC_URL", "https://api.mainnet-beta.solana.com"),
@@ -107,6 +125,32 @@ impl AppConfig {
                 .unwrap_or_else(|| "https://grpc.triton.one".to_string()),
             grpc_account_token: first_env(&["GRPC_ACCOUNT_TOKEN", "SHYFT_GRPC_TOKEN"])
                 .or_else(|| first_env(&["GRPC_TOKEN", "RABBITSTREAM_TOKEN"])),
+            scanner_grpc_url: first_env(&[
+                "SCANNER_GRPC_URL",
+                "SHYFT_GRPC_URL",
+                "GRPC_ACCOUNT_URL",
+                "GRPC_URL",
+            ])
+            .unwrap_or_else(|| "https://grpc.triton.one".to_string()),
+            scanner_grpc_token: first_env(&[
+                "SCANNER_GRPC_TOKEN",
+                "SHYFT_GRPC_TOKEN",
+                "GRPC_ACCOUNT_TOKEN",
+                "GRPC_TOKEN",
+                "RABBITSTREAM_TOKEN",
+            ]),
+            helius_api_key: std::env::var("HELIUS_API_KEY")
+                .ok()
+                .filter(|s| !s.trim().is_empty()),
+            filter_db_path: env_or("FILTER_DB_PATH", "data/filter.sqlite3"),
+            smart_money_file: env_or("SMART_MONEY_FILE", "data/smart_money.txt"),
+            creator_blacklist_file: env_or("CREATOR_BLACKLIST_FILE", "data/creator_blacklist.txt"),
+            filter_hot_reload_secs: env_parse("FILTER_HOT_RELOAD_SECS", 300),
+            smart_money_window_secs: env_parse("SMART_MONEY_WINDOW_SECS", 60),
+            smart_money_threshold: env_parse("SMART_MONEY_THRESHOLD", 2),
+            smart_money_max_buys: env_parse("SMART_MONEY_MAX_BUYS", 20),
+            filter_min_score: env_parse("FILTER_MIN_SCORE", 60),
+            scanner_idle_timeout_secs: env_parse("SCANNER_IDLE_TIMEOUT_SECS", 30),
             keypair: std::sync::Arc::new(keypair),
             pubkey,
             target_wallets,
