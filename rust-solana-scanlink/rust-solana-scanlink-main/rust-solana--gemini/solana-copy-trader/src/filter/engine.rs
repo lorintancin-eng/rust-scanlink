@@ -34,7 +34,7 @@ const CURVE_INITIAL_VIRTUAL_SOL: u64 = 30_000_000_000;
 const OLD_WALLET_DAYS: u64 = 7;
 const HELIUS_PAGE_LIMIT: usize = 100;
 const HELIUS_MAX_PAGES: usize = 5;
-const FALLBACK_SM_THRESHOLD: usize = 3;
+const FALLBACK_SM_THRESHOLD: usize = 2;
 const DAY_MS: u64 = 24 * 60 * 60 * 1000;
 
 #[derive(Debug, Clone)]
@@ -977,10 +977,23 @@ fn gate3_reject_reason(
     stats: &WindowStats,
     config: &AppConfig,
 ) -> Option<String> {
-    if config.gate3_creator_self_buy_block && stats.creator_buy_count > 0 {
+    let creator_buy_share = if stats.total_eligible_sol > 0.0 {
+        stats.creator_buy_sol / stats.total_eligible_sol
+    } else {
+        0.0
+    };
+    if config.gate3_creator_self_buy_block
+        && stats.creator_buy_count > 0
+        && (stats.creator_buy_sol > config.gate3_creator_self_buy_max_sol
+            || creator_buy_share > config.gate3_creator_self_buy_max_share)
+    {
         return Some(format!(
-            "gate3 reject: creator self-buy detected | count={} | sol={:.2}",
-            stats.creator_buy_count, stats.creator_buy_sol,
+            "gate3 reject: creator self-buy detected | count={} | sol={:.2}/{:.2} | share={:.2}/{:.2}",
+            stats.creator_buy_count,
+            stats.creator_buy_sol,
+            config.gate3_creator_self_buy_max_sol,
+            creator_buy_share,
+            config.gate3_creator_self_buy_max_share,
         ));
     }
     if config.gate3_early_concentration_reject
@@ -1870,18 +1883,20 @@ mod tests {
             latency_metrics_file: String::new(),
             filter_hot_reload_secs: 0,
             smart_money_window_secs: 60,
-            smart_money_fast_window_ms: 800,
-            smart_money_soft_window_ms: 2_200,
-            gate3_hard_reject_ms: 2_500,
+            smart_money_fast_window_ms: 650,
+            smart_money_soft_window_ms: 1_500,
+            gate3_hard_reject_ms: 1_800,
             smart_money_fast_threshold: 2,
             smart_money_threshold: 2,
             smart_money_max_buys: 20,
-            gate3_fast_min_sol: 1.0,
-            gate3_soft_min_sol: 1.8,
-            gate3_max_single_buyer_share: 0.70,
+            gate3_fast_min_sol: 0.35,
+            gate3_soft_min_sol: 0.90,
+            gate3_max_single_buyer_share: 0.85,
             gate3_creator_self_buy_block: true,
+            gate3_creator_self_buy_max_sol: 0.20,
+            gate3_creator_self_buy_max_share: 0.25,
             gate3_early_concentration_reject: true,
-            gate3_early_concentration_min_buys: 6,
+            gate3_early_concentration_min_buys: 8,
             disable_smart_money_filter: false,
             filter_min_score: 60,
             scanner_idle_timeout_secs: 0,
@@ -2036,10 +2051,10 @@ mod tests {
         let stats = WindowStats {
             mode: SmartMoneyMode::EarlyBuyerFallback,
             fast_threshold: 2,
-            soft_threshold: 3,
+            soft_threshold: 2,
             unique_sm_wallets: ["creator".to_string()].into_iter().collect(),
-            sm_sol_total: 1.4,
-            total_eligible_sol: 1.4,
+            sm_sol_total: 0.50,
+            total_eligible_sol: 0.50,
             fastest_sm_ms: Some(30),
             fast_reached_at_ms: None,
             soft_reached_at_ms: None,
@@ -2048,11 +2063,61 @@ mod tests {
             max_single_buyer_share: 1.0,
             max_single_buyer: Some("creator".to_string()),
             creator_buy_count: 1,
-            creator_buy_sol: 1.4,
+            creator_buy_sol: 0.50,
             elapsed_ms: 100,
         };
         let reason = gate3_reject_reason(&candidate, &stats, &cfg).expect("creator self-buy reject");
         assert!(reason.contains("creator self-buy"));
+    }
+
+    #[test]
+    fn gate3_allows_small_creator_bootstrap_buy() {
+        let cfg = base_config();
+        let candidate = Candidate {
+            token: NewToken {
+                mint: "mint".to_string(),
+                name: "name".to_string(),
+                symbol: "sym".to_string(),
+                uri: String::new(),
+                creator: "creator".to_string(),
+                bonding_curve: String::new(),
+                signature: String::new(),
+                slot: 0,
+                discovered_at_ms: 0,
+                is_v2: true,
+            },
+            created_at: Instant::now(),
+            discovered_at_ms: 0,
+            status: CandidateStatus::Active,
+            narrative_keywords: Vec::new(),
+            early_buys: Vec::new(),
+            buy_signatures: HashSet::new(),
+            creator_profile: None,
+            buyer_profiles: HashMap::new(),
+            pending_buyer_profiles: HashSet::new(),
+            trace: CandidateTrace::default(),
+        };
+        let stats = WindowStats {
+            mode: SmartMoneyMode::EarlyBuyerFallback,
+            fast_threshold: 2,
+            soft_threshold: 2,
+            unique_sm_wallets: ["creator".to_string(), "other".to_string()]
+                .into_iter()
+                .collect(),
+            sm_sol_total: 0.60,
+            total_eligible_sol: 0.60,
+            fastest_sm_ms: Some(30),
+            fast_reached_at_ms: Some(300),
+            soft_reached_at_ms: Some(300),
+            buy_count: 2,
+            eligible_buyers: 2,
+            max_single_buyer_share: 0.66,
+            max_single_buyer: Some("other".to_string()),
+            creator_buy_count: 1,
+            creator_buy_sol: 0.10,
+            elapsed_ms: 300,
+        };
+        assert!(gate3_reject_reason(&candidate, &stats, &cfg).is_none());
     }
 
     #[test]
