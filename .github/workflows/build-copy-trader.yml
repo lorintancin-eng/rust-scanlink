@@ -1,0 +1,38 @@
+name: Build Copy Trader
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+jobs:
+  build-linux:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: rust-solana-scanlink/rust-solana-scanlink-main/rust-solana--gemini/solana-copy-trader
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install build dependencies
+        run: sudo apt-get update && sudo apt-get install -y pkg-config libssl-dev
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo artifacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: rust-solana-scanlink/rust-solana-scanlink-main/rust-solana--gemini/solana-copy-trader
+
+      - name: Build release binary
+        run: cargo build --release --bin copy-trader
+
+      - name: Upload Linux artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: copy-trader-linux
+          path: rust-solana-scanlink/rust-solana-scanlink-main/rust-solana--gemini/solana-copy-trader/target/release/copy-trader
+          if-no-files-found: error
