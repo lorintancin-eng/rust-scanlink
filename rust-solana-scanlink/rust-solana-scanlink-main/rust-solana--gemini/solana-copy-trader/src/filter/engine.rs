@@ -4,13 +4,14 @@ use crate::processor::pumpfun::BondingCurveState;
 use crate::scanner::{NewToken, PumpBuyEvent, ScannerEvent, DISC_CREATE, DISC_CREATE_V2, PUMP_PROGRAM_ID};
 use anyhow::{Context, Result};
 use futures::stream::{self, StreamExt};
-use serde_json::Value;
+use serde_json::{json, Value};
 use solana_client::rpc_client::RpcClient;
 use solana_sdk::{commitment_config::CommitmentConfig, pubkey::Pubkey};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::str::FromStr;
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use tokio::io::AsyncWriteExt;
 use tokio::sync::{mpsc, RwLock};
 use tracing::{error, info, warn};
 
@@ -183,6 +184,23 @@ pub async fn run(
                             ).await;
                         }
                         if let Some(signal) = decision.signal {
+                            if let Err(err) = append_jsonl(
+        &shared.config.passed_tokens_file,
+        &json!({
+            "detected_at_ms": signal.token.discovered_at_ms,
+            "mint": &signal.token.mint,
+            "symbol": &signal.token.symbol,
+            "name": &signal.token.name,
+            "creator": &signal.token.creator,
+            "score": signal.score,
+            "sm_count": signal.sm_count,
+            "sm_sol_total": signal.sm_sol_total,
+            "latency_ms": signal.latency_ms,
+            "reason": &signal.reason,
+        }),
+                            ).await {
+                                warn!("passed_tokens append failed: {}", err);
+                            }
                             if buy_signal_tx.send(signal).await.is_err() {
                                 warn!("过滤层：执行层通道已关闭");
                                 break;
@@ -247,6 +265,23 @@ async fn handle_new_token(
 ) -> Result<()> {
     if candidates.contains_key(&token.mint) {
         return Ok(());
+    }
+    if let Err(err) = append_jsonl(
+        &shared.config.scanned_tokens_file,
+        &json!({
+            "detected_at_ms": token.discovered_at_ms,
+            "mint": &token.mint,
+            "symbol": &token.symbol,
+            "name": &token.name,
+            "creator": &token.creator,
+            "bonding_curve": &token.bonding_curve,
+            "signature": &token.signature,
+            "slot": token.slot,
+            "uri": &token.uri,
+            "is_v2": token.is_v2,
+        }),
+    ).await {
+        warn!("scanned_tokens append failed: {}", err);
     }
 
     let gate1 = gate1_check(shared, creator_window, &token).await;
@@ -797,6 +832,25 @@ async fn load_plaintext_set(path: &str) -> Result<Vec<String>> {
         .filter(|line| !line.is_empty() && !line.starts_with('#'))
         .map(ToOwned::to_owned)
         .collect())
+}
+
+async fn append_jsonl(path: &str, value: &Value) -> Result<()> {
+    let path_ref = std::path::Path::new(path);
+    if let Some(parent) = path_ref.parent() {
+        tokio::fs::create_dir_all(parent).await?;
+    }
+
+    let mut file = tokio::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path_ref)
+        .await
+        .with_context(|| format!("打开输出文件失败: {}", path_ref.display()))?;
+
+    let mut line = serde_json::to_vec(value)?;
+    line.push(b'\n');
+    file.write_all(&line).await?;
+    Ok(())
 }
 
 async fn record_filter_result(

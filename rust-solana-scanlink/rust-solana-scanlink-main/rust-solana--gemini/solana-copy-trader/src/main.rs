@@ -71,6 +71,15 @@ async fn main() -> Result<()> {
 
     let config = Arc::new(AppConfig::from_env()?);
     let sniper_group = CopyGroup::from_app_config(config.as_ref());
+    if config.execution_enabled {
+        info!("Mode: scanner + filter + execution");
+    } else {
+        info!(
+            "Mode: scanner + filter only | buy/sell disabled | scanned={} | passed={}",
+            config.scanned_tokens_file,
+            config.passed_tokens_file,
+        );
+    }
 
     info!("交易钱包: {}", config.pubkey);
     info!(
@@ -147,7 +156,7 @@ async fn main() -> Result<()> {
         tg_notifier.clone(),
     ));
 
-    if config.auto_sell_enabled {
+    if config.execution_enabled && config.auto_sell_enabled {
         let _grpc_monitor =
             auto_sell_manager.start_grpc_monitor(account_update_rx, sell_signal_tx.clone());
         let _fallback_monitor = auto_sell_manager.start_fallback_monitor(sell_signal_tx.clone());
@@ -161,7 +170,8 @@ async fn main() -> Result<()> {
         }
     });
 
-    let account_subscriber_task = account_subscriber.clone();
+    if config.execution_enabled && config.auto_sell_enabled {
+        let account_subscriber_task = account_subscriber.clone();
     let account_update_tx_task = account_update_tx.clone();
     tokio::spawn(async move {
         loop {
@@ -179,6 +189,7 @@ async fn main() -> Result<()> {
             sell_exec.handle_sell_signal(signal).await;
         }
     });
+    }
 
     let scanner_cfg = config.clone();
     let scanner_tx_task = scanner_tx.clone();
@@ -199,12 +210,25 @@ async fn main() -> Result<()> {
     info!("主流程已启动，等待扫描事件与 BuySignal");
 
     while let Some(signal) = buy_signal_rx.recv().await {
-        tg_stats.buy_attempts.fetch_add(1, Ordering::Relaxed);
-
         let Ok(token_mint) = Pubkey::from_str(&signal.token.mint) else {
             warn!("执行层：mint 无效，跳过 {}", signal.token.mint);
             continue;
         };
+
+        if !config.execution_enabled {
+            info!(
+                "Dry-run shortlist | mint={} | symbol={} | score={} | sm={} | sol={:.2} | reason={}",
+                signal.token.mint,
+                signal.token.symbol,
+                signal.score,
+                signal.sm_count,
+                signal.sm_sol_total,
+                signal.reason,
+            );
+            continue;
+        }
+
+        tg_stats.buy_attempts.fetch_add(1, Ordering::Relaxed);
 
         info!(
             "执行层：收到 BuySignal | mint={} | symbol={} | score={} | sm={} | sol={:.2} | latency={}ms",

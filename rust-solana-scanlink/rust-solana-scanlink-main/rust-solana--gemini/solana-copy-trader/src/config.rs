@@ -36,6 +36,12 @@ pub struct AppConfig {
     pub smart_money_max_buys: usize,
     pub filter_min_score: u32,
     pub scanner_idle_timeout_secs: u64,
+    /// 临时停用买入/卖出，只保留扫描和过滤
+    pub execution_enabled: bool,
+    /// 扫链层发现的新币清单
+    pub scanned_tokens_file: String,
+    /// 过滤通过后的候选代币清单
+    pub passed_tokens_file: String,
 
     // Wallet
     pub keypair: std::sync::Arc<Keypair>,
@@ -151,6 +157,9 @@ impl AppConfig {
             smart_money_max_buys: env_parse("SMART_MONEY_MAX_BUYS", 20),
             filter_min_score: env_parse("FILTER_MIN_SCORE", 60),
             scanner_idle_timeout_secs: env_parse("SCANNER_IDLE_TIMEOUT_SECS", 30),
+            execution_enabled: env_parse("EXECUTION_ENABLED", false),
+            scanned_tokens_file: env_or("SCANNED_TOKENS_FILE", "data/scanned_tokens.jsonl"),
+            passed_tokens_file: env_or("PASSED_TOKENS_FILE", "data/passed_tokens.jsonl"),
             keypair: std::sync::Arc::new(keypair),
             pubkey,
             target_wallets,
