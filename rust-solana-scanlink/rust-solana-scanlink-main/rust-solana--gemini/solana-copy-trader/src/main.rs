@@ -2,8 +2,8 @@ mod autosell;
 mod config;
 mod consensus;
 mod filter;
-mod grpc;
 mod groups;
+mod grpc;
 mod processor;
 mod scanner;
 mod telegram;
@@ -24,8 +24,8 @@ use tracing::{error, info, warn};
 use autosell::{AutoSellManager, Position, SellAccountSnapshot, SellSignal};
 use config::AppConfig;
 use filter::BuySignal as SniperBuySignal;
-use grpc::{AccountSubscriber, AccountUpdate, AtaBalanceCache, BondingCurveCache};
 use groups::CopyGroup;
+use grpc::{AccountSubscriber, AccountUpdate, AtaBalanceCache, BondingCurveCache};
 use processor::prefetch::PrefetchCache;
 use processor::pumpfun::PumpfunProcessor;
 use scanner::ScannerEvent;
@@ -34,6 +34,7 @@ use tx::{
     blockhash,
     builder::TxBuilder,
     confirm::{format_mcap_usd, format_price_gmgn, BuyConfirmer},
+    execution_router::ExecutionPlan,
     sell_executor::SellExecutor,
     sender::TxSender,
 };
@@ -65,28 +66,41 @@ async fn main() -> Result<()> {
     init_logging();
 
     info!("==============================================");
-    info!("   Solana Pump.fun Scanner System v{}", env!("CARGO_PKG_VERSION"));
+    info!(
+        "   Solana Pump.fun Scanner System v{}",
+        env!("CARGO_PKG_VERSION")
+    );
     info!("   Yellowstone Scanner + 四层过滤 + 现有执行层");
     info!("==============================================");
 
     let config = Arc::new(AppConfig::from_env()?);
+    let execution_plan = ExecutionPlan::from_config(config.as_ref());
     let sniper_group = CopyGroup::from_app_config(config.as_ref());
     if config.execution_enabled {
         info!("Mode: scanner + filter + execution");
     } else {
         info!(
             "Mode: scanner + filter only | buy/sell disabled | scanned={} | passed={}",
-            config.scanned_tokens_file,
-            config.passed_tokens_file,
+            config.scanned_tokens_file, config.passed_tokens_file,
         );
     }
 
     info!("交易钱包: {}", config.pubkey);
     info!(
         "扫链节点: {} | SmartMoney 阈值: {} | 打分阈值: {}",
-        config.scanner_grpc_url,
-        config.smart_money_threshold,
-        config.filter_min_score,
+        config.scanner_grpc_url, config.smart_money_threshold, config.filter_min_score,
+    );
+
+    info!("Execution plan: {}", execution_plan.summary());
+    info!(
+        "Gate3 windows: fast={}ms soft={}ms hard={}ms | fast_threshold={} | hotlists: wallets={} funders={} blocked={}",
+        config.smart_money_fast_window_ms,
+        config.smart_money_soft_window_ms,
+        config.smart_money_window_secs * 1000,
+        config.smart_money_fast_threshold,
+        config.smart_money_file,
+        config.smart_money_funder_file,
+        config.blocked_buyers_file,
     );
 
     let rpc_client = Arc::new(RpcClient::new_with_commitment(
@@ -172,23 +186,26 @@ async fn main() -> Result<()> {
 
     if config.execution_enabled && config.auto_sell_enabled {
         let account_subscriber_task = account_subscriber.clone();
-    let account_update_tx_task = account_update_tx.clone();
-    tokio::spawn(async move {
-        loop {
-            match account_subscriber_task.subscribe(account_update_tx_task.clone()).await {
-                Ok(()) => warn!("账户订阅流关闭，准备重连"),
-                Err(err) => error!("账户订阅流异常: {}", err),
+        let account_update_tx_task = account_update_tx.clone();
+        tokio::spawn(async move {
+            loop {
+                match account_subscriber_task
+                    .subscribe(account_update_tx_task.clone())
+                    .await
+                {
+                    Ok(()) => warn!("账户订阅流关闭，准备重连"),
+                    Err(err) => error!("账户订阅流异常: {}", err),
+                }
+                tokio::time::sleep(Duration::from_secs(2)).await;
             }
-            tokio::time::sleep(Duration::from_secs(2)).await;
-        }
-    });
+        });
 
-    let sell_exec = sell_executor.clone();
-    tokio::spawn(async move {
-        while let Some(signal) = sell_signal_rx.recv().await {
-            sell_exec.handle_sell_signal(signal).await;
-        }
-    });
+        let sell_exec = sell_executor.clone();
+        tokio::spawn(async move {
+            while let Some(signal) = sell_signal_rx.recv().await {
+                sell_exec.handle_sell_signal(signal).await;
+            }
+        });
     }
 
     let scanner_cfg = config.clone();
@@ -217,12 +234,13 @@ async fn main() -> Result<()> {
 
         if !config.execution_enabled {
             info!(
-                "Dry-run shortlist | mint={} | symbol={} | score={} | sm={} | sol={:.2} | reason={}",
+                "Dry-run shortlist | mint={} | symbol={} | score={} | sm={} | sol={:.2} | plan={} | reason={}",
                 signal.token.mint,
                 signal.token.symbol,
                 signal.score,
                 signal.sm_count,
                 signal.sm_sol_total,
+                execution_plan.summary(),
                 signal.reason,
             );
             continue;
@@ -338,13 +356,16 @@ async fn execute_buy(
         ..Default::default()
     };
     let config = group.to_app_config(base_config);
+    let execution_plan = ExecutionPlan::from_config(&config);
 
     let prefetch_wait_start = Instant::now();
     let prefetched = match prefetch_cache.get(mint) {
         Some(prefetched) => Some(prefetched),
-        None => prefetch_cache
-            .get_or_wait(mint, Duration::from_millis(PREFETCH_WAIT_MS))
-            .await,
+        None => {
+            prefetch_cache
+                .get_or_wait(mint, Duration::from_millis(PREFETCH_WAIT_MS))
+                .await
+        }
     };
     timings.prefetch_wait = prefetch_wait_start.elapsed();
 
@@ -436,7 +457,7 @@ async fn execute_buy(
         Ok((mirror, _)) => {
             let (blockhash, _) = blockhash_cache.get_sync();
             let tx_build_start = Instant::now();
-            let tx_result = if !config.zero_slot_urls.is_empty() {
+            let tx_result = if execution_plan.prefers_zero_slot() {
                 let fee_account = tx_sender.random_0slot_tip_account();
                 TxBuilder::build_0slot_transaction(
                     &mirror,
@@ -447,7 +468,7 @@ async fn execute_buy(
                     group.tip_buy_lamports,
                     &[],
                 )
-            } else if config.jito_enabled {
+            } else if execution_plan.prefers_jito() {
                 let tip = tx_sender.random_jito_tip_account();
                 TxBuilder::build_jito_bundle_transaction(
                     &mirror,
@@ -474,7 +495,7 @@ async fn execute_buy(
                             let buy_usd = sol_usd.sol_to_usd(buy_sol);
 
                             info!(
-                                "Buy submitted: [{}] {} | {:.4} SOL (${:.2}) | est {:.0} tokens | price={} | mcap={} | queue={} | prefetch={} | quote_build={} | tx_build={} | send_call={} | total={} | sig={}",
+                                "Buy submitted: [{}] {} | {:.4} SOL (${:.2}) | est {:.0} tokens | price={} | mcap={} | route={} | queue={} | prefetch={} | quote_build={} | tx_build={} | send_call={} | total={} | sig={}",
                                 group.name,
                                 &mint.to_string()[..12],
                                 buy_sol,
@@ -482,6 +503,7 @@ async fn execute_buy(
                                 estimated_tokens_raw as f64 / 1e6,
                                 format_price_gmgn(entry_price_usd),
                                 format_mcap_usd(entry_mcap_usd),
+                                execution_plan.summary(),
                                 format_latency(timings.queue),
                                 format_latency(timings.prefetch_wait),
                                 format_latency(timings.quote_build),
@@ -503,10 +525,10 @@ async fn execute_buy(
                                 position.mark_confirming();
                                 auto_sell_manager.add_position(position.clone());
 
-                                let user_ata = prefetched
-                                    .as_ref()
-                                    .map(|pf| pf.user_ata)
-                                    .unwrap_or_else(|| get_associated_token_address(&config.pubkey, mint));
+                                let user_ata =
+                                    prefetched.as_ref().map(|pf| pf.user_ata).unwrap_or_else(
+                                        || get_associated_token_address(&config.pubkey, mint),
+                                    );
 
                                 BuyConfirmer::spawn_confirm_task(
                                     rpc_client.clone(),
@@ -528,7 +550,12 @@ async fn execute_buy(
                             }
                         }
                         Err(err) => {
-                            error!("Buy send failed [{}] {}: {}", group.name, &mint.to_string()[..12], err);
+                            error!(
+                                "Buy send failed [{}] {}: {}",
+                                group.name,
+                                &mint.to_string()[..12],
+                                err
+                            );
                             tg_stats.buy_failed.fetch_add(1, Ordering::Relaxed);
                             tg.send(TgEvent::BuyFailed {
                                 group_name: group.name.clone(),
@@ -539,13 +566,23 @@ async fn execute_buy(
                     }
                 }
                 Err(err) => {
-                    error!("Buy tx build failed [{}] {}: {}", group.name, &mint.to_string()[..12], err);
+                    error!(
+                        "Buy tx build failed [{}] {}: {}",
+                        group.name,
+                        &mint.to_string()[..12],
+                        err
+                    );
                     tg_stats.buy_failed.fetch_add(1, Ordering::Relaxed);
                 }
             }
         }
         Err(err) => {
-            warn!("Buy skipped [{}] {}: {}", group.name, &mint.to_string()[..12], err);
+            warn!(
+                "Buy skipped [{}] {}: {}",
+                group.name,
+                &mint.to_string()[..12],
+                err
+            );
         }
     }
 }
