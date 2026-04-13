@@ -43,6 +43,7 @@ pub struct AppConfig {
     pub disable_smart_money_filter: bool,
     pub filter_min_score: u32,
     pub scanner_idle_timeout_secs: u64,
+    pub creator_gate_timeout_ms: u64,
     pub creator_min_wallet_age_days: u64,
     pub creator_fresh_wallet_token_limit: u32,
     /// 临时停用买入/卖出，只保留扫描和过滤
@@ -176,6 +177,7 @@ impl AppConfig {
             disable_smart_money_filter: env_parse("DISABLE_SMART_MONEY_FILTER", false),
             filter_min_score: env_parse("FILTER_MIN_SCORE", 60),
             scanner_idle_timeout_secs: env_parse("SCANNER_IDLE_TIMEOUT_SECS", 30),
+            creator_gate_timeout_ms: env_parse("CREATOR_GATE_TIMEOUT_MS", 1_500),
             creator_min_wallet_age_days: env_parse("CREATOR_MIN_WALLET_AGE_DAYS", 1),
             creator_fresh_wallet_token_limit: env_parse("CREATOR_FRESH_WALLET_TOKEN_LIMIT", 2),
             execution_enabled: env_parse("EXECUTION_ENABLED", false),

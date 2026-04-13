@@ -154,6 +154,8 @@ struct WindowStats {
     unique_sm_wallets: HashSet<String>,
     sm_sol_total: f64,
     fastest_sm_ms: Option<u64>,
+    fast_reached_at_ms: Option<u64>,
+    soft_reached_at_ms: Option<u64>,
     buy_count: usize,
     eligible_buyers: usize,
     elapsed_ms: u64,
@@ -696,22 +698,115 @@ async fn creator_gate(shared: &SharedState, token: &NewToken) -> Result<CreatorG
         });
     };
 
-    let mints = fetch_creator_mints(shared, api_key, &token.creator).await?;
+    let timeout_ms = shared.config.creator_gate_timeout_ms.max(1);
+    match tokio::time::timeout(
+        Duration::from_millis(timeout_ms),
+        creator_gate_remote(shared, token, api_key, cached.clone()),
+    )
+    .await
+    {
+        Ok(result) => result,
+        Err(_) => Ok(creator_gate_timeout_fallback(
+            shared.config.as_ref(),
+            cached,
+            timeout_ms,
+        )),
+    }
+}
+
+async fn creator_gate_remote(
+    shared: &SharedState,
+    token: &NewToken,
+    api_key: &str,
+    cached: Option<CreatorProfile>,
+) -> Result<CreatorGateResult> {
     let stale_rug_count = cached.as_ref().map(|p| p.rug_count).unwrap_or_default();
-    let graduated = fetch_graduated_count(shared, &mints).await?;
-    let snapshot = fetch_address_snapshot(shared, api_key, &token.creator).await?;
-    let profile = CreatorProfile {
+    let (mints, snapshot) = tokio::try_join!(
+        fetch_creator_mints(shared, api_key, &token.creator),
+        fetch_address_snapshot(shared, api_key, &token.creator)
+    )?;
+
+    let total_tokens = mints.len() as u32;
+    let mut profile = CreatorProfile {
         address: token.creator.clone(),
-        total_tokens: mints.len() as u32,
-        graduated,
+        total_tokens,
+        graduated: 0,
         rug_count: stale_rug_count,
         oldest_tx_ms: snapshot.oldest_tx_ms,
         wallet_age_days: snapshot.wallet_age_days,
         first_funder: snapshot.first_funder,
         fetched_at_ms: now_ms(),
     };
+
+    if let Some(decision) = apply_creator_rules_without_graduated(shared.config.as_ref(), &profile) {
+        shared.db.upsert_creator_profile(&profile).await?;
+        return Ok(decision);
+    }
+
+    if needs_creator_graduated_count(shared.config.as_ref(), &profile) {
+        profile.graduated = fetch_graduated_count(shared, &mints).await?;
+    }
+
     shared.db.upsert_creator_profile(&profile).await?;
     Ok(apply_creator_rules(shared.config.as_ref(), profile))
+}
+
+fn creator_gate_timeout_fallback(
+    config: &AppConfig,
+    cached: Option<CreatorProfile>,
+    timeout_ms: u64,
+) -> CreatorGateResult {
+    if let Some(profile) = cached {
+        let mut result = apply_creator_rules(config, profile);
+        result.reason = format!("{} | gate2 cache fallback timeout={}ms", result.reason, timeout_ms);
+        return result;
+    }
+
+    CreatorGateResult {
+        passed: true,
+        reason: format!("gate2 soft-pass: timeout {}ms", timeout_ms),
+        profile: None,
+    }
+}
+
+fn apply_creator_rules_without_graduated(
+    config: &AppConfig,
+    profile: &CreatorProfile,
+) -> Option<CreatorGateResult> {
+    if profile.total_tokens > CREATOR_TOTAL_TOKEN_LIMIT {
+        return Some(CreatorGateResult {
+            passed: false,
+            reason: format!(
+                "gate2 reject: creator total launches too high ({})",
+                profile.total_tokens
+            ),
+            profile: Some(profile.clone()),
+        });
+    }
+    if profile.rug_count >= CREATOR_RUG_LIMIT {
+        return Some(CreatorGateResult {
+            passed: false,
+            reason: format!("gate2 reject: creator rug count {}", profile.rug_count),
+            profile: Some(profile.clone()),
+        });
+    }
+    if profile.wallet_age_days < config.creator_min_wallet_age_days as u32
+        && profile.total_tokens >= config.creator_fresh_wallet_token_limit
+    {
+        return Some(CreatorGateResult {
+            passed: false,
+            reason: format!(
+                "gate2 reject: fresh wallet age={}d launches={}",
+                profile.wallet_age_days, profile.total_tokens
+            ),
+            profile: Some(profile.clone()),
+        });
+    }
+    None
+}
+
+fn needs_creator_graduated_count(config: &AppConfig, profile: &CreatorProfile) -> bool {
+    profile.total_tokens >= config.creator_fresh_wallet_token_limit
 }
 
 fn apply_creator_rules(config: &AppConfig, profile: CreatorProfile) -> CreatorGateResult {
@@ -831,16 +926,18 @@ async fn should_finalize(candidate: &Candidate, shared: &SharedState) -> Option<
 }
 
 fn gate3_trigger_from_stats(config: &AppConfig, stats: &WindowStats) -> Option<Gate3Trigger> {
-    if stats.unique_sm_wallets.len() >= stats.fast_threshold
-        && stats.elapsed_ms <= effective_fast_window_ms(config)
+    if stats
+        .fast_reached_at_ms
+        .is_some_and(|elapsed| elapsed <= effective_fast_window_ms(config))
     {
         return Some(Gate3Trigger {
             path: Gate3Path::Fast,
             threshold: stats.fast_threshold,
         });
     }
-    if stats.unique_sm_wallets.len() >= stats.soft_threshold
-        && stats.elapsed_ms <= effective_soft_window_ms(config)
+    if stats
+        .soft_reached_at_ms
+        .is_some_and(|elapsed| elapsed <= effective_soft_window_ms(config))
     {
         return Some(Gate3Trigger {
             path: Gate3Path::Soft,
@@ -888,6 +985,8 @@ async fn smart_money_stats(candidate: &Candidate, shared: &SharedState) -> Windo
     let mut eligible_buyers = HashSet::new();
     let mut sm_sol_total = 0.0f64;
     let mut fastest_sm_ms: Option<u64> = None;
+    let mut fast_reached_at_ms: Option<u64> = None;
+    let mut soft_reached_at_ms: Option<u64> = None;
 
     for buy in &candidate.early_buys {
         let buyer = buy.buyer.to_string();
@@ -916,6 +1015,12 @@ async fn smart_money_stats(candidate: &Candidate, shared: &SharedState) -> Windo
             Some(current) => current.min(elapsed_ms),
             None => elapsed_ms,
         });
+        if fast_reached_at_ms.is_none() && unique_sm_wallets.len() >= fast_threshold {
+            fast_reached_at_ms = Some(elapsed_ms);
+        }
+        if soft_reached_at_ms.is_none() && unique_sm_wallets.len() >= soft_threshold {
+            soft_reached_at_ms = Some(elapsed_ms);
+        }
     }
 
     WindowStats {
@@ -925,6 +1030,8 @@ async fn smart_money_stats(candidate: &Candidate, shared: &SharedState) -> Windo
         unique_sm_wallets,
         sm_sol_total,
         fastest_sm_ms,
+        fast_reached_at_ms,
+        soft_reached_at_ms,
         buy_count: candidate.early_buys.len(),
         eligible_buyers: eligible_buyers.len(),
         elapsed_ms: candidate.created_at.elapsed().as_millis() as u64,
@@ -1665,8 +1772,10 @@ mod tests {
             smart_money_fast_threshold: 2,
             smart_money_threshold: 2,
             smart_money_max_buys: 20,
+            disable_smart_money_filter: false,
             filter_min_score: 60,
             scanner_idle_timeout_secs: 0,
+            creator_gate_timeout_ms: 1_500,
             creator_min_wallet_age_days: 1,
             creator_fresh_wallet_token_limit: 2,
             execution_enabled: false,
@@ -1713,6 +1822,8 @@ mod tests {
             unique_sm_wallets: ["a".to_string(), "b".to_string()].into_iter().collect(),
             sm_sol_total: 0.0,
             fastest_sm_ms: Some(100),
+            fast_reached_at_ms: Some(900),
+            soft_reached_at_ms: None,
             buy_count: 2,
             eligible_buyers: 2,
             elapsed_ms: 900,
@@ -1739,6 +1850,8 @@ mod tests {
             .collect(),
             sm_sol_total: 0.0,
             fastest_sm_ms: Some(100),
+            fast_reached_at_ms: Some(900),
+            soft_reached_at_ms: Some(2_500),
             buy_count: 4,
             eligible_buyers: 4,
             elapsed_ms: 2_500,
