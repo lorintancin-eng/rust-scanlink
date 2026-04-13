@@ -984,14 +984,16 @@ fn gate3_reject_reason(
     };
     if config.gate3_creator_self_buy_block
         && stats.creator_buy_count > 0
-        && (stats.creator_buy_sol > config.gate3_creator_self_buy_max_sol
-            || creator_buy_share > config.gate3_creator_self_buy_max_share)
+        && (stats.creator_buy_sol > config.gate3_creator_self_buy_hard_sol
+            || (stats.creator_buy_sol > config.gate3_creator_self_buy_max_sol
+                && creator_buy_share > config.gate3_creator_self_buy_max_share))
     {
         return Some(format!(
-            "gate3 reject: creator self-buy detected | count={} | sol={:.2}/{:.2} | share={:.2}/{:.2}",
+            "gate3 reject: creator self-buy detected | count={} | sol={:.2}/{:.2}/{:.2} | share={:.2}/{:.2}",
             stats.creator_buy_count,
             stats.creator_buy_sol,
             config.gate3_creator_self_buy_max_sol,
+            config.gate3_creator_self_buy_hard_sol,
             creator_buy_share,
             config.gate3_creator_self_buy_max_share,
         ));
@@ -1220,8 +1222,18 @@ async fn score_candidate(shared: &SharedState, mut candidate: Candidate) -> Scor
     let buyer_quality_score = (buyer_quality_pct * 15.0).round().clamp(0.0, 15.0) as u32;
     let total_score =
         sm_count_score + sm_sol_score + momentum_score + curve_score + buyer_quality_score;
+    let required_score = match trigger.path {
+        Gate3Path::Fast => shared
+            .config
+            .filter_fast_min_score
+            .min(shared.config.filter_min_score),
+        Gate3Path::Soft => shared
+            .config
+            .filter_soft_min_score
+            .min(shared.config.filter_min_score),
+    };
     let reason = format!(
-        "mode={} path={} participants={} capital={} momentum={} curve={} buyer_quality={} total={} | matched={} eligible={} sol={:.2} fastest={}ms narrative={}",
+        "mode={} path={} participants={} capital={} momentum={} curve={} buyer_quality={} total={} required={} | matched={} eligible={} sol={:.2} fastest={}ms narrative={}",
         smart_money_mode_label(stats.mode),
         gate3_path_label(trigger.path),
         sm_count_score,
@@ -1230,6 +1242,7 @@ async fn score_candidate(shared: &SharedState, mut candidate: Candidate) -> Scor
         curve_score,
         buyer_quality_score,
         total_score,
+        required_score,
         stats.unique_sm_wallets.len(),
         stats.eligible_buyers,
         stats.sm_sol_total,
@@ -1241,7 +1254,7 @@ async fn score_candidate(shared: &SharedState, mut candidate: Candidate) -> Scor
         }
     );
 
-    if total_score < shared.config.filter_min_score {
+    if total_score < required_score {
         return ScoreDecision {
             passed: false,
             gate: "gate4".to_string(),
@@ -1895,10 +1908,13 @@ mod tests {
             gate3_creator_self_buy_block: true,
             gate3_creator_self_buy_max_sol: 0.20,
             gate3_creator_self_buy_max_share: 0.25,
+            gate3_creator_self_buy_hard_sol: 2.00,
             gate3_early_concentration_reject: true,
             gate3_early_concentration_min_buys: 8,
             disable_smart_money_filter: false,
             filter_min_score: 60,
+            filter_fast_min_score: 48,
+            filter_soft_min_score: 58,
             scanner_idle_timeout_secs: 0,
             creator_gate_timeout_ms: 1_500,
             creator_min_wallet_age_days: 1,
@@ -2063,7 +2079,7 @@ mod tests {
             max_single_buyer_share: 1.0,
             max_single_buyer: Some("creator".to_string()),
             creator_buy_count: 1,
-            creator_buy_sol: 0.50,
+            creator_buy_sol: 3.00,
             elapsed_ms: 100,
         };
         let reason = gate3_reject_reason(&candidate, &stats, &cfg).expect("creator self-buy reject");
