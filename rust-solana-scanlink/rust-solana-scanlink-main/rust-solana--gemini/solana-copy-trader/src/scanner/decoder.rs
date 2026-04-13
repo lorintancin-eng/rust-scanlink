@@ -185,7 +185,7 @@ fn decode_new_token(
 
     let mint = indexed_account(account_indices, account_keys, 0)?;
     let bonding_curve = indexed_account(account_indices, account_keys, 2)?;
-    let creator = indexed_account(account_indices, account_keys, 7)?;
+    let creator = read_pubkey_string(payload, &mut offset)?;
 
     Some(NewToken {
         mint: mint.to_string(),
@@ -293,6 +293,16 @@ fn read_borsh_string(data: &[u8], offset: &mut usize) -> Option<String> {
     Some(String::from_utf8_lossy(&bytes).into_owned())
 }
 
+fn read_pubkey_string(data: &[u8], offset: &mut usize) -> Option<String> {
+    if *offset + 32 > data.len() {
+        return None;
+    }
+    let bytes: [u8; 32] = data[*offset..*offset + 32].try_into().ok()?;
+    *offset += 32;
+    Some(Pubkey::new_from_array(bytes).to_string())
+}
+
+
 fn now_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -322,8 +332,19 @@ mod tests {
     #[test]
     fn test_discriminator_const() {
         assert_eq!(DISC_CREATE[0], 0x18);
-        assert_eq!(DISC_CREATE_V2[0], 0x67);
+        assert_eq!(DISC_CREATE_V2[0], 214);
         assert_ne!(DISC_CREATE, DISC_CREATE_V2);
+    }
+
+    #[test]
+    fn test_read_pubkey_string() {
+        let expected = Pubkey::new_unique();
+        let mut off = 0;
+        assert_eq!(
+            read_pubkey_string(expected.as_ref(), &mut off),
+            Some(expected.to_string())
+        );
+        assert_eq!(off, 32);
     }
 }
 
