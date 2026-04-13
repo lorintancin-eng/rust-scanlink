@@ -288,11 +288,12 @@ pub async fn run(
                     }
                     let stats = smart_money_stats(candidate, &shared).await;
                     if let Some(reason) = gate3_reject_reason(candidate, &stats, &shared.config) {
+                        let path = gate3_reject_path(&reason).to_string();
                         expired.push((
                             mint.clone(),
                             reason,
                             smart_money_mode_label(stats.mode).to_string(),
-                            gate3_reject_path(&reason).to_string(),
+                            path,
                             stats.buy_count,
                             stats.unique_sm_wallets.len(),
                         ));
