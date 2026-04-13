@@ -808,6 +808,16 @@ fn smart_money_mode_label(mode: SmartMoneyMode) -> &'static str {
     }
 }
 
+fn smart_money_mode(config: &AppConfig, hotlists: &HotLists) -> SmartMoneyMode {
+    if config.disable_smart_money_filter {
+        SmartMoneyMode::EarlyBuyerFallback
+    } else if hotlists.smart_money.is_empty() && hotlists.smart_money_funders.is_empty() {
+        SmartMoneyMode::EarlyBuyerFallback
+    } else {
+        SmartMoneyMode::Hotlist
+    }
+}
+
 fn gate3_path_label(path: Gate3Path) -> &'static str {
     match path {
         Gate3Path::Fast => "fast",
@@ -871,11 +881,7 @@ fn gate3_reject_reason(
 
 async fn smart_money_stats(candidate: &Candidate, shared: &SharedState) -> WindowStats {
     let hotlists = shared.hotlists.read().await;
-    let mode = if hotlists.smart_money.is_empty() && hotlists.smart_money_funders.is_empty() {
-        SmartMoneyMode::EarlyBuyerFallback
-    } else {
-        SmartMoneyMode::Hotlist
-    };
+    let mode = smart_money_mode(shared.config.as_ref(), &hotlists);
     let fast_threshold = effective_fast_threshold(&shared.config, mode);
     let soft_threshold = effective_soft_threshold(&shared.config, mode);
     let mut unique_sm_wallets = HashSet::new();
@@ -1084,8 +1090,7 @@ async fn score_candidate(shared: &SharedState, mut candidate: Candidate) -> Scor
 
 async fn select_trigger_trade(candidate: &Candidate, shared: &SharedState) -> Option<PumpBuyEvent> {
     let hotlists = shared.hotlists.read().await;
-    let hotlist_mode =
-        !(hotlists.smart_money.is_empty() && hotlists.smart_money_funders.is_empty());
+    let hotlist_mode = smart_money_mode(shared.config.as_ref(), &hotlists) == SmartMoneyMode::Hotlist;
     if !hotlist_mode {
         return candidate
             .early_buys
@@ -1443,7 +1448,15 @@ async fn reload_hotlists(shared: &SharedState) -> Result<()> {
         smart_money_funders.len(),
         blocked_buyers.len(),
     );
-    if smart_money.is_empty() && smart_money_funders.is_empty() {
+    if shared.config.disable_smart_money_filter {
+        warn!(
+            "smart_money filter disabled, forcing early-buyer fallback | fast_threshold={} | soft_threshold={} | fast_window_ms={} | soft_window_ms={}",
+            effective_fast_threshold(&shared.config, SmartMoneyMode::EarlyBuyerFallback),
+            effective_soft_threshold(&shared.config, SmartMoneyMode::EarlyBuyerFallback),
+            effective_fast_window_ms(&shared.config),
+            effective_soft_window_ms(&shared.config),
+        );
+    } else if smart_money.is_empty() && smart_money_funders.is_empty() {
         warn!(
             "smart_money lists empty, enabling early-buyer fallback | fast_threshold={} | soft_threshold={} | fast_window_ms={} | soft_window_ms={}",
             effective_fast_threshold(&shared.config, SmartMoneyMode::EarlyBuyerFallback),

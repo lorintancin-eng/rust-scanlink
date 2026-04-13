@@ -93,11 +93,13 @@ async fn main() -> Result<()> {
 
     info!("Execution plan: {}", execution_plan.summary());
     info!(
-        "Gate3 windows: fast={}ms soft={}ms hard={}ms | fast_threshold={} | hotlists: wallets={} funders={} blocked={}",
+        "Gate3 windows: fast={}ms soft={}ms hard={}ms | fast_threshold={} | smart_money_disabled={} | helius={} | hotlists: wallets={} funders={} blocked={}",
         config.smart_money_fast_window_ms,
         config.smart_money_soft_window_ms,
         config.smart_money_window_secs * 1000,
         config.smart_money_fast_threshold,
+        config.disable_smart_money_filter,
+        config.helius_api_key.is_some(),
         config.smart_money_file,
         config.smart_money_funder_file,
         config.blocked_buyers_file,
