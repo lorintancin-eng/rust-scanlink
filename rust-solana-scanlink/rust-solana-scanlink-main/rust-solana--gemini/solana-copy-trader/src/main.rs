@@ -93,11 +93,15 @@ async fn main() -> Result<()> {
 
     info!("Execution plan: {}", execution_plan.summary());
     info!(
-        "Gate3 windows: fast={}ms soft={}ms hard={}ms | fast_threshold={} | smart_money_disabled={} | helius={} | creator_gate_timeout_ms={} | hotlists: wallets={} funders={} blocked={}",
+        "Gate3 windows: fast={}ms soft={}ms hard={}ms | thresholds: buyers_fast={} buyers_soft={} sol_fast={:.2} sol_soft={:.2} max_share={:.2} | smart_money_disabled={} | helius={} | creator_gate_timeout_ms={} | hotlists: wallets={} funders={} blocked={}",
         config.smart_money_fast_window_ms,
         config.smart_money_soft_window_ms,
-        config.smart_money_window_secs * 1000,
+        config.gate3_hard_reject_ms,
         config.smart_money_fast_threshold,
+        config.smart_money_threshold.max(3),
+        config.gate3_fast_min_sol,
+        config.gate3_soft_min_sol,
+        config.gate3_max_single_buyer_share,
         config.disable_smart_money_filter,
         config.helius_api_key.is_some(),
         config.creator_gate_timeout_ms,

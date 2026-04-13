@@ -34,7 +34,7 @@ const CURVE_INITIAL_VIRTUAL_SOL: u64 = 30_000_000_000;
 const OLD_WALLET_DAYS: u64 = 7;
 const HELIUS_PAGE_LIMIT: usize = 100;
 const HELIUS_MAX_PAGES: usize = 5;
-const FALLBACK_SM_THRESHOLD: usize = 4;
+const FALLBACK_SM_THRESHOLD: usize = 3;
 const DAY_MS: u64 = 24 * 60 * 60 * 1000;
 
 #[derive(Debug, Clone)]
@@ -153,11 +153,16 @@ struct WindowStats {
     soft_threshold: usize,
     unique_sm_wallets: HashSet<String>,
     sm_sol_total: f64,
+    total_eligible_sol: f64,
     fastest_sm_ms: Option<u64>,
     fast_reached_at_ms: Option<u64>,
     soft_reached_at_ms: Option<u64>,
     buy_count: usize,
     eligible_buyers: usize,
+    max_single_buyer_share: f64,
+    max_single_buyer: Option<String>,
+    creator_buy_count: usize,
+    creator_buy_sol: f64,
     elapsed_ms: u64,
 }
 
@@ -523,7 +528,7 @@ async fn handle_buy_event(
         .detected_at
         .duration_since(candidate.created_at)
         .as_millis() as u64
-        > hard_window_ms(&shared.config)
+        > effective_hard_reject_ms(&shared.config)
     {
         return;
     }
@@ -867,9 +872,7 @@ fn apply_creator_rules(config: &AppConfig, profile: CreatorProfile) -> CreatorGa
 fn effective_soft_threshold(config: &AppConfig, mode: SmartMoneyMode) -> usize {
     match mode {
         SmartMoneyMode::Hotlist => config.smart_money_threshold.max(1),
-        SmartMoneyMode::EarlyBuyerFallback => {
-            config.smart_money_threshold.max(FALLBACK_SM_THRESHOLD)
-        }
+        SmartMoneyMode::EarlyBuyerFallback => config.smart_money_threshold.max(FALLBACK_SM_THRESHOLD),
     }
 }
 
@@ -879,7 +882,7 @@ fn effective_fast_threshold(config: &AppConfig, mode: SmartMoneyMode) -> usize {
 }
 
 fn effective_soft_window_ms(config: &AppConfig) -> u64 {
-    let hard = hard_window_ms(config);
+    let hard = max_supported_window_ms(config);
     config
         .smart_money_soft_window_ms
         .max(config.smart_money_fast_window_ms)
@@ -892,8 +895,15 @@ fn effective_fast_window_ms(config: &AppConfig) -> u64 {
         .min(effective_soft_window_ms(config))
 }
 
-fn hard_window_ms(config: &AppConfig) -> u64 {
+fn max_supported_window_ms(config: &AppConfig) -> u64 {
     config.smart_money_window_secs.saturating_mul(1000)
+}
+
+fn effective_hard_reject_ms(config: &AppConfig) -> u64 {
+    config
+        .gate3_hard_reject_ms
+        .max(effective_soft_window_ms(config))
+        .min(max_supported_window_ms(config))
 }
 
 fn smart_money_mode_label(mode: SmartMoneyMode) -> &'static str {
@@ -922,22 +932,27 @@ fn gate3_path_label(path: Gate3Path) -> &'static str {
 
 async fn should_finalize(candidate: &Candidate, shared: &SharedState) -> Option<Gate3Trigger> {
     let stats = smart_money_stats(candidate, shared).await;
+    if gate3_reject_reason(candidate, &stats, shared.config.as_ref()).is_some() {
+        return None;
+    }
     gate3_trigger_from_stats(shared.config.as_ref(), &stats)
 }
 
 fn gate3_trigger_from_stats(config: &AppConfig, stats: &WindowStats) -> Option<Gate3Trigger> {
-    if stats
-        .fast_reached_at_ms
-        .is_some_and(|elapsed| elapsed <= effective_fast_window_ms(config))
+    if gate3_fast_ready(config, stats)
+        && stats
+            .fast_reached_at_ms
+            .is_some_and(|elapsed| elapsed <= effective_fast_window_ms(config))
     {
         return Some(Gate3Trigger {
             path: Gate3Path::Fast,
             threshold: stats.fast_threshold,
         });
     }
-    if stats
-        .soft_reached_at_ms
-        .is_some_and(|elapsed| elapsed <= effective_soft_window_ms(config))
+    if gate3_soft_ready(config, stats)
+        && stats
+            .soft_reached_at_ms
+            .is_some_and(|elapsed| elapsed <= effective_soft_window_ms(config))
     {
         return Some(Gate3Trigger {
             path: Gate3Path::Soft,
@@ -947,29 +962,62 @@ fn gate3_trigger_from_stats(config: &AppConfig, stats: &WindowStats) -> Option<G
     None
 }
 
+fn gate3_fast_ready(config: &AppConfig, stats: &WindowStats) -> bool {
+    stats.unique_sm_wallets.len() >= stats.fast_threshold
+        && stats.sm_sol_total >= config.gate3_fast_min_sol
+}
+
+fn gate3_soft_ready(config: &AppConfig, stats: &WindowStats) -> bool {
+    stats.unique_sm_wallets.len() >= stats.soft_threshold
+        && stats.sm_sol_total >= config.gate3_soft_min_sol
+}
+
 fn gate3_reject_reason(
     candidate: &Candidate,
     stats: &WindowStats,
     config: &AppConfig,
 ) -> Option<String> {
-    if stats.elapsed_ms > effective_soft_window_ms(config) {
+    if config.gate3_creator_self_buy_block && stats.creator_buy_count > 0 {
         return Some(format!(
-            "gate3 reject: window closed | mode={} | matched={} | threshold={} | first_buys={} | elapsed_ms={}",
+            "gate3 reject: creator self-buy detected | count={} | sol={:.2}",
+            stats.creator_buy_count, stats.creator_buy_sol,
+        ));
+    }
+    if config.gate3_early_concentration_reject
+        && candidate.early_buys.len() >= config.gate3_early_concentration_min_buys
+        && stats.max_single_buyer_share > config.gate3_max_single_buyer_share
+    {
+        return Some(format!(
+            "gate3 reject: early concentration | buyer={} | share={:.2} | max_allowed={:.2} | eligible_sol={:.2} | first_buys={}",
+            stats.max_single_buyer.as_deref().unwrap_or("-"),
+            stats.max_single_buyer_share,
+            config.gate3_max_single_buyer_share,
+            stats.total_eligible_sol,
+            stats.buy_count,
+        ));
+    }
+    if stats.elapsed_ms > effective_hard_reject_ms(config) {
+        return Some(format!(
+            "gate3 reject: hard window closed | mode={} | matched={} | threshold={} | sol={:.2}/{:.2} | first_buys={} | elapsed_ms={}",
             smart_money_mode_label(stats.mode),
             stats.unique_sm_wallets.len(),
             stats.soft_threshold,
+            stats.sm_sol_total,
+            config.gate3_soft_min_sol,
             stats.buy_count,
             stats.elapsed_ms,
         ));
     }
     if candidate.early_buys.len() >= config.smart_money_max_buys
-        && stats.unique_sm_wallets.len() < stats.soft_threshold
+        && !gate3_soft_ready(config, stats)
     {
         return Some(format!(
-            "gate3 reject: max buys reached | mode={} | matched={} | threshold={} | first_buys={}",
+            "gate3 reject: max buys reached | mode={} | matched={} | threshold={} | sol={:.2}/{:.2} | first_buys={}",
             smart_money_mode_label(stats.mode),
             stats.unique_sm_wallets.len(),
             stats.soft_threshold,
+            stats.sm_sol_total,
+            config.gate3_soft_min_sol,
             stats.buy_count,
         ));
     }
@@ -983,10 +1031,16 @@ async fn smart_money_stats(candidate: &Candidate, shared: &SharedState) -> Windo
     let soft_threshold = effective_soft_threshold(&shared.config, mode);
     let mut unique_sm_wallets = HashSet::new();
     let mut eligible_buyers = HashSet::new();
+    let mut eligible_sol_total = 0.0f64;
     let mut sm_sol_total = 0.0f64;
     let mut fastest_sm_ms: Option<u64> = None;
     let mut fast_reached_at_ms: Option<u64> = None;
     let mut soft_reached_at_ms: Option<u64> = None;
+    let mut buyer_sol_totals: HashMap<String, f64> = HashMap::new();
+    let mut max_single_buyer_share = 0.0f64;
+    let mut max_single_buyer: Option<String> = None;
+    let mut creator_buy_count = 0usize;
+    let mut creator_buy_sol = 0.0f64;
 
     for buy in &candidate.early_buys {
         let buyer = buy.buyer.to_string();
@@ -994,19 +1048,27 @@ async fn smart_money_stats(candidate: &Candidate, shared: &SharedState) -> Windo
             continue;
         }
         eligible_buyers.insert(buyer.clone());
+        let buy_sol = buy.sol_amount_lamports as f64 / 1e9;
+        eligible_sol_total += buy_sol;
+        let buyer_total = buyer_sol_totals.entry(buyer.clone()).or_default();
+        *buyer_total += buy_sol;
+        if buyer == candidate.token.creator {
+            creator_buy_count += 1;
+            creator_buy_sol += buy_sol;
+        }
 
         let matched = match mode {
             SmartMoneyMode::Hotlist => {
                 buyer_matches_hotlist(&buyer, candidate.buyer_profiles.get(&buyer), &hotlists)
             }
-            SmartMoneyMode::EarlyBuyerFallback => unique_sm_wallets.insert(buyer.clone()),
+            SmartMoneyMode::EarlyBuyerFallback => true,
         };
         if !matched {
             continue;
         }
 
         unique_sm_wallets.insert(buyer);
-        sm_sol_total += buy.sol_amount_lamports as f64 / 1e9;
+        sm_sol_total += buy_sol;
         let elapsed_ms = buy
             .detected_at
             .saturating_duration_since(candidate.created_at)
@@ -1015,11 +1077,27 @@ async fn smart_money_stats(candidate: &Candidate, shared: &SharedState) -> Windo
             Some(current) => current.min(elapsed_ms),
             None => elapsed_ms,
         });
-        if fast_reached_at_ms.is_none() && unique_sm_wallets.len() >= fast_threshold {
+        if fast_reached_at_ms.is_none()
+            && unique_sm_wallets.len() >= fast_threshold
+            && sm_sol_total >= shared.config.gate3_fast_min_sol
+        {
             fast_reached_at_ms = Some(elapsed_ms);
         }
-        if soft_reached_at_ms.is_none() && unique_sm_wallets.len() >= soft_threshold {
+        if soft_reached_at_ms.is_none()
+            && unique_sm_wallets.len() >= soft_threshold
+            && sm_sol_total >= shared.config.gate3_soft_min_sol
+        {
             soft_reached_at_ms = Some(elapsed_ms);
+        }
+    }
+
+    if eligible_sol_total > 0.0 {
+        for (buyer, total) in &buyer_sol_totals {
+            let share = *total / eligible_sol_total;
+            if share >= max_single_buyer_share {
+                max_single_buyer_share = share;
+                max_single_buyer = Some(buyer.clone());
+            }
         }
     }
 
@@ -1029,11 +1107,16 @@ async fn smart_money_stats(candidate: &Candidate, shared: &SharedState) -> Windo
         soft_threshold,
         unique_sm_wallets,
         sm_sol_total,
+        total_eligible_sol: eligible_sol_total,
         fastest_sm_ms,
         fast_reached_at_ms,
         soft_reached_at_ms,
         buy_count: candidate.early_buys.len(),
         eligible_buyers: eligible_buyers.len(),
+        max_single_buyer_share,
+        max_single_buyer,
+        creator_buy_count,
+        creator_buy_sol,
         elapsed_ms: candidate.created_at.elapsed().as_millis() as u64,
     }
 }
@@ -1059,11 +1142,14 @@ async fn score_candidate(shared: &SharedState, mut candidate: Candidate) -> Scor
             gate: "gate3".to_string(),
             score: 0,
             reason: format!(
-                "gate3 reject: below threshold | mode={} | matched={} | fast_threshold={} | soft_threshold={} | first_buys={}",
+                "gate3 reject: below threshold | mode={} | matched={} | fast_threshold={} | soft_threshold={} | sol={:.2} | fast_sol={:.2} | soft_sol={:.2} | first_buys={}",
                 smart_money_mode_label(stats.mode),
                 stats.unique_sm_wallets.len(),
                 stats.fast_threshold,
                 stats.soft_threshold,
+                stats.sm_sol_total,
+                shared.config.gate3_fast_min_sol,
+                shared.config.gate3_soft_min_sol,
                 stats.buy_count
             ),
             signal: None,
@@ -1202,7 +1288,7 @@ async fn select_trigger_trade(candidate: &Candidate, shared: &SharedState) -> Op
         return candidate
             .early_buys
             .iter()
-            .find(|buy| !hotlists.blocked_buyers.contains(&buy.buyer.to_string()))
+            .find(|buy| buy_is_trigger_eligible(shared.config.as_ref(), candidate, buy, &hotlists))
             .cloned();
     }
 
@@ -1211,9 +1297,26 @@ async fn select_trigger_trade(candidate: &Candidate, shared: &SharedState) -> Op
         .iter()
         .find(|buy| {
             let buyer = buy.buyer.to_string();
-            buyer_matches_hotlist(&buyer, candidate.buyer_profiles.get(&buyer), &hotlists)
+            buy_is_trigger_eligible(shared.config.as_ref(), candidate, buy, &hotlists)
+                && buyer_matches_hotlist(&buyer, candidate.buyer_profiles.get(&buyer), &hotlists)
         })
         .cloned()
+}
+
+fn buy_is_trigger_eligible(
+    config: &AppConfig,
+    candidate: &Candidate,
+    buy: &PumpBuyEvent,
+    hotlists: &HotLists,
+) -> bool {
+    let buyer = buy.buyer.to_string();
+    if hotlists.blocked_buyers.contains(&buyer) {
+        return false;
+    }
+    if config.gate3_creator_self_buy_block && buyer == candidate.token.creator {
+        return false;
+    }
+    true
 }
 
 async fn fetch_creator_mints(
@@ -1767,11 +1870,18 @@ mod tests {
             latency_metrics_file: String::new(),
             filter_hot_reload_secs: 0,
             smart_money_window_secs: 60,
-            smart_money_fast_window_ms: 1_200,
-            smart_money_soft_window_ms: 5_000,
+            smart_money_fast_window_ms: 800,
+            smart_money_soft_window_ms: 2_200,
+            gate3_hard_reject_ms: 2_500,
             smart_money_fast_threshold: 2,
             smart_money_threshold: 2,
             smart_money_max_buys: 20,
+            gate3_fast_min_sol: 1.0,
+            gate3_soft_min_sol: 1.8,
+            gate3_max_single_buyer_share: 0.70,
+            gate3_creator_self_buy_block: true,
+            gate3_early_concentration_reject: true,
+            gate3_early_concentration_min_buys: 6,
             disable_smart_money_filter: false,
             filter_min_score: 60,
             scanner_idle_timeout_secs: 0,
@@ -1820,12 +1930,17 @@ mod tests {
             fast_threshold: 2,
             soft_threshold: 4,
             unique_sm_wallets: ["a".to_string(), "b".to_string()].into_iter().collect(),
-            sm_sol_total: 0.0,
+            sm_sol_total: 1.2,
+            total_eligible_sol: 1.2,
             fastest_sm_ms: Some(100),
             fast_reached_at_ms: Some(900),
             soft_reached_at_ms: None,
             buy_count: 2,
             eligible_buyers: 2,
+            max_single_buyer_share: 0.55,
+            max_single_buyer: Some("a".to_string()),
+            creator_buy_count: 0,
+            creator_buy_sol: 0.0,
             elapsed_ms: 900,
         };
         let trigger = gate3_trigger_from_stats(&cfg, &stats).expect("fast trigger");
@@ -1839,7 +1954,7 @@ mod tests {
         let stats = WindowStats {
             mode: SmartMoneyMode::EarlyBuyerFallback,
             fast_threshold: 2,
-            soft_threshold: 4,
+            soft_threshold: 3,
             unique_sm_wallets: [
                 "a".to_string(),
                 "b".to_string(),
@@ -1848,17 +1963,96 @@ mod tests {
             ]
             .into_iter()
             .collect(),
-            sm_sol_total: 0.0,
+            sm_sol_total: 2.1,
+            total_eligible_sol: 2.1,
             fastest_sm_ms: Some(100),
             fast_reached_at_ms: Some(900),
-            soft_reached_at_ms: Some(2_500),
+            soft_reached_at_ms: Some(2_000),
             buy_count: 4,
             eligible_buyers: 4,
-            elapsed_ms: 2_500,
+            max_single_buyer_share: 0.35,
+            max_single_buyer: Some("a".to_string()),
+            creator_buy_count: 0,
+            creator_buy_sol: 0.0,
+            elapsed_ms: 2_000,
         };
         let trigger = gate3_trigger_from_stats(&cfg, &stats).expect("soft trigger");
         assert_eq!(trigger.path, Gate3Path::Soft);
-        assert_eq!(trigger.threshold, 4);
+        assert_eq!(trigger.threshold, 3);
+    }
+
+    #[test]
+    fn gate3_requires_sol_threshold_for_fast_path() {
+        let cfg = base_config();
+        let stats = WindowStats {
+            mode: SmartMoneyMode::EarlyBuyerFallback,
+            fast_threshold: 2,
+            soft_threshold: 3,
+            unique_sm_wallets: ["a".to_string(), "b".to_string()].into_iter().collect(),
+            sm_sol_total: 0.6,
+            total_eligible_sol: 0.6,
+            fastest_sm_ms: Some(90),
+            fast_reached_at_ms: None,
+            soft_reached_at_ms: None,
+            buy_count: 2,
+            eligible_buyers: 2,
+            max_single_buyer_share: 0.55,
+            max_single_buyer: Some("a".to_string()),
+            creator_buy_count: 0,
+            creator_buy_sol: 0.0,
+            elapsed_ms: 700,
+        };
+        assert!(!gate3_fast_ready(&cfg, &stats));
+        assert!(gate3_trigger_from_stats(&cfg, &stats).is_none());
+    }
+
+    #[test]
+    fn gate3_rejects_creator_self_buy() {
+        let cfg = base_config();
+        let candidate = Candidate {
+            token: NewToken {
+                mint: "mint".to_string(),
+                name: "name".to_string(),
+                symbol: "sym".to_string(),
+                uri: String::new(),
+                creator: "creator".to_string(),
+                bonding_curve: String::new(),
+                signature: String::new(),
+                slot: 0,
+                discovered_at_ms: 0,
+                is_v2: true,
+            },
+            created_at: Instant::now(),
+            discovered_at_ms: 0,
+            status: CandidateStatus::Active,
+            narrative_keywords: Vec::new(),
+            early_buys: Vec::new(),
+            buy_signatures: HashSet::new(),
+            creator_profile: None,
+            buyer_profiles: HashMap::new(),
+            pending_buyer_profiles: HashSet::new(),
+            trace: CandidateTrace::default(),
+        };
+        let stats = WindowStats {
+            mode: SmartMoneyMode::EarlyBuyerFallback,
+            fast_threshold: 2,
+            soft_threshold: 3,
+            unique_sm_wallets: ["creator".to_string()].into_iter().collect(),
+            sm_sol_total: 1.4,
+            total_eligible_sol: 1.4,
+            fastest_sm_ms: Some(30),
+            fast_reached_at_ms: None,
+            soft_reached_at_ms: None,
+            buy_count: 1,
+            eligible_buyers: 1,
+            max_single_buyer_share: 1.0,
+            max_single_buyer: Some("creator".to_string()),
+            creator_buy_count: 1,
+            creator_buy_sol: 1.4,
+            elapsed_ms: 100,
+        };
+        let reason = gate3_reject_reason(&candidate, &stats, &cfg).expect("creator self-buy reject");
+        assert!(reason.contains("creator self-buy"));
     }
 
     #[test]
