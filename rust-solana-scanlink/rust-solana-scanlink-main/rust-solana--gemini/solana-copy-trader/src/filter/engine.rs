@@ -27,6 +27,7 @@ const CURVE_INITIAL_VIRTUAL_SOL: u64 = 30_000_000_000;
 const OLD_WALLET_DAYS: u64 = 7;
 const HELIUS_PAGE_LIMIT: usize = 100;
 const HELIUS_MAX_PAGES: usize = 5;
+const FALLBACK_SM_THRESHOLD: usize = 4;
 
 #[derive(Debug, Clone)]
 pub struct BuySignal {
@@ -93,8 +94,16 @@ struct ScoreDecision {
     signal: Option<BuySignal>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SmartMoneyMode {
+    Hotlist,
+    EarlyBuyerFallback,
+}
+
 #[derive(Debug, Clone)]
 struct WindowStats {
+    mode: SmartMoneyMode,
+    threshold: usize,
     unique_sm_wallets: HashSet<String>,
     sm_sol_total: f64,
     fastest_sm_ms: Option<u64>,
@@ -218,11 +227,13 @@ pub async fn run(
                     }
                     if now.duration_since(candidate.created_at).as_secs() >= config.smart_money_window_secs {
                         expired.push(mint.clone());
-                    } else if candidate.status == CandidateStatus::Active
-                        && candidate.early_buys.len() >= config.smart_money_max_buys
-                        && smart_money_stats(candidate, &shared).await.unique_sm_wallets.len() < config.smart_money_threshold
-                    {
-                        expired.push(mint.clone());
+                    } else if candidate.status == CandidateStatus::Active {
+                        let stats = smart_money_stats(candidate, &shared).await;
+                        if candidate.early_buys.len() >= config.smart_money_max_buys
+                            && stats.unique_sm_wallets.len() < stats.threshold
+                        {
+                            expired.push(mint.clone());
+                        }
                     }
                 }
 
@@ -230,10 +241,12 @@ pub async fn run(
                     if let Some(candidate) = candidates.remove(&mint) {
                         let stats = smart_money_stats(&candidate, &shared).await;
                         let reason = format!(
-                            "关卡3拒绝：窗口结束 | 前{}笔买入内聪明钱={} | 阈值={}",
-                            stats.buy_count,
+                            "Gate3 reject: window closed | mode={} | {}={} within first {} buys | threshold={}",
+                            smart_money_mode_label(stats.mode),
+                            smart_money_subject(stats.mode),
                             stats.unique_sm_wallets.len(),
-                            shared.config.smart_money_threshold
+                            stats.buy_count,
+                            stats.threshold
                         );
                         record_filter_result(&shared, &candidate.token, false, Some("gate3".to_string()), None, reason).await;
                     }
@@ -496,28 +509,67 @@ fn apply_creator_rules(profile: CreatorProfile) -> CreatorGateResult {
     }
 }
 
+fn effective_smart_money_threshold(config: &AppConfig, mode: SmartMoneyMode) -> usize {
+    match mode {
+        SmartMoneyMode::Hotlist => config.smart_money_threshold,
+        SmartMoneyMode::EarlyBuyerFallback => config.smart_money_threshold.max(FALLBACK_SM_THRESHOLD),
+    }
+}
+
+fn smart_money_mode_label(mode: SmartMoneyMode) -> &'static str {
+    match mode {
+        SmartMoneyMode::Hotlist => "smart_money",
+        SmartMoneyMode::EarlyBuyerFallback => "early_buyers_fallback",
+    }
+}
+
+fn smart_money_subject(mode: SmartMoneyMode) -> &'static str {
+    match mode {
+        SmartMoneyMode::Hotlist => "smart_money",
+        SmartMoneyMode::EarlyBuyerFallback => "eligible_early_buyers",
+    }
+}
+
 async fn should_finalize(candidate: &Candidate, shared: &SharedState) -> bool {
-    smart_money_stats(candidate, shared).await.unique_sm_wallets.len() >= shared.config.smart_money_threshold
+    let stats = smart_money_stats(candidate, shared).await;
+    stats.unique_sm_wallets.len() >= stats.threshold
 }
 
 async fn smart_money_stats(candidate: &Candidate, shared: &SharedState) -> WindowStats {
     let hotlists = shared.hotlists.read().await;
+    let mode = if hotlists.smart_money.is_empty() {
+        SmartMoneyMode::EarlyBuyerFallback
+    } else {
+        SmartMoneyMode::Hotlist
+    };
+    let threshold = effective_smart_money_threshold(&shared.config, mode);
     let mut unique_sm_wallets = HashSet::new();
     let mut sm_sol_total = 0.0f64;
     let mut fastest_sm_ms: Option<u64> = None;
+
     for buy in &candidate.early_buys {
         let buyer = buy.buyer.to_string();
-        if hotlists.smart_money.contains(&buyer) {
-            unique_sm_wallets.insert(buyer);
-            sm_sol_total += buy.sol_amount_lamports as f64 / 1e9;
-            let elapsed_ms = buy.detected_at.saturating_duration_since(candidate.created_at).as_millis() as u64;
-            fastest_sm_ms = Some(match fastest_sm_ms {
-                Some(current) => current.min(elapsed_ms),
-                None => elapsed_ms,
-            });
+        let matched = match mode {
+            SmartMoneyMode::Hotlist => hotlists.smart_money.contains(&buyer),
+            SmartMoneyMode::EarlyBuyerFallback => unique_sm_wallets.insert(buyer.clone()),
+        };
+        if !matched {
+            continue;
         }
+        if mode == SmartMoneyMode::Hotlist {
+            unique_sm_wallets.insert(buyer);
+        }
+        sm_sol_total += buy.sol_amount_lamports as f64 / 1e9;
+        let elapsed_ms = buy.detected_at.saturating_duration_since(candidate.created_at).as_millis() as u64;
+        fastest_sm_ms = Some(match fastest_sm_ms {
+            Some(current) => current.min(elapsed_ms),
+            None => elapsed_ms,
+        });
     }
+
     WindowStats {
+        mode,
+        threshold,
         unique_sm_wallets,
         sm_sol_total,
         fastest_sm_ms,
@@ -527,15 +579,17 @@ async fn smart_money_stats(candidate: &Candidate, shared: &SharedState) -> Windo
 
 async fn score_candidate(shared: &SharedState, candidate: Candidate) -> ScoreDecision {
     let stats = smart_money_stats(&candidate, shared).await;
-    if stats.unique_sm_wallets.len() < shared.config.smart_money_threshold {
+    if stats.unique_sm_wallets.len() < stats.threshold {
         return ScoreDecision {
             passed: false,
             gate: "gate3".to_string(),
             score: 0,
             reason: format!(
-                "关卡3拒绝：聪明钱不足 | sm={} | 阈值={} | 前{}笔买入",
+                "Gate3 reject: {} below threshold | mode={} | count={} | threshold={} | first_buys={}",
+                smart_money_subject(stats.mode),
+                smart_money_mode_label(stats.mode),
                 stats.unique_sm_wallets.len(),
-                shared.config.smart_money_threshold,
+                stats.threshold,
                 stats.buy_count
             ),
             signal: None,
@@ -564,7 +618,8 @@ async fn score_candidate(shared: &SharedState, candidate: Candidate) -> ScoreDec
     let buyer_quality_score = (buyer_quality_pct * 15.0).round().clamp(0.0, 15.0) as u32;
     let total_score = sm_count_score + sm_sol_score + momentum_score + curve_score + buyer_quality_score;
     let reason = format!(
-        "SM数量={} SM买入={} 动量={} 曲线={} 买家质量={} 总分={} | sm={} sol={:.2} fastest={}ms narrative={}",
+        "mode={} participants={} capital={} momentum={} curve={} buyer_quality={} total={} | count={} sol={:.2} fastest={}ms narrative={}",
+        smart_money_mode_label(stats.mode),
         sm_count_score,
         sm_sol_score,
         momentum_score,
@@ -592,7 +647,7 @@ async fn score_candidate(shared: &SharedState, candidate: Candidate) -> ScoreDec
             passed: false,
             gate: "gate4".to_string(),
             score: total_score,
-            reason: format!("{} | 缺少 Smart Money 买入上下文", reason),
+            reason: format!("{} | missing trigger buy context", reason),
             signal: None,
         };
     };
@@ -617,6 +672,9 @@ async fn score_candidate(shared: &SharedState, candidate: Candidate) -> ScoreDec
 
 async fn select_trigger_trade(candidate: &Candidate, shared: &SharedState) -> Option<PumpBuyEvent> {
     let hotlists = shared.hotlists.read().await;
+    if hotlists.smart_money.is_empty() {
+        return candidate.early_buys.first().cloned();
+    }
     candidate
         .early_buys
         .iter()
@@ -814,7 +872,13 @@ async fn reload_hotlists(shared: &SharedState) -> Result<()> {
     }
     shared.db.sync_blacklist(&blacklist).await?;
     shared.db.sync_smart_money(&smart_money).await?;
-    info!("过滤层：名单已加载 | blacklist={} | smart_money={}", blacklist.len(), smart_money.len());
+    info!("Filter hotlists loaded | blacklist={} | smart_money={}", blacklist.len(), smart_money.len());
+    if smart_money.is_empty() {
+        warn!(
+            "smart_money list empty, enabling early-buyer fallback | threshold={}",
+            effective_smart_money_threshold(&shared.config, SmartMoneyMode::EarlyBuyerFallback)
+        );
+    }
     Ok(())
 }
 

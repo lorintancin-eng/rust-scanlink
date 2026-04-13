@@ -65,7 +65,7 @@ async fn main() -> Result<()> {
     init_logging();
 
     info!("==============================================");
-    info!("   Solana Pump.fun 扫链狙击系统 v1.6.20");
+    info!("   Solana Pump.fun Scanner System v{}", env!("CARGO_PKG_VERSION"));
     info!("   Yellowstone Scanner + 四层过滤 + 现有执行层");
     info!("==============================================");
 
