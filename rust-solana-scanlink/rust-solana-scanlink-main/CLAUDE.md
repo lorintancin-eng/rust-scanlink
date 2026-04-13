@@ -21,7 +21,7 @@ cargo check              # Fast type-check without codegen
 cargo clippy             # Linting
 ```
 
-Binary name is `copy-trader` (defined in Cargo.toml `[[bin]]`). CI builds on push to main, artifact: `copy-trader-linux`.
+Binary name is `rust-scanlink-trader` (defined in Cargo.toml `[[bin]]`). CI builds on push to main, artifact: `rust-scanlink-trader-linux`.
 
 ## Configuration
 

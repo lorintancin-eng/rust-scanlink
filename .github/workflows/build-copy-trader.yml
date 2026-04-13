@@ -1,4 +1,4 @@
-name: Build Copy Trader
+name: Build Rust Scanlink Trader
 
 on:
   push:
@@ -28,11 +28,11 @@ jobs:
           workspaces: rust-solana-scanlink/rust-solana-scanlink-main/rust-solana--gemini/solana-copy-trader
 
       - name: Build release binary
-        run: cargo build --release --bin copy-trader
+        run: cargo build --release --bin rust-scanlink-trader
 
       - name: Upload Linux artifact
         uses: actions/upload-artifact@v4
         with:
-          name: copy-trader-linux
-          path: rust-solana-scanlink/rust-solana-scanlink-main/rust-solana--gemini/solana-copy-trader/target/release/copy-trader
+          name: rust-scanlink-trader-linux
+          path: rust-solana-scanlink/rust-solana-scanlink-main/rust-solana--gemini/solana-copy-trader/target/release/rust-scanlink-trader
           if-no-files-found: error

@@ -1,11 +1,11 @@
 [package]
 name = "solana-copy-trader"
-version = "1.6.29"
+version = "1.6.30"
 edition = "2021"
 description = "High-performance Solana copy-trading bot in Rust"
 
 [[bin]]
-name = "copy-trader"
+name = "rust-scanlink-trader"
 path = "src/main.rs"
 
 [dependencies]

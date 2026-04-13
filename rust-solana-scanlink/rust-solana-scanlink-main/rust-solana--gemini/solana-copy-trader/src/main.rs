@@ -89,7 +89,7 @@ impl RuntimeGuard {
                         continue;
                     }
                     anyhow::bail!(
-                        "another copy-trader instance is already running | pid_file={}",
+                        "another rust-scanlink-trader instance is already running | pid_file={}",
                         path.display()
                     );
                 }
@@ -134,7 +134,7 @@ fn runtime_guard_is_stale(path: &Path) -> Result<bool> {
         match fs::read(&cmdline) {
             Ok(bytes) => {
                 let command = String::from_utf8_lossy(&bytes);
-                Ok(!command.contains("copy-trader"))
+                Ok(!command.contains("rust-scanlink-trader"))
             }
             Err(err) if err.kind() == ErrorKind::NotFound => Ok(true),
             Err(_) => Ok(false),

@@ -72,7 +72,7 @@ impl SolUsdPrice {
         let resp = match client
             .get(COINGECKO_URL)
             .header("Accept", "application/json")
-            .header("User-Agent", "solana-copy-trader/1.0")
+            .header("User-Agent", "rust-scanlink-trader/1.0")
             .send()
             .await
         {
