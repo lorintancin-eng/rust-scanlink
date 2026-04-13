@@ -14,6 +14,10 @@ use anyhow::Result;
 use solana_client::rpc_client::RpcClient;
 use solana_sdk::pubkey::Pubkey;
 use spl_associated_token_account::get_associated_token_address;
+use std::fs::{self, OpenOptions};
+use std::io::{ErrorKind, Write};
+use std::path::{Path, PathBuf};
+use std::process;
 use std::str::FromStr;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
@@ -53,11 +57,94 @@ struct BuyPathTimings {
     send_call: Duration,
 }
 
+struct RuntimeGuard {
+    path: PathBuf,
+}
+
 fn format_latency(duration: Duration) -> String {
     if duration.as_millis() > 0 {
         format!("{}ms", duration.as_millis())
     } else {
         format!("{}us", duration.as_micros())
+    }
+}
+
+impl RuntimeGuard {
+    fn acquire(config: &AppConfig) -> Result<Self> {
+        let path = runtime_guard_path(config);
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+
+        for _ in 0..2 {
+            match OpenOptions::new().create_new(true).write(true).open(&path) {
+                Ok(mut file) => {
+                    writeln!(file, "{}", process::id())?;
+                    info!("Runtime guard acquired: {}", path.display());
+                    return Ok(Self { path });
+                }
+                Err(err) if err.kind() == ErrorKind::AlreadyExists => {
+                    if runtime_guard_is_stale(&path)? {
+                        let _ = fs::remove_file(&path);
+                        continue;
+                    }
+                    anyhow::bail!(
+                        "another copy-trader instance is already running | pid_file={}",
+                        path.display()
+                    );
+                }
+                Err(err) => return Err(err.into()),
+            }
+        }
+
+        anyhow::bail!(
+            "failed to acquire runtime pid file after stale cleanup | pid_file={}",
+            path.display()
+        );
+    }
+}
+
+impl Drop for RuntimeGuard {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.path);
+    }
+}
+
+fn runtime_guard_path(config: &AppConfig) -> PathBuf {
+    Path::new(&config.filter_db_path)
+        .parent()
+        .filter(|path| !path.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("data"))
+        .join("runtime.pid")
+}
+
+fn runtime_guard_is_stale(path: &Path) -> Result<bool> {
+    let content = match fs::read_to_string(path) {
+        Ok(content) => content,
+        Err(err) if err.kind() == ErrorKind::NotFound => return Ok(true),
+        Err(err) => return Err(err.into()),
+    };
+    let Some(pid) = content.trim().parse::<u32>().ok() else {
+        return Ok(true);
+    };
+
+    #[cfg(target_os = "linux")]
+    {
+        let cmdline = PathBuf::from(format!("/proc/{pid}/cmdline"));
+        match fs::read(&cmdline) {
+            Ok(bytes) => {
+                let command = String::from_utf8_lossy(&bytes);
+                Ok(!command.contains("copy-trader"))
+            }
+            Err(err) if err.kind() == ErrorKind::NotFound => Ok(true),
+            Err(_) => Ok(false),
+        }
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = pid;
+        Ok(false)
     }
 }
 
@@ -74,6 +161,7 @@ async fn main() -> Result<()> {
     info!("==============================================");
 
     let config = Arc::new(AppConfig::from_env()?);
+    let _runtime_guard = RuntimeGuard::acquire(config.as_ref())?;
     let execution_plan = ExecutionPlan::from_config(config.as_ref());
     let sniper_group = CopyGroup::from_app_config(config.as_ref());
     if config.execution_enabled {
