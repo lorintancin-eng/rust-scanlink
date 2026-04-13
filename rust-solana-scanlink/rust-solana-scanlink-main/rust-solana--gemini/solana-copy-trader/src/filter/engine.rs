@@ -103,6 +103,7 @@ enum InternalMessage {
     Scored {
         mint: String,
         decision: ScoreDecision,
+        gate4_at_ms: Option<u64>,
     },
 }
 
@@ -124,6 +125,7 @@ struct ScoreDecision {
     path: String,
     matched_buyers: usize,
     early_buy_count: usize,
+    gate4_at_ms: Option<u64>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -223,8 +225,13 @@ pub async fn run(
                     InternalMessage::BuyerProfileResolved { mint, address, profile } => {
                         handle_buyer_profile_resolution(&shared, &internal_tx, &mut candidates, mint, address, profile).await;
                     }
-                    InternalMessage::Scored { mint, decision } => {
-                        if let Some(candidate) = candidates.remove(&mint) {
+                    InternalMessage::Scored {
+                        mint,
+                        decision,
+                        gate4_at_ms,
+                    } => {
+                        if let Some(mut candidate) = candidates.remove(&mint) {
+                            candidate.trace.gate4_at_ms = gate4_at_ms;
                             record_candidate_outcome(
                                 &shared,
                                 &candidate,
@@ -585,7 +592,12 @@ fn spawn_score_task(
     tokio::spawn(async move {
         let mint = candidate.token.mint.clone();
         let decision = score_candidate(&shared, candidate).await;
-        let _ = tx.send(InternalMessage::Scored { mint, decision });
+        let gate4_at_ms = decision.gate4_at_ms;
+        let _ = tx.send(InternalMessage::Scored {
+            mint,
+            decision,
+            gate4_at_ms,
+        });
     });
 }
 
@@ -946,6 +958,7 @@ async fn score_candidate(shared: &SharedState, mut candidate: Candidate) -> Scor
             path: "insufficient".to_string(),
             matched_buyers: stats.unique_sm_wallets.len(),
             early_buy_count: stats.buy_count,
+            gate4_at_ms: None,
         };
     };
 
@@ -1027,6 +1040,7 @@ async fn score_candidate(shared: &SharedState, mut candidate: Candidate) -> Scor
             path: gate3_path_label(trigger.path).to_string(),
             matched_buyers: stats.unique_sm_wallets.len(),
             early_buy_count: stats.buy_count,
+            gate4_at_ms: candidate.trace.gate4_at_ms,
         };
     }
 
@@ -1041,6 +1055,7 @@ async fn score_candidate(shared: &SharedState, mut candidate: Candidate) -> Scor
             path: gate3_path_label(trigger.path).to_string(),
             matched_buyers: stats.unique_sm_wallets.len(),
             early_buy_count: stats.buy_count,
+            gate4_at_ms: candidate.trace.gate4_at_ms,
         };
     };
 
@@ -1063,6 +1078,7 @@ async fn score_candidate(shared: &SharedState, mut candidate: Candidate) -> Scor
         path: gate3_path_label(trigger.path).to_string(),
         matched_buyers: stats.unique_sm_wallets.len(),
         early_buy_count: stats.buy_count,
+        gate4_at_ms: candidate.trace.gate4_at_ms,
     }
 }
 
