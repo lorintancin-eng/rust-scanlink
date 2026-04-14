@@ -7,6 +7,8 @@ use yellowstone_grpc_proto::prelude::{
     SubscribeUpdateTransactionInfo, TransactionStatusMeta,
 };
 
+const MAX_FALLBACK_BUY_LAMPORTS: u64 = 50_000_000_000;
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NewToken {
     pub mint: String,
@@ -69,6 +71,7 @@ pub fn decode_transaction(slot: u64, tx_info: &SubscribeUpdateTransactionInfo) -
             &signature,
             discovered_at_ms,
             detected_at,
+            tx_info.meta.as_ref(),
             &ix.data,
             &ix.accounts,
             ix.program_id_index as usize,
@@ -85,6 +88,7 @@ pub fn decode_transaction(slot: u64, tx_info: &SubscribeUpdateTransactionInfo) -
                     &signature,
                     discovered_at_ms,
                     detected_at,
+                    tx_info.meta.as_ref(),
                     &ix.data,
                     &ix.accounts,
                     ix.program_id_index as usize,
@@ -103,6 +107,7 @@ fn decode_instruction(
     signature: &str,
     discovered_at_ms: u64,
     detected_at: Instant,
+    meta: Option<&TransactionStatusMeta>,
     data: &[u8],
     account_indices: &[u8],
     program_idx: usize,
@@ -147,8 +152,15 @@ fn decode_instruction(
     }
 
     if disc == DISC_BUY {
-        if let Some(buy) = decode_buy(slot, signature, detected_at, data, account_indices, account_keys)
-        {
+        if let Some(buy) = decode_buy(
+            slot,
+            signature,
+            detected_at,
+            meta,
+            data,
+            account_indices,
+            account_keys,
+        ) {
             debug!(
                 "扫链：捕获买入 | mint={} | buyer={} | sol={:.4} | sig={}",
                 buy.mint,
@@ -205,6 +217,7 @@ fn decode_buy(
     slot: u64,
     signature: &str,
     detected_at: Instant,
+    meta: Option<&TransactionStatusMeta>,
     data: &[u8],
     account_indices: &[u8],
     account_keys: &[Pubkey],
@@ -214,7 +227,8 @@ fn decode_buy(
     }
 
     let mint = indexed_account(account_indices, account_keys, 2)?;
-    let buyer = indexed_account(account_indices, account_keys, 6)?;
+    let buyer_account_idx = *account_indices.get(6)? as usize;
+    let buyer = *account_keys.get(buyer_account_idx)?;
     let token_program = indexed_account(account_indices, account_keys, 8)?;
     let instruction_accounts: Vec<Pubkey> = account_indices
         .iter()
@@ -225,7 +239,12 @@ fn decode_buy(
         return None;
     }
 
-    let sol_amount_lamports = u64::from_le_bytes(data[16..24].try_into().ok()?);
+    let fallback_max_sol_cost_lamports = u64::from_le_bytes(data[16..24].try_into().ok()?);
+    let sol_amount_lamports = estimate_buy_sol_amount_lamports(
+        meta,
+        buyer_account_idx,
+        fallback_max_sol_cost_lamports,
+    );
 
     Some(PumpBuyEvent {
         mint: mint.to_string(),
@@ -302,6 +321,42 @@ fn read_pubkey_string(data: &[u8], offset: &mut usize) -> Option<String> {
     Some(Pubkey::new_from_array(bytes).to_string())
 }
 
+fn estimate_buy_sol_amount_lamports(
+    meta: Option<&TransactionStatusMeta>,
+    buyer_account_idx: usize,
+    fallback_max_sol_cost_lamports: u64,
+) -> u64 {
+    if let Some(meta) = meta {
+        if let (Some(pre_balance), Some(post_balance)) = (
+            meta.pre_balances.get(buyer_account_idx),
+            meta.post_balances.get(buyer_account_idx),
+        ) {
+            if pre_balance > post_balance {
+                let total_spent = pre_balance.saturating_sub(*post_balance);
+                let fee_adjusted = if buyer_account_idx == 0 {
+                    total_spent.saturating_sub(meta.fee)
+                } else {
+                    total_spent
+                };
+                if fee_adjusted > 0 {
+                    return fee_adjusted;
+                }
+                return 0;
+            }
+        }
+    }
+
+    sanitize_fallback_buy_lamports(fallback_max_sol_cost_lamports)
+}
+
+fn sanitize_fallback_buy_lamports(lamports: u64) -> u64 {
+    if lamports > MAX_FALLBACK_BUY_LAMPORTS {
+        0
+    } else {
+        lamports
+    }
+}
+
 
 fn now_ms() -> u64 {
     SystemTime::now()
@@ -345,6 +400,29 @@ mod tests {
             Some(expected.to_string())
         );
         assert_eq!(off, 32);
+    }
+
+    #[test]
+    fn buy_sol_amount_prefers_balance_delta_over_max_cost() {
+        let meta = TransactionStatusMeta {
+            pre_balances: vec![2_000_000_000],
+            post_balances: vec![1_500_000_000],
+            fee: 5_000,
+            ..Default::default()
+        };
+        assert_eq!(
+            estimate_buy_sol_amount_lamports(Some(&meta), 0, u64::MAX),
+            499_995_000
+        );
+    }
+
+    #[test]
+    fn buy_sol_amount_zeroes_absurd_fallback_when_meta_missing() {
+        assert_eq!(estimate_buy_sol_amount_lamports(None, 0, u64::MAX), 0);
+        assert_eq!(
+            estimate_buy_sol_amount_lamports(None, 0, 900_000_000),
+            900_000_000
+        );
     }
 }
 
