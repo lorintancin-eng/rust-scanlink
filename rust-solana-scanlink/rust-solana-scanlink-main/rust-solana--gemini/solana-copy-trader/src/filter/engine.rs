@@ -1,6 +1,9 @@
 use crate::config::AppConfig;
 use crate::filter::db::{
-    BuyerProfile, CreatorProfile, FilterDb, FilterResultRecord, FilterTimingRecord,
+    BuyerProfile, ClusterEdgeRecord, ClusterMemberRecord, CreatorProfile, DynamicKeywordRecord,
+    FeedHealthRecord, FilterDb, FilterResultRecord, FilterTimingRecord, FunderProfile,
+    Gate3SequenceRecord, Gate3SnapshotRecord, LabelSuggestionRecord, RawEventRecord,
+    RiskSignalRecord, ScoringBreakdownRecord,
 };
 use crate::processor::pumpfun::BondingCurveState;
 use crate::scanner::{
@@ -165,6 +168,7 @@ struct WindowStats {
     soft_reached_at_ms: Option<u64>,
     buy_count: usize,
     eligible_buyers: usize,
+    unique_funders: usize,
     max_single_buyer_share: f64,
     max_single_buyer: Option<String>,
     creator_buy_count: usize,
@@ -388,6 +392,7 @@ async fn handle_new_token(
     {
         warn!("scanned_tokens append failed: {}", err);
     }
+    persist_raw_new_token_event(shared, &token).await;
 
     let gate1 = gate1_check(shared, creator_window, &token).await;
     if !gate1.passed {
@@ -495,6 +500,9 @@ async fn handle_creator_gate_resolution(
 
     candidate.status = CandidateStatus::Active;
     candidate.creator_profile = result.profile;
+    if let Some(profile) = candidate.creator_profile.as_ref() {
+        persist_entity_links_for_creator(shared, &candidate.token, profile).await;
+    }
     candidate.trace.gate3_open_at_ms.get_or_insert_with(now_ms);
 
     if let Some(trigger) = should_finalize(candidate, shared).await {
@@ -518,6 +526,7 @@ async fn handle_buyer_profile_resolution(
     };
     candidate.pending_buyer_profiles.remove(&address);
     if let Some(profile) = profile {
+        persist_entity_links_for_buyer(shared, &candidate.token.mint, &profile).await;
         candidate.buyer_profiles.insert(address, profile);
     }
 
@@ -539,6 +548,7 @@ async fn handle_buy_event(
     candidates: &mut HashMap<String, Candidate>,
     buy: PumpBuyEvent,
 ) {
+    persist_raw_buy_event(shared, &buy).await;
     let mut reject_now: Option<(String, String, String, String, usize, usize)> = None;
 
     {
@@ -1189,6 +1199,7 @@ async fn smart_money_stats(candidate: &Candidate, shared: &SharedState) -> Windo
     let soft_threshold = effective_soft_threshold(&shared.config, mode);
     let mut unique_sm_wallets = HashSet::new();
     let mut eligible_buyers = HashSet::new();
+    let mut unique_funders = HashSet::new();
     let mut eligible_sol_total = 0.0f64;
     let mut sm_sol_total = 0.0f64;
     let mut fastest_sm_ms: Option<u64> = None;
@@ -1206,6 +1217,13 @@ async fn smart_money_stats(candidate: &Candidate, shared: &SharedState) -> Windo
             continue;
         }
         eligible_buyers.insert(buyer.clone());
+        if let Some(funder) = candidate
+            .buyer_profiles
+            .get(&buyer)
+            .and_then(|profile| profile.first_funder.clone())
+        {
+            unique_funders.insert(funder);
+        }
         let buy_sol = buy.sol_amount_lamports as f64 / 1e9;
         eligible_sol_total += buy_sol;
         let buyer_total = buyer_sol_totals.entry(buyer.clone()).or_default();
@@ -1271,6 +1289,7 @@ async fn smart_money_stats(candidate: &Candidate, shared: &SharedState) -> Windo
         soft_reached_at_ms,
         buy_count: candidate.early_buys.len(),
         eligible_buyers: eligible_buyers.len(),
+        unique_funders: unique_funders.len(),
         max_single_buyer_share,
         max_single_buyer,
         creator_buy_count,
@@ -1821,6 +1840,29 @@ async fn refresh_dynamic_hot_keywords(shared: &SharedState) -> Result<()> {
     }
 
     write_plaintext_lines(&shared.config.dynamic_hot_keywords_file, &keywords).await?;
+    let expiry_ms = now_ms()
+        .saturating_add(shared.config.dynamic_hot_refresh_secs.max(30).saturating_mul(2) * 1000);
+    let keyword_records: Vec<DynamicKeywordRecord> = keywords
+        .iter()
+        .enumerate()
+        .map(|(idx, keyword)| DynamicKeywordRecord {
+            keyword: keyword.clone(),
+            source: "dynamic_hot_refresh".to_string(),
+            score: shared
+                .config
+                .dynamic_hot_keywords_limit
+                .saturating_sub(idx)
+                .max(1) as u32,
+            expires_at_ms: expiry_ms,
+        })
+        .collect();
+    if let Err(err) = shared
+        .db
+        .replace_dynamic_keywords("dynamic_hot_refresh", &keyword_records)
+        .await
+    {
+        warn!("dynamic keyword sqlite sync failed: {}", err);
+    }
     info!(
         "Dynamic hot keywords refreshed | count={} | sample={}",
         keywords.len(),
@@ -2173,6 +2215,11 @@ async fn record_candidate_outcome(
     early_buy_count: usize,
     matched_buyers: usize,
 ) {
+    let reject_gate_ref = reject_gate.clone();
+    let score_ref = score;
+    let reason_ref = reason.clone();
+    let mode_ref = mode.clone();
+    let path_ref = path.clone();
     record_token_outcome(
         shared,
         &candidate.token,
@@ -2185,6 +2232,17 @@ async fn record_candidate_outcome(
         path,
         early_buy_count,
         matched_buyers,
+    )
+    .await;
+    persist_candidate_analytics(
+        shared,
+        candidate,
+        passed,
+        reject_gate_ref.as_deref(),
+        score_ref,
+        &reason_ref,
+        &mode_ref,
+        &path_ref,
     )
     .await;
 }
@@ -2285,6 +2343,420 @@ async fn record_token_outcome(
     }
 }
 
+async fn persist_raw_new_token_event(shared: &SharedState, token: &NewToken) {
+    if !shared.config.persist_raw_scanner_events {
+        return;
+    }
+    let payload = json!({
+        "mint": token.mint,
+        "creator": token.creator,
+        "name": token.name,
+        "symbol": token.symbol,
+        "uri": token.uri,
+        "bonding_curve": token.bonding_curve,
+        "signature": token.signature,
+        "slot": token.slot,
+        "feed_source": token.feed_source,
+        "is_v2": token.is_v2,
+    });
+    let record = RawEventRecord {
+        feed_source: token.feed_source.clone(),
+        event_type: "new_token".to_string(),
+        slot: token.slot,
+        signature: token.signature.clone(),
+        mint: token.mint.clone(),
+        actor: Some(token.creator.clone()),
+        recorded_at_ms: token.discovered_at_ms,
+        payload_json: payload.to_string(),
+    };
+    if let Err(err) = shared.db.insert_raw_event(&record).await {
+        warn!("raw new_token insert failed: {}", err);
+    }
+}
+
+async fn persist_raw_buy_event(shared: &SharedState, buy: &PumpBuyEvent) {
+    if !shared.config.persist_raw_scanner_events {
+        return;
+    }
+    let payload = json!({
+        "mint": buy.mint,
+        "buyer": buy.buyer.to_string(),
+        "sol_amount_lamports": buy.sol_amount_lamports,
+        "feed_source": buy.feed_source,
+        "signature": buy.signature,
+        "slot": buy.slot,
+    });
+    let record = RawEventRecord {
+        feed_source: buy.feed_source.clone(),
+        event_type: "buy".to_string(),
+        slot: buy.slot,
+        signature: buy.signature.clone(),
+        mint: buy.mint.clone(),
+        actor: Some(buy.buyer.to_string()),
+        recorded_at_ms: now_ms(),
+        payload_json: payload.to_string(),
+    };
+    if let Err(err) = shared.db.insert_raw_event(&record).await {
+        warn!("raw buy insert failed: {}", err);
+    }
+}
+
+async fn persist_entity_links_for_creator(
+    shared: &SharedState,
+    token: &NewToken,
+    profile: &CreatorProfile,
+) {
+    let Some(funder) = profile.first_funder.clone() else {
+        return;
+    };
+    let funder_profile = FunderProfile {
+        address: funder.clone(),
+        wallet_count: 1,
+        rug_exposure: profile.rug_count,
+        last_seen_ms: profile.fetched_at_ms,
+    };
+    if let Err(err) = shared.db.upsert_funder_profile(&funder_profile).await {
+        warn!("upsert funder profile failed | funder={} | {}", funder, err);
+    }
+    let cluster_id = cluster_id_for_funder(&funder);
+    let member = ClusterMemberRecord {
+        cluster_id: cluster_id.clone(),
+        address: token.creator.clone(),
+        cluster_type: "creator_funder".to_string(),
+        score: 100,
+    };
+    if let Err(err) = shared.db.upsert_cluster_member(&member).await {
+        warn!("upsert creator cluster member failed | {}", err);
+    }
+    let edge = ClusterEdgeRecord {
+        src: funder,
+        dst: token.creator.clone(),
+        edge_type: "funds_creator".to_string(),
+        weight: profile.total_tokens.max(1) as i32,
+    };
+    if let Err(err) = shared.db.upsert_cluster_edge(&edge).await {
+        warn!("upsert creator cluster edge failed | {}", err);
+    }
+}
+
+async fn persist_entity_links_for_buyer(
+    shared: &SharedState,
+    mint: &str,
+    profile: &BuyerProfile,
+) {
+    let Some(funder) = profile.first_funder.clone() else {
+        return;
+    };
+    let current = shared
+        .db
+        .get_funder_profile(&funder)
+        .await
+        .ok()
+        .flatten()
+        .unwrap_or_default();
+    let funder_profile = FunderProfile {
+        address: funder.clone(),
+        wallet_count: current.wallet_count.saturating_add(1),
+        rug_exposure: current.rug_exposure,
+        last_seen_ms: profile.fetched_at_ms.max(current.last_seen_ms),
+    };
+    if let Err(err) = shared.db.upsert_funder_profile(&funder_profile).await {
+        warn!("upsert buyer funder profile failed | funder={} | {}", funder, err);
+    }
+    let cluster_id = cluster_id_for_funder(&funder);
+    let member = ClusterMemberRecord {
+        cluster_id: cluster_id.clone(),
+        address: profile.address.clone(),
+        cluster_type: "buyer_funder".to_string(),
+        score: 50,
+    };
+    if let Err(err) = shared.db.upsert_cluster_member(&member).await {
+        warn!("upsert buyer cluster member failed | {}", err);
+    }
+    let edge = ClusterEdgeRecord {
+        src: funder,
+        dst: profile.address.clone(),
+        edge_type: format!("funds_buyer:{}", mint),
+        weight: 1,
+    };
+    if let Err(err) = shared.db.upsert_cluster_edge(&edge).await {
+        warn!("upsert buyer cluster edge failed | {}", err);
+    }
+}
+
+fn cluster_id_for_funder(funder: &str) -> String {
+    format!("funder:{}", funder)
+}
+
+async fn persist_candidate_analytics(
+    shared: &SharedState,
+    candidate: &Candidate,
+    passed: bool,
+    reject_gate: Option<&str>,
+    score: Option<u32>,
+    reason: &str,
+    mode: &str,
+    path: &str,
+) {
+    let stats = smart_money_stats(candidate, shared).await;
+    let first_buy_ms = candidate
+        .early_buys
+        .iter()
+        .map(|buy| buy.detected_at.saturating_duration_since(candidate.created_at).as_millis() as u64)
+        .min();
+    let threshold_hit_ms = match path {
+        "fast" => stats.fast_reached_at_ms,
+        "soft" => stats.soft_reached_at_ms,
+        _ => None,
+    };
+
+    let snapshot = Gate3SnapshotRecord {
+        mint: candidate.token.mint.clone(),
+        mode: mode.to_string(),
+        path: path.to_string(),
+        buy_count: stats.buy_count,
+        unique_buyers: stats.eligible_buyers,
+        unique_funders: stats.unique_funders,
+        matched_buyers: stats.unique_sm_wallets.len(),
+        total_sol: stats.total_eligible_sol,
+        matched_sol: stats.sm_sol_total,
+        creator_buy_sol: stats.creator_buy_sol,
+        max_single_buyer_share: stats.max_single_buyer_share,
+        first_buy_ms,
+        threshold_hit_ms,
+        recorded_at_ms: now_ms(),
+    };
+    if let Err(err) = shared.db.insert_gate3_snapshot(&snapshot).await {
+        warn!("insert gate3 snapshot failed | mint={} | {}", candidate.token.mint, err);
+    }
+
+    if shared.config.persist_gate3_sequences {
+        let sequences: Vec<Gate3SequenceRecord> = candidate
+            .early_buys
+            .iter()
+            .enumerate()
+            .map(|(idx, buy)| {
+                let buyer = buy.buyer.to_string();
+                let funder = candidate
+                    .buyer_profiles
+                    .get(&buyer)
+                    .and_then(|profile| profile.first_funder.clone());
+                Gate3SequenceRecord {
+                    mint: candidate.token.mint.clone(),
+                    seq_no: idx,
+                    buyer: buyer.clone(),
+                    funder: funder.clone(),
+                    cluster_id: funder.as_deref().map(cluster_id_for_funder),
+                    sol_amount: buy.sol_amount_lamports as f64 / 1e9,
+                    detected_at_ms: candidate.token.discovered_at_ms.saturating_add(
+                        buy.detected_at
+                            .saturating_duration_since(candidate.created_at)
+                            .as_millis() as u64,
+                    ),
+                    is_creator: buyer == candidate.token.creator,
+                    feed_source: buy.feed_source.clone(),
+                }
+            })
+            .collect();
+        if let Err(err) = shared
+            .db
+            .replace_gate3_sequences(&candidate.token.mint, &sequences)
+            .await
+        {
+            warn!("replace gate3 sequences failed | mint={} | {}", candidate.token.mint, err);
+        }
+    }
+
+    if shared.config.persist_scoring_breakdowns {
+        let participants_score = match stats.unique_sm_wallets.len() {
+            0 => 0,
+            1 => 10,
+            2 => 20,
+            _ => 30,
+        };
+        let capital_score = if stats.sm_sol_total >= 2.0 {
+            20
+        } else if stats.sm_sol_total >= 0.5 {
+            10
+        } else {
+            0
+        };
+        let momentum_score = if stats.buy_count >= 15 {
+            20
+        } else if stats.buy_count >= 8 {
+            13
+        } else if stats.buy_count >= 4 {
+            6
+        } else {
+            0
+        };
+        let curve_progress_pct = fetch_curve_progress_pct(shared, &candidate.token)
+            .await
+            .unwrap_or(0.0);
+        let curve_score = if curve_progress_pct > 5.0 {
+            15
+        } else if curve_progress_pct > 2.0 {
+            10
+        } else if curve_progress_pct > 0.5 {
+            5
+        } else {
+            0
+        };
+        let buyer_quality_pct = fetch_buyer_quality_pct(shared, candidate)
+            .await
+            .unwrap_or(0.0);
+        let buyer_quality_score =
+            (buyer_quality_pct * 15.0).round().clamp(0.0, 15.0) as u32;
+        let dynamic_bonus = ((candidate.dynamic_narrative_keywords.len() as u32)
+            .saturating_mul(shared.config.dynamic_narrative_bonus_per_hit))
+        .min(shared.config.dynamic_narrative_bonus_cap);
+        let quality_score =
+            participants_score + capital_score + curve_score + buyer_quality_score;
+        let urgency_score = momentum_score + dynamic_bonus;
+        let total_score = quality_score + urgency_score;
+        let required_score = match path {
+            "soft" => shared
+                .config
+                .filter_soft_min_score
+                .min(shared.config.filter_min_score),
+            _ => shared
+                .config
+                .filter_fast_min_score
+                .min(shared.config.filter_min_score),
+        };
+        let execution_confidence = if passed {
+            total_score.min(100)
+        } else {
+            quality_score.min(100)
+        };
+        let details = json!({
+            "participants_score": participants_score,
+            "capital_score": capital_score,
+            "momentum_score": momentum_score,
+            "curve_score": curve_score,
+            "buyer_quality_score": buyer_quality_score,
+            "dynamic_narrative_bonus": dynamic_bonus,
+            "curve_progress_pct": curve_progress_pct,
+            "buyer_quality_pct": buyer_quality_pct,
+            "reason": reason,
+        });
+        let breakdown = ScoringBreakdownRecord {
+            mint: candidate.token.mint.clone(),
+            path: path.to_string(),
+            quality_score,
+            urgency_score,
+            execution_confidence,
+            total_score,
+            required_score,
+            details_json: details.to_string(),
+            recorded_at_ms: now_ms(),
+        };
+        if let Err(err) = shared.db.insert_scoring_breakdown(&breakdown).await {
+            warn!("insert scoring breakdown failed | mint={} | {}", candidate.token.mint, err);
+        }
+    }
+
+    let risk_signals = build_risk_signals(candidate, reject_gate, reason);
+    if !risk_signals.is_empty() {
+        if let Err(err) = shared
+            .db
+            .replace_risk_signals(&candidate.token.mint, &risk_signals)
+            .await
+        {
+            warn!("replace risk signals failed | mint={} | {}", candidate.token.mint, err);
+        }
+    }
+
+    if shared.config.persist_label_suggestions {
+        for suggestion in build_label_suggestions(candidate, passed, reject_gate, score, reason) {
+            if let Err(err) = shared.db.insert_label_suggestion(&suggestion).await {
+                warn!(
+                    "insert label suggestion failed | subject={} | {}",
+                    suggestion.subject, err
+                );
+            }
+        }
+    }
+}
+
+fn build_risk_signals(
+    candidate: &Candidate,
+    reject_gate: Option<&str>,
+    reason: &str,
+) -> Vec<RiskSignalRecord> {
+    let mut signals = Vec::new();
+    let detected_at_ms = now_ms();
+    let mut push = |signal_type: &str, signal_value: &str, score: i32| {
+        signals.push(RiskSignalRecord {
+            mint: candidate.token.mint.clone(),
+            signal_type: signal_type.to_string(),
+            signal_value: signal_value.to_string(),
+            score,
+            detected_at_ms,
+        });
+    };
+    if let Some(gate) = reject_gate {
+        push("reject_gate", gate, 20);
+    }
+    if reason.contains("factory creator pattern") {
+        push("factory_creator", candidate.token.creator.as_str(), 90);
+    }
+    if reason.contains("creator self-buy") {
+        push("creator_self_buy", candidate.token.creator.as_str(), 80);
+    }
+    if reason.contains("blacklist keyword") {
+        push("blacklist_keyword", reason, 70);
+    }
+    if reason.contains("symbol too long") {
+        push("symbol_shape", candidate.token.symbol.as_str(), 35);
+    }
+    if reason.contains("early concentration") {
+        push("buy_concentration", reason, 60);
+    }
+    signals
+}
+
+fn build_label_suggestions(
+    candidate: &Candidate,
+    passed: bool,
+    reject_gate: Option<&str>,
+    score: Option<u32>,
+    reason: &str,
+) -> Vec<LabelSuggestionRecord> {
+    let now = now_ms();
+    let mut out = Vec::new();
+    if passed && score.unwrap_or_default() >= 60 {
+        out.push(LabelSuggestionRecord {
+            label_type: "watch_creator".to_string(),
+            subject: candidate.token.creator.clone(),
+            reason: format!("passed filter with score {}", score.unwrap_or_default()),
+            score: score.unwrap_or_default() as i32,
+            mint: Some(candidate.token.mint.clone()),
+            created_at_ms: now,
+        });
+    }
+    if reason.contains("factory creator pattern") || reason.contains("blacklist keyword") {
+        out.push(LabelSuggestionRecord {
+            label_type: "creator_blacklist_candidate".to_string(),
+            subject: candidate.token.creator.clone(),
+            reason: reason.to_string(),
+            score: 90,
+            mint: Some(candidate.token.mint.clone()),
+            created_at_ms: now,
+        });
+    } else if reject_gate == Some("gate3") && reason.contains("creator self-buy") {
+        out.push(LabelSuggestionRecord {
+            label_type: "creator_review_candidate".to_string(),
+            subject: candidate.token.creator.clone(),
+            reason: reason.to_string(),
+            score: 70,
+            mint: Some(candidate.token.mint.clone()),
+            created_at_ms: now,
+        });
+    }
+    out
+}
+
 fn now_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -2308,9 +2780,14 @@ mod tests {
             grpc_account_token: None,
             scanner_grpc_url: String::new(),
             scanner_grpc_token: None,
+            scanner_secondary_grpc_url: None,
+            scanner_secondary_grpc_token: None,
+            scanner_primary_feed_label: "primary_processed".to_string(),
+            scanner_secondary_feed_label: "secondary_processed".to_string(),
             helius_api_key: None,
             coingecko_api_key: None,
             filter_db_path: String::new(),
+            replay_db_path: String::new(),
             smart_money_file: String::new(),
             smart_money_funder_file: String::new(),
             blocked_buyers_file: String::new(),
@@ -2321,6 +2798,11 @@ mod tests {
             dynamic_hot_refresh_secs: 60,
             dynamic_hot_keywords_enabled: true,
             dynamic_hot_keywords_limit: 40,
+            persist_raw_scanner_events: true,
+            persist_gate3_sequences: true,
+            persist_scoring_breakdowns: true,
+            persist_label_suggestions: true,
+            persist_feed_health: true,
             smart_money_window_secs: 60,
             smart_money_fast_window_ms: 650,
             smart_money_soft_window_ms: 1_500,
@@ -2399,6 +2881,7 @@ mod tests {
             soft_reached_at_ms: None,
             buy_count: 2,
             eligible_buyers: 2,
+            unique_funders: 0,
             max_single_buyer_share: 0.55,
             max_single_buyer: Some("a".to_string()),
             creator_buy_count: 0,
@@ -2432,6 +2915,7 @@ mod tests {
             soft_reached_at_ms: Some(2_000),
             buy_count: 4,
             eligible_buyers: 4,
+            unique_funders: 0,
             max_single_buyer_share: 0.35,
             max_single_buyer: Some("a".to_string()),
             creator_buy_count: 0,
@@ -2458,6 +2942,7 @@ mod tests {
             soft_reached_at_ms: None,
             buy_count: 2,
             eligible_buyers: 2,
+            unique_funders: 0,
             max_single_buyer_share: 0.55,
             max_single_buyer: Some("a".to_string()),
             creator_buy_count: 0,
@@ -2482,6 +2967,7 @@ mod tests {
                 signature: String::new(),
                 slot: 0,
                 discovered_at_ms: 0,
+                feed_source: "test".to_string(),
                 is_v2: true,
             },
             created_at: Instant::now(),
@@ -2508,6 +2994,7 @@ mod tests {
             soft_reached_at_ms: None,
             buy_count: 1,
             eligible_buyers: 1,
+            unique_funders: 0,
             max_single_buyer_share: 1.0,
             max_single_buyer: Some("creator".to_string()),
             creator_buy_count: 1,
@@ -2532,6 +3019,7 @@ mod tests {
                 signature: String::new(),
                 slot: 0,
                 discovered_at_ms: 0,
+                feed_source: "test".to_string(),
                 is_v2: true,
             },
             created_at: Instant::now(),
@@ -2560,6 +3048,7 @@ mod tests {
             soft_reached_at_ms: Some(300),
             buy_count: 2,
             eligible_buyers: 2,
+            unique_funders: 0,
             max_single_buyer_share: 0.66,
             max_single_buyer: Some("other".to_string()),
             creator_buy_count: 1,
@@ -2583,6 +3072,7 @@ mod tests {
                 signature: String::new(),
                 slot: 0,
                 discovered_at_ms: 0,
+                feed_source: "test".to_string(),
                 is_v2: true,
             },
             created_at: Instant::now(),
@@ -2616,6 +3106,7 @@ mod tests {
             soft_reached_at_ms: Some(80),
             buy_count: 4,
             eligible_buyers: 4,
+            unique_funders: 0,
             max_single_buyer_share: 0.36,
             max_single_buyer: Some("creator".to_string()),
             creator_buy_count: 1,
@@ -2645,6 +3136,7 @@ mod tests {
             signature: String::new(),
             slot: 0,
             discovered_at_ms: 0,
+            feed_source: "test".to_string(),
             is_v2: true,
         };
         let mut dynamic = HashSet::new();

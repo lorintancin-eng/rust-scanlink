@@ -26,6 +26,14 @@ pub struct BuyerProfile {
     pub fetched_at_ms: u64,
 }
 
+#[derive(Debug, Clone, Default)]
+pub struct FunderProfile {
+    pub address: String,
+    pub wallet_count: u32,
+    pub rug_exposure: u32,
+    pub last_seen_ms: u64,
+}
+
 #[derive(Debug, Clone)]
 pub struct FilterResultRecord {
     pub mint: String,
@@ -56,6 +64,114 @@ pub struct FilterTimingRecord {
     pub matched_buyers: usize,
 }
 
+#[derive(Debug, Clone)]
+pub struct RawEventRecord {
+    pub feed_source: String,
+    pub event_type: String,
+    pub slot: u64,
+    pub signature: String,
+    pub mint: String,
+    pub actor: Option<String>,
+    pub recorded_at_ms: u64,
+    pub payload_json: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct FeedHealthRecord {
+    pub feed_label: String,
+    pub feed_url: String,
+    pub status: String,
+    pub detail: String,
+    pub ts_ms: u64,
+}
+
+#[derive(Debug, Clone)]
+pub struct Gate3SnapshotRecord {
+    pub mint: String,
+    pub mode: String,
+    pub path: String,
+    pub buy_count: usize,
+    pub unique_buyers: usize,
+    pub unique_funders: usize,
+    pub matched_buyers: usize,
+    pub total_sol: f64,
+    pub matched_sol: f64,
+    pub creator_buy_sol: f64,
+    pub max_single_buyer_share: f64,
+    pub first_buy_ms: Option<u64>,
+    pub threshold_hit_ms: Option<u64>,
+    pub recorded_at_ms: u64,
+}
+
+#[derive(Debug, Clone)]
+pub struct Gate3SequenceRecord {
+    pub mint: String,
+    pub seq_no: usize,
+    pub buyer: String,
+    pub funder: Option<String>,
+    pub cluster_id: Option<String>,
+    pub sol_amount: f64,
+    pub detected_at_ms: u64,
+    pub is_creator: bool,
+    pub feed_source: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct ScoringBreakdownRecord {
+    pub mint: String,
+    pub path: String,
+    pub quality_score: u32,
+    pub urgency_score: u32,
+    pub execution_confidence: u32,
+    pub total_score: u32,
+    pub required_score: u32,
+    pub details_json: String,
+    pub recorded_at_ms: u64,
+}
+
+#[derive(Debug, Clone)]
+pub struct RiskSignalRecord {
+    pub mint: String,
+    pub signal_type: String,
+    pub signal_value: String,
+    pub score: i32,
+    pub detected_at_ms: u64,
+}
+
+#[derive(Debug, Clone)]
+pub struct DynamicKeywordRecord {
+    pub keyword: String,
+    pub source: String,
+    pub score: u32,
+    pub expires_at_ms: u64,
+}
+
+#[derive(Debug, Clone)]
+pub struct LabelSuggestionRecord {
+    pub label_type: String,
+    pub subject: String,
+    pub reason: String,
+    pub score: i32,
+    pub mint: Option<String>,
+    pub created_at_ms: u64,
+}
+
+#[derive(Debug, Clone)]
+pub struct ClusterMemberRecord {
+    pub cluster_id: String,
+    pub address: String,
+    pub cluster_type: String,
+    pub score: i32,
+}
+
+#[derive(Debug, Clone)]
+pub struct ClusterEdgeRecord {
+    pub src: String,
+    pub dst: String,
+    pub edge_type: String,
+    pub weight: i32,
+}
+
 #[derive(Clone)]
 pub struct FilterDb {
     path: Arc<PathBuf>,
@@ -68,13 +184,13 @@ impl FilterDb {
         if let Some(parent) = path.parent() {
             tokio::fs::create_dir_all(parent)
                 .await
-                .with_context(|| format!("鍒涘缓杩囨护灞傜洰褰曞け璐? {}", parent.display()))?;
+                .with_context(|| format!("create sqlite parent failed: {}", parent.display()))?;
         }
 
         let init_path = path.clone();
         tokio::task::spawn_blocking(move || init_db(&init_path))
             .await
-            .context("鍒濆鍖栬繃婊ゅ眰 SQLite 浠诲姟澶辫触")??;
+            .context("initialize sqlite schema failed")??;
 
         Ok(Self {
             path: Arc::new(path),
@@ -108,15 +224,12 @@ impl FilterDb {
             .map_err(Into::into)
         })
         .await
-        .context("璇诲彇 creator_profiles 浠诲姟澶辫触")?
+        .context("query creator_profiles failed")?
     }
 
     pub async fn upsert_creator_profile(&self, profile: &CreatorProfile) -> Result<()> {
-        let _guard = self.write_lock.lock().await;
-        let path = self.path.clone();
         let profile = profile.clone();
-        tokio::task::spawn_blocking(move || {
-            let conn = open_conn(path.as_path())?;
+        self.with_conn(move |conn| {
             conn.execute(
                 "INSERT INTO creator_profiles(address, total_tokens, graduated, rug_count, oldest_tx_ms, wallet_age_days, first_funder, fetched_at_ms)
                  VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
@@ -139,11 +252,9 @@ impl FilterDb {
                     profile.fetched_at_ms,
                 ],
             )?;
-            Ok::<_, anyhow::Error>(())
+            Ok(())
         })
         .await
-        .context("鍐欏叆 creator_profiles 浠诲姟澶辫触")??;
-        Ok(())
     }
 
     pub async fn get_buyer_profile(&self, address: &str) -> Result<Option<BuyerProfile>> {
@@ -169,15 +280,12 @@ impl FilterDb {
             .map_err(Into::into)
         })
         .await
-        .context("璇诲彇 buyer_profiles 浠诲姟澶辫触")?
+        .context("query buyer_profiles failed")?
     }
 
     pub async fn upsert_buyer_profile(&self, profile: &BuyerProfile) -> Result<()> {
-        let _guard = self.write_lock.lock().await;
-        let path = self.path.clone();
         let profile = profile.clone();
-        tokio::task::spawn_blocking(move || {
-            let conn = open_conn(path.as_path())?;
+        self.with_conn(move |conn| {
             conn.execute(
                 "INSERT INTO buyer_profiles(address, oldest_tx_ms, wallet_age_days, first_funder, fetched_at_ms)
                  VALUES(?1, ?2, ?3, ?4, ?5)
@@ -194,19 +302,61 @@ impl FilterDb {
                     profile.fetched_at_ms,
                 ],
             )?;
-            Ok::<_, anyhow::Error>(())
+            Ok(())
         })
         .await
-        .context("鍐欏叆 buyer_profiles 浠诲姟澶辫触")??;
-        Ok(())
+    }
+
+    pub async fn get_funder_profile(&self, address: &str) -> Result<Option<FunderProfile>> {
+        let path = self.path.clone();
+        let address = address.to_string();
+        tokio::task::spawn_blocking(move || {
+            let conn = open_conn(path.as_path())?;
+            conn.query_row(
+                "SELECT address, wallet_count, rug_exposure, last_seen_ms
+                 FROM funder_profiles WHERE address = ?1",
+                params![address],
+                |row| {
+                    Ok(FunderProfile {
+                        address: row.get(0)?,
+                        wallet_count: row.get(1)?,
+                        rug_exposure: row.get(2)?,
+                        last_seen_ms: row.get(3)?,
+                    })
+                },
+            )
+            .optional()
+            .map_err(Into::into)
+        })
+        .await
+        .context("query funder_profiles failed")?
+    }
+
+    pub async fn upsert_funder_profile(&self, profile: &FunderProfile) -> Result<()> {
+        let profile = profile.clone();
+        self.with_conn(move |conn| {
+            conn.execute(
+                "INSERT INTO funder_profiles(address, wallet_count, rug_exposure, last_seen_ms)
+                 VALUES(?1, ?2, ?3, ?4)
+                 ON CONFLICT(address) DO UPDATE SET
+                    wallet_count = MAX(wallet_count, excluded.wallet_count),
+                    rug_exposure = MAX(rug_exposure, excluded.rug_exposure),
+                    last_seen_ms = MAX(last_seen_ms, excluded.last_seen_ms)",
+                params![
+                    profile.address,
+                    profile.wallet_count,
+                    profile.rug_exposure,
+                    profile.last_seen_ms,
+                ],
+            )?;
+            Ok(())
+        })
+        .await
     }
 
     pub async fn insert_filter_result(&self, record: &FilterResultRecord) -> Result<()> {
-        let _guard = self.write_lock.lock().await;
-        let path = self.path.clone();
         let record = record.clone();
-        tokio::task::spawn_blocking(move || {
-            let conn = open_conn(path.as_path())?;
+        self.with_conn(move |conn| {
             conn.execute(
                 "INSERT OR REPLACE INTO filter_results(
                     mint, creator, symbol, passed, reject_gate, score, reason, ts
@@ -219,22 +369,17 @@ impl FilterDb {
                     record.reject_gate,
                     record.score,
                     record.reason,
-                    record.ts
+                    record.ts,
                 ],
             )?;
-            Ok::<_, anyhow::Error>(())
+            Ok(())
         })
         .await
-        .context("鍐欏叆 filter_results 浠诲姟澶辫触")??;
-        Ok(())
     }
 
     pub async fn insert_filter_timing(&self, record: &FilterTimingRecord) -> Result<()> {
-        let _guard = self.write_lock.lock().await;
-        let path = self.path.clone();
         let record = record.clone();
-        tokio::task::spawn_blocking(move || {
-            let conn = open_conn(path.as_path())?;
+        self.with_conn(move |conn| {
             conn.execute(
                 "INSERT OR REPLACE INTO filter_timelines(
                     mint, decision, mode, path, detected_at_ms, gate1_at_ms, gate2_at_ms, gate3_open_at_ms,
@@ -257,19 +402,254 @@ impl FilterDb {
                     record.matched_buyers as u64,
                 ],
             )?;
-            Ok::<_, anyhow::Error>(())
+            Ok(())
         })
         .await
-        .context("鍐欏叆 filter_timelines 浠诲姟澶辫触")??;
-        Ok(())
+    }
+
+    pub async fn insert_raw_event(&self, record: &RawEventRecord) -> Result<()> {
+        let record = record.clone();
+        self.with_conn(move |conn| {
+            conn.execute(
+                "INSERT INTO raw_events(
+                    feed_source, event_type, slot, signature, mint, actor, recorded_at_ms, payload_json
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                params![
+                    record.feed_source,
+                    record.event_type,
+                    record.slot,
+                    record.signature,
+                    record.mint,
+                    record.actor,
+                    record.recorded_at_ms,
+                    record.payload_json,
+                ],
+            )?;
+            Ok(())
+        })
+        .await
+    }
+
+    pub async fn insert_feed_health(&self, record: &FeedHealthRecord) -> Result<()> {
+        let record = record.clone();
+        self.with_conn(move |conn| {
+            conn.execute(
+                "INSERT INTO feed_health(feed_label, feed_url, status, detail, ts_ms)
+                 VALUES(?1, ?2, ?3, ?4, ?5)",
+                params![
+                    record.feed_label,
+                    record.feed_url,
+                    record.status,
+                    record.detail,
+                    record.ts_ms,
+                ],
+            )?;
+            Ok(())
+        })
+        .await
+    }
+
+    pub async fn insert_gate3_snapshot(&self, record: &Gate3SnapshotRecord) -> Result<()> {
+        let record = record.clone();
+        self.with_conn(move |conn| {
+            conn.execute(
+                "INSERT OR REPLACE INTO gate3_snapshots(
+                    mint, mode, path, buy_count, unique_buyers, unique_funders, matched_buyers, total_sol,
+                    matched_sol, creator_buy_sol, max_single_buyer_share, first_buy_ms, threshold_hit_ms, recorded_at_ms
+                 ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
+                params![
+                    record.mint,
+                    record.mode,
+                    record.path,
+                    record.buy_count as u64,
+                    record.unique_buyers as u64,
+                    record.unique_funders as u64,
+                    record.matched_buyers as u64,
+                    record.total_sol,
+                    record.matched_sol,
+                    record.creator_buy_sol,
+                    record.max_single_buyer_share,
+                    record.first_buy_ms,
+                    record.threshold_hit_ms,
+                    record.recorded_at_ms,
+                ],
+            )?;
+            Ok(())
+        })
+        .await
+    }
+
+    pub async fn replace_gate3_sequences(
+        &self,
+        mint: &str,
+        records: &[Gate3SequenceRecord],
+    ) -> Result<()> {
+        let mint = mint.to_string();
+        let records = records.to_vec();
+        self.with_conn(move |conn| {
+            let tx = conn.unchecked_transaction()?;
+            tx.execute("DELETE FROM gate3_sequences WHERE mint = ?1", params![mint])?;
+            for record in records {
+                tx.execute(
+                    "INSERT INTO gate3_sequences(
+                        mint, seq_no, buyer, funder, cluster_id, sol_amount, detected_at_ms, is_creator, feed_source
+                     ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                    params![
+                        record.mint,
+                        record.seq_no as u64,
+                        record.buyer,
+                        record.funder,
+                        record.cluster_id,
+                        record.sol_amount,
+                        record.detected_at_ms,
+                        if record.is_creator { 1 } else { 0 },
+                        record.feed_source,
+                    ],
+                )?;
+            }
+            tx.commit()?;
+            Ok(())
+        })
+        .await
+    }
+
+    pub async fn insert_scoring_breakdown(&self, record: &ScoringBreakdownRecord) -> Result<()> {
+        let record = record.clone();
+        self.with_conn(move |conn| {
+            conn.execute(
+                "INSERT OR REPLACE INTO scoring_breakdowns(
+                    mint, path, quality_score, urgency_score, execution_confidence, total_score,
+                    required_score, details_json, recorded_at_ms
+                 ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                params![
+                    record.mint,
+                    record.path,
+                    record.quality_score,
+                    record.urgency_score,
+                    record.execution_confidence,
+                    record.total_score,
+                    record.required_score,
+                    record.details_json,
+                    record.recorded_at_ms,
+                ],
+            )?;
+            Ok(())
+        })
+        .await
+    }
+
+    pub async fn replace_risk_signals(&self, mint: &str, signals: &[RiskSignalRecord]) -> Result<()> {
+        let mint = mint.to_string();
+        let signals = signals.to_vec();
+        self.with_conn(move |conn| {
+            let tx = conn.unchecked_transaction()?;
+            tx.execute("DELETE FROM token_risk_signals WHERE mint = ?1", params![mint])?;
+            for signal in signals {
+                tx.execute(
+                    "INSERT INTO token_risk_signals(mint, signal_type, signal_value, score, detected_at_ms)
+                     VALUES(?1, ?2, ?3, ?4, ?5)",
+                    params![
+                        signal.mint,
+                        signal.signal_type,
+                        signal.signal_value,
+                        signal.score,
+                        signal.detected_at_ms,
+                    ],
+                )?;
+            }
+            tx.commit()?;
+            Ok(())
+        })
+        .await
+    }
+
+    pub async fn replace_dynamic_keywords(
+        &self,
+        source: &str,
+        keywords: &[DynamicKeywordRecord],
+    ) -> Result<()> {
+        let source = source.to_string();
+        let keywords = keywords.to_vec();
+        self.with_conn(move |conn| {
+            let tx = conn.unchecked_transaction()?;
+            tx.execute("DELETE FROM dynamic_keywords WHERE source = ?1", params![source])?;
+            for keyword in keywords {
+                tx.execute(
+                    "INSERT INTO dynamic_keywords(keyword, source, score, expires_at_ms)
+                     VALUES(?1, ?2, ?3, ?4)",
+                    params![
+                        keyword.keyword,
+                        keyword.source,
+                        keyword.score,
+                        keyword.expires_at_ms,
+                    ],
+                )?;
+            }
+            tx.commit()?;
+            Ok(())
+        })
+        .await
+    }
+
+    pub async fn insert_label_suggestion(&self, record: &LabelSuggestionRecord) -> Result<()> {
+        let record = record.clone();
+        self.with_conn(move |conn| {
+            conn.execute(
+                "INSERT INTO label_suggestions(label_type, subject, reason, score, mint, created_at_ms)
+                 VALUES(?1, ?2, ?3, ?4, ?5, ?6)",
+                params![
+                    record.label_type,
+                    record.subject,
+                    record.reason,
+                    record.score,
+                    record.mint,
+                    record.created_at_ms,
+                ],
+            )?;
+            Ok(())
+        })
+        .await
+    }
+
+    pub async fn upsert_cluster_member(&self, record: &ClusterMemberRecord) -> Result<()> {
+        let record = record.clone();
+        self.with_conn(move |conn| {
+            conn.execute(
+                "INSERT INTO address_clusters(cluster_id, address, cluster_type, score)
+                 VALUES(?1, ?2, ?3, ?4)
+                 ON CONFLICT(cluster_id, address) DO UPDATE SET
+                    cluster_type = excluded.cluster_type,
+                    score = MAX(score, excluded.score)",
+                params![
+                    record.cluster_id,
+                    record.address,
+                    record.cluster_type,
+                    record.score,
+                ],
+            )?;
+            Ok(())
+        })
+        .await
+    }
+
+    pub async fn upsert_cluster_edge(&self, record: &ClusterEdgeRecord) -> Result<()> {
+        let record = record.clone();
+        self.with_conn(move |conn| {
+            conn.execute(
+                "INSERT INTO cluster_edges(src, dst, edge_type, weight)
+                 VALUES(?1, ?2, ?3, ?4)
+                 ON CONFLICT(src, dst, edge_type) DO UPDATE SET
+                    weight = MAX(weight, excluded.weight)",
+                params![record.src, record.dst, record.edge_type, record.weight],
+            )?;
+            Ok(())
+        })
+        .await
     }
 
     pub async fn sync_blacklist(&self, addresses: &[String]) -> Result<()> {
-        let _guard = self.write_lock.lock().await;
-        let path = self.path.clone();
         let entries = addresses.to_vec();
-        tokio::task::spawn_blocking(move || {
-            let conn = open_conn(path.as_path())?;
+        self.with_conn(move |conn| {
             let tx = conn.unchecked_transaction()?;
             for address in entries {
                 tx.execute(
@@ -280,19 +660,14 @@ impl FilterDb {
                 )?;
             }
             tx.commit()?;
-            Ok::<_, anyhow::Error>(())
+            Ok(())
         })
         .await
-        .context("鍚屾 blacklist 浠诲姟澶辫触")??;
-        Ok(())
     }
 
     pub async fn sync_smart_money(&self, addresses: &[String]) -> Result<()> {
-        let _guard = self.write_lock.lock().await;
-        let path = self.path.clone();
         let entries = addresses.to_vec();
-        tokio::task::spawn_blocking(move || {
-            let conn = open_conn(path.as_path())?;
+        self.with_conn(move |conn| {
             let tx = conn.unchecked_transaction()?;
             for address in entries {
                 tx.execute(
@@ -303,10 +678,24 @@ impl FilterDb {
                 )?;
             }
             tx.commit()?;
+            Ok(())
+        })
+        .await
+    }
+
+    async fn with_conn<F>(&self, func: F) -> Result<()>
+    where
+        F: FnOnce(&mut Connection) -> Result<()> + Send + 'static,
+    {
+        let _guard = self.write_lock.lock().await;
+        let path = self.path.clone();
+        tokio::task::spawn_blocking(move || {
+            let mut conn = open_conn(path.as_path())?;
+            func(&mut conn)?;
             Ok::<_, anyhow::Error>(())
         })
         .await
-        .context("鍚屾 smart_money 浠诲姟澶辫触")??;
+        .context("sqlite write task failed")??;
         Ok(())
     }
 }
@@ -330,6 +719,12 @@ fn init_db(path: &Path) -> Result<()> {
             wallet_age_days INTEGER NOT NULL DEFAULT 0,
             first_funder TEXT,
             fetched_at_ms INTEGER NOT NULL DEFAULT 0
+        );
+        CREATE TABLE IF NOT EXISTS funder_profiles (
+            address TEXT PRIMARY KEY,
+            wallet_count INTEGER NOT NULL DEFAULT 0,
+            rug_exposure INTEGER NOT NULL DEFAULT 0,
+            last_seen_ms INTEGER NOT NULL DEFAULT 0
         );
         CREATE TABLE IF NOT EXISTS smart_money (
             address TEXT PRIMARY KEY,
@@ -367,6 +762,101 @@ fn init_db(path: &Path) -> Result<()> {
             latency_ms INTEGER NOT NULL,
             early_buy_count INTEGER NOT NULL DEFAULT 0,
             matched_buyers INTEGER NOT NULL DEFAULT 0
+        );
+        CREATE TABLE IF NOT EXISTS raw_events (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            feed_source TEXT NOT NULL,
+            event_type TEXT NOT NULL,
+            slot INTEGER NOT NULL,
+            signature TEXT NOT NULL,
+            mint TEXT NOT NULL,
+            actor TEXT,
+            recorded_at_ms INTEGER NOT NULL,
+            payload_json TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS feed_health (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            feed_label TEXT NOT NULL,
+            feed_url TEXT NOT NULL,
+            status TEXT NOT NULL,
+            detail TEXT NOT NULL,
+            ts_ms INTEGER NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS gate3_snapshots (
+            mint TEXT PRIMARY KEY,
+            mode TEXT NOT NULL,
+            path TEXT NOT NULL,
+            buy_count INTEGER NOT NULL,
+            unique_buyers INTEGER NOT NULL,
+            unique_funders INTEGER NOT NULL DEFAULT 0,
+            matched_buyers INTEGER NOT NULL DEFAULT 0,
+            total_sol REAL NOT NULL DEFAULT 0,
+            matched_sol REAL NOT NULL DEFAULT 0,
+            creator_buy_sol REAL NOT NULL DEFAULT 0,
+            max_single_buyer_share REAL NOT NULL DEFAULT 0,
+            first_buy_ms INTEGER,
+            threshold_hit_ms INTEGER,
+            recorded_at_ms INTEGER NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS gate3_sequences (
+            mint TEXT NOT NULL,
+            seq_no INTEGER NOT NULL,
+            buyer TEXT NOT NULL,
+            funder TEXT,
+            cluster_id TEXT,
+            sol_amount REAL NOT NULL DEFAULT 0,
+            detected_at_ms INTEGER NOT NULL,
+            is_creator INTEGER NOT NULL DEFAULT 0,
+            feed_source TEXT NOT NULL,
+            PRIMARY KEY(mint, seq_no)
+        );
+        CREATE TABLE IF NOT EXISTS scoring_breakdowns (
+            mint TEXT PRIMARY KEY,
+            path TEXT NOT NULL,
+            quality_score INTEGER NOT NULL,
+            urgency_score INTEGER NOT NULL,
+            execution_confidence INTEGER NOT NULL,
+            total_score INTEGER NOT NULL,
+            required_score INTEGER NOT NULL,
+            details_json TEXT NOT NULL,
+            recorded_at_ms INTEGER NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS token_risk_signals (
+            mint TEXT NOT NULL,
+            signal_type TEXT NOT NULL,
+            signal_value TEXT NOT NULL,
+            score INTEGER NOT NULL DEFAULT 0,
+            detected_at_ms INTEGER NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS dynamic_keywords (
+            keyword TEXT NOT NULL,
+            source TEXT NOT NULL,
+            score INTEGER NOT NULL DEFAULT 0,
+            expires_at_ms INTEGER NOT NULL,
+            PRIMARY KEY(keyword, source)
+        );
+        CREATE TABLE IF NOT EXISTS label_suggestions (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            label_type TEXT NOT NULL,
+            subject TEXT NOT NULL,
+            reason TEXT NOT NULL,
+            score INTEGER NOT NULL,
+            mint TEXT,
+            created_at_ms INTEGER NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS address_clusters (
+            cluster_id TEXT NOT NULL,
+            address TEXT NOT NULL,
+            cluster_type TEXT NOT NULL,
+            score INTEGER NOT NULL DEFAULT 0,
+            PRIMARY KEY(cluster_id, address)
+        );
+        CREATE TABLE IF NOT EXISTS cluster_edges (
+            src TEXT NOT NULL,
+            dst TEXT NOT NULL,
+            edge_type TEXT NOT NULL,
+            weight INTEGER NOT NULL DEFAULT 0,
+            PRIMARY KEY(src, dst, edge_type)
         );",
     )?;
     ensure_column(
@@ -404,7 +894,7 @@ fn ensure_column(conn: &Connection, table: &str, column: &str, statement: &str) 
 
 fn open_conn(path: &Path) -> Result<Connection> {
     let conn = Connection::open(path)
-        .with_context(|| format!("鎵撳紑 SQLite 澶辫触: {}", path.display()))?;
+        .with_context(|| format!("open SQLite failed: {}", path.display()))?;
     conn.pragma_update(None, "journal_mode", "WAL")?;
     conn.busy_timeout(Duration::from_secs(5))?;
     Ok(conn)

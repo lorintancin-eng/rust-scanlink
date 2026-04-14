@@ -1,4 +1,6 @@
 pub mod decoder;
+pub mod failover;
+pub mod feed;
 pub mod geyser;
 
 pub use decoder::{NewToken, PumpBuyEvent, ScannerEvent};

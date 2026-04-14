@@ -1,4 +1,5 @@
 use crate::config::AppConfig;
+use crate::scanner::feed::FeedEndpoint;
 use crate::scanner::{decoder, ScannerEvent, PUMP_PROGRAM_ID};
 use anyhow::{Context, Result};
 use futures::StreamExt;
@@ -14,19 +15,64 @@ use yellowstone_grpc_proto::prelude::{
 };
 
 pub async fn start(cfg: Arc<AppConfig>, tx: mpsc::Sender<ScannerEvent>) -> Result<()> {
+    let endpoints = build_endpoints(cfg.as_ref());
+    let Some(primary) = endpoints.first().cloned() else {
+        anyhow::bail!("scanner feed list is empty");
+    };
+
+    for endpoint in endpoints.into_iter().skip(1) {
+        let cfg_clone = cfg.clone();
+        let tx_clone = tx.clone();
+        tokio::spawn(async move {
+            if let Err(err) = start_feed_loop(cfg_clone, endpoint, tx_clone).await {
+                error!("scanner: secondary feed task exited | {}", err);
+            }
+        });
+    }
+
+    start_feed_loop(cfg, primary, tx).await
+}
+
+fn build_endpoints(cfg: &AppConfig) -> Vec<FeedEndpoint> {
+    let mut endpoints = vec![FeedEndpoint::new(
+        cfg.scanner_primary_feed_label.clone(),
+        cfg.scanner_grpc_url.clone(),
+        cfg.scanner_grpc_token.clone(),
+    )];
+
+    if let Some(url) = cfg.scanner_secondary_grpc_url.clone() {
+        endpoints.push(FeedEndpoint::new(
+            cfg.scanner_secondary_feed_label.clone(),
+            url,
+            cfg.scanner_secondary_grpc_token.clone().or_else(|| cfg.scanner_grpc_token.clone()),
+        ));
+    }
+
+    endpoints
+}
+
+async fn start_feed_loop(
+    cfg: Arc<AppConfig>,
+    endpoint: FeedEndpoint,
+    tx: mpsc::Sender<ScannerEvent>,
+) -> Result<()> {
     let mut retry_delay = Duration::from_secs(1);
     const MAX_DELAY: Duration = Duration::from_secs(30);
 
     loop {
-        info!("扫链：正在连接 gRPC 节点 {}", cfg.scanner_grpc_url);
-        match run_stream(&cfg, &tx).await {
+        info!(
+            "scanner: connecting feed={} url={}",
+            endpoint.label, endpoint.url
+        );
+        match run_stream(cfg.as_ref(), &endpoint, &tx).await {
             Ok(()) => {
-                warn!("扫链：输出通道已关闭，停止扫链任务");
+                warn!("scanner: output channel closed | feed={}", endpoint.label);
                 return Ok(());
             }
             Err(err) => {
                 error!(
-                    "扫链：连接断开，{} 秒后重连 | {}",
+                    "scanner: feed disconnected | feed={} | retry_in={}s | {}",
+                    endpoint.label,
                     retry_delay.as_secs(),
                     err
                 );
@@ -37,23 +83,30 @@ pub async fn start(cfg: Arc<AppConfig>, tx: mpsc::Sender<ScannerEvent>) -> Resul
     }
 }
 
-async fn run_stream(cfg: &AppConfig, tx: &mpsc::Sender<ScannerEvent>) -> Result<()> {
-    let mut client = GeyserGrpcClient::build_from_shared(cfg.scanner_grpc_url.clone())?
-        .x_token(cfg.scanner_grpc_token.clone())?
+async fn run_stream(
+    cfg: &AppConfig,
+    endpoint: &FeedEndpoint,
+    tx: &mpsc::Sender<ScannerEvent>,
+) -> Result<()> {
+    let mut client = GeyserGrpcClient::build_from_shared(endpoint.url.clone())?
+        .x_token(endpoint.token.clone())?
         .connect_timeout(Duration::from_secs(10))
         .timeout(Duration::from_secs(30))
         .tls_config(ClientTlsConfig::new().with_native_roots())?
         .max_decoding_message_size(64 * 1024 * 1024)
         .connect()
         .await
-        .context("扫链：gRPC 连接失败")?;
+        .context("scanner gRPC connect failed")?;
 
     let (_, mut stream) = client
         .subscribe_with_request(Some(build_subscribe_request()))
         .await
-        .context("扫链：发送订阅请求失败")?;
+        .context("scanner subscribe request failed")?;
 
-    info!("扫链：订阅成功，开始监听 Pump.fun 新币与早期买入");
+    info!(
+        "scanner: subscription ready | feed={} | program={}",
+        endpoint.label, PUMP_PROGRAM_ID
+    );
 
     let mut last_message_at = Instant::now();
     let idle_timeout = Duration::from_secs(cfg.scanner_idle_timeout_secs);
@@ -66,7 +119,9 @@ async fn run_stream(cfg: &AppConfig, tx: &mpsc::Sender<ScannerEvent>) -> Result<
                 match update.update_oneof {
                     Some(UpdateOneof::Transaction(tx_update)) => {
                         if let Some(tx_info) = tx_update.transaction.as_ref() {
-                            for event in decoder::decode_transaction(tx_update.slot, tx_info) {
+                            for event in
+                                decoder::decode_transaction(&endpoint.label, tx_update.slot, tx_info)
+                            {
                                 if tx.send(event).await.is_err() {
                                     return Ok(());
                                 }
@@ -74,25 +129,27 @@ async fn run_stream(cfg: &AppConfig, tx: &mpsc::Sender<ScannerEvent>) -> Result<
                         }
                     }
                     Some(UpdateOneof::Ping(_)) => {
-                        debug!("扫链：收到 gRPC Ping");
+                        debug!("scanner: ping | feed={}", endpoint.label);
                     }
                     Some(UpdateOneof::Pong(_)) => {
-                        debug!("扫链：收到 gRPC Pong");
+                        debug!("scanner: pong | feed={}", endpoint.label);
                     }
                     Some(other) => {
                         debug!(
-                            "扫链：忽略非交易更新 {:?}",
+                            "scanner: ignored non-transaction update | feed={} | kind={:?}",
+                            endpoint.label,
                             std::mem::discriminant(&other)
                         );
                     }
                     None => {}
                 }
             }
-            Ok(Some(Err(err))) => return Err(err).context("扫链：消息流读取失败"),
-            Ok(None) => anyhow::bail!("扫链：gRPC 流意外结束"),
+            Ok(Some(Err(err))) => return Err(err).context("scanner stream read failed"),
+            Ok(None) => anyhow::bail!("scanner stream ended unexpectedly"),
             Err(_) if last_message_at.elapsed() >= idle_timeout => {
                 anyhow::bail!(
-                    "扫链：超过 {} 秒没有收到任何消息，主动重连",
+                    "scanner feed idle timeout | feed={} | idle_secs={}",
+                    endpoint.label,
                     cfg.scanner_idle_timeout_secs
                 );
             }

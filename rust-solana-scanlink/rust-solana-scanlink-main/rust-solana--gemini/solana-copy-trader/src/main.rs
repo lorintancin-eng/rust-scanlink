@@ -151,8 +151,18 @@ fn runtime_guard_is_stale(path: &Path) -> Result<bool> {
 #[tokio::main]
 async fn main() -> Result<()> {
     init_logging();
+    /*
 
     info!("==============================================");
+    */
+    info!("==============================================");
+    info!(
+        "   Solana Pump.fun Scanner System v{}",
+        env!("CARGO_PKG_VERSION")
+    );
+    info!("   Yellowstone Scanner + Multi-Gate Filter + Execution Router");
+    info!("==============================================");
+    /*
     info!(
         "   Solana Pump.fun Scanner System v{}",
         env!("CARGO_PKG_VERSION")
@@ -160,6 +170,7 @@ async fn main() -> Result<()> {
     info!("   Yellowstone Scanner + 四层过滤 + 现有执行层");
     info!("==============================================");
 
+    */
     let config = Arc::new(AppConfig::from_env()?);
     let _runtime_guard = RuntimeGuard::acquire(config.as_ref())?;
     let execution_plan = ExecutionPlan::from_config(config.as_ref());
@@ -215,6 +226,21 @@ async fn main() -> Result<()> {
         config.dynamic_narrative_bonus_cap,
         config.dynamic_hot_keywords_file,
         config.coingecko_api_key.is_some(),
+    );
+    info!(
+        "Scanner feeds: primary_label={} primary_url={} | secondary_label={} secondary_url={} | persist_raw_events={} gate3_sequences={} scoring_breakdowns={} labels={} replay_db={}",
+        config.scanner_primary_feed_label,
+        config.scanner_grpc_url,
+        config.scanner_secondary_feed_label,
+        config
+            .scanner_secondary_grpc_url
+            .as_deref()
+            .unwrap_or("-"),
+        config.persist_raw_scanner_events,
+        config.persist_gate3_sequences,
+        config.persist_scoring_breakdowns,
+        config.persist_label_suggestions,
+        config.replay_db_path,
     );
 
     let rpc_client = Arc::new(RpcClient::new_with_commitment(

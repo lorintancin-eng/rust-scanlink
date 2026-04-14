@@ -24,6 +24,10 @@ pub struct AppConfig {
     /// Pump.fun 扫链专用 Yellowstone gRPC
     pub scanner_grpc_url: String,
     pub scanner_grpc_token: Option<String>,
+    pub scanner_secondary_grpc_url: Option<String>,
+    pub scanner_secondary_grpc_token: Option<String>,
+    pub scanner_primary_feed_label: String,
+    pub scanner_secondary_feed_label: String,
     /// 过滤层 Creator/地址画像查询
     pub helius_api_key: Option<String>,
     /// 可选 CoinGecko Pro Key，用于更实时的 GeckoTerminal 热点池
@@ -36,10 +40,16 @@ pub struct AppConfig {
     pub creator_blacklist_file: String,
     pub dynamic_hot_keywords_file: String,
     pub latency_metrics_file: String,
+    pub replay_db_path: String,
     pub filter_hot_reload_secs: u64,
     pub dynamic_hot_refresh_secs: u64,
     pub dynamic_hot_keywords_enabled: bool,
     pub dynamic_hot_keywords_limit: usize,
+    pub persist_raw_scanner_events: bool,
+    pub persist_gate3_sequences: bool,
+    pub persist_scoring_breakdowns: bool,
+    pub persist_label_suggestions: bool,
+    pub persist_feed_health: bool,
     pub smart_money_window_secs: u64,
     pub smart_money_fast_window_ms: u64,
     pub smart_money_soft_window_ms: u64,
@@ -178,6 +188,14 @@ impl AppConfig {
                 "GRPC_TOKEN",
                 "RABBITSTREAM_TOKEN",
             ]),
+            scanner_secondary_grpc_url: first_env(&["SCANNER_SECONDARY_GRPC_URL"])
+                .filter(|value| !value.trim().is_empty()),
+            scanner_secondary_grpc_token: first_env(&["SCANNER_SECONDARY_GRPC_TOKEN"]),
+            scanner_primary_feed_label: env_or("SCANNER_PRIMARY_FEED_LABEL", "primary_processed"),
+            scanner_secondary_feed_label: env_or(
+                "SCANNER_SECONDARY_FEED_LABEL",
+                "secondary_processed",
+            ),
             helius_api_key: std::env::var("HELIUS_API_KEY")
                 .ok()
                 .filter(|s| !s.trim().is_empty()),
@@ -185,6 +203,7 @@ impl AppConfig {
                 .ok()
                 .filter(|s| !s.trim().is_empty()),
             filter_db_path: env_or("FILTER_DB_PATH", "data/filter.sqlite3"),
+            replay_db_path: env_or("REPLAY_DB_PATH", "data/replay.sqlite3"),
             smart_money_file: env_or("SMART_MONEY_FILE", "data/smart_money.txt"),
             smart_money_funder_file: env_or(
                 "SMART_MONEY_FUNDER_FILE",
@@ -201,6 +220,11 @@ impl AppConfig {
             dynamic_hot_refresh_secs: env_parse("DYNAMIC_HOT_REFRESH_SECS", 60),
             dynamic_hot_keywords_enabled: env_parse("DYNAMIC_HOT_KEYWORDS_ENABLED", true),
             dynamic_hot_keywords_limit: env_parse("DYNAMIC_HOT_KEYWORDS_LIMIT", 40),
+            persist_raw_scanner_events: env_parse("PERSIST_RAW_SCANNER_EVENTS", true),
+            persist_gate3_sequences: env_parse("PERSIST_GATE3_SEQUENCES", true),
+            persist_scoring_breakdowns: env_parse("PERSIST_SCORING_BREAKDOWNS", true),
+            persist_label_suggestions: env_parse("PERSIST_LABEL_SUGGESTIONS", true),
+            persist_feed_health: env_parse("PERSIST_FEED_HEALTH", true),
             smart_money_window_secs: env_parse("SMART_MONEY_WINDOW_SECS", 60),
             smart_money_fast_window_ms: env_parse("SMART_MONEY_FAST_WINDOW_MS", 650),
             smart_money_soft_window_ms: env_parse("SMART_MONEY_SOFT_WINDOW_MS", 1_500),

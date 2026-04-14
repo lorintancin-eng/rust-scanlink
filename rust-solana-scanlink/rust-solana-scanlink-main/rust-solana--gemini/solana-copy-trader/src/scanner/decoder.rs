@@ -14,6 +14,7 @@ pub struct NewToken {
     pub mint: String,
     pub bonding_curve: String,
     pub creator: String,
+    pub feed_source: String,
     pub name: String,
     pub symbol: String,
     pub uri: String,
@@ -27,6 +28,7 @@ pub struct NewToken {
 pub struct PumpBuyEvent {
     pub mint: String,
     pub buyer: Pubkey,
+    pub feed_source: String,
     pub token_program: Pubkey,
     pub sol_amount_lamports: u64,
     pub instruction_data: Vec<u8>,
@@ -42,7 +44,11 @@ pub enum ScannerEvent {
     Buy(PumpBuyEvent),
 }
 
-pub fn decode_transaction(slot: u64, tx_info: &SubscribeUpdateTransactionInfo) -> Vec<ScannerEvent> {
+pub fn decode_transaction(
+    feed_source: &str,
+    slot: u64,
+    tx_info: &SubscribeUpdateTransactionInfo,
+) -> Vec<ScannerEvent> {
     let Some(tx) = tx_info.transaction.as_ref() else {
         return Vec::new();
     };
@@ -69,6 +75,7 @@ pub fn decode_transaction(slot: u64, tx_info: &SubscribeUpdateTransactionInfo) -
         decode_instruction(
             slot,
             &signature,
+            feed_source,
             discovered_at_ms,
             detected_at,
             tx_info.meta.as_ref(),
@@ -86,6 +93,7 @@ pub fn decode_transaction(slot: u64, tx_info: &SubscribeUpdateTransactionInfo) -
                 decode_instruction(
                     slot,
                     &signature,
+                    feed_source,
                     discovered_at_ms,
                     detected_at,
                     tx_info.meta.as_ref(),
@@ -105,6 +113,7 @@ pub fn decode_transaction(slot: u64, tx_info: &SubscribeUpdateTransactionInfo) -
 fn decode_instruction(
     slot: u64,
     signature: &str,
+    feed_source: &str,
     discovered_at_ms: u64,
     detected_at: Instant,
     meta: Option<&TransactionStatusMeta>,
@@ -132,6 +141,7 @@ fn decode_instruction(
         if let Some(token) = decode_new_token(
             slot,
             signature,
+            feed_source,
             discovered_at_ms,
             disc == DISC_CREATE_V2,
             data,
@@ -155,6 +165,7 @@ fn decode_instruction(
         if let Some(buy) = decode_buy(
             slot,
             signature,
+            feed_source,
             detected_at,
             meta,
             data,
@@ -182,6 +193,7 @@ fn decode_instruction(
 fn decode_new_token(
     slot: u64,
     signature: &str,
+    feed_source: &str,
     discovered_at_ms: u64,
     is_v2: bool,
     data: &[u8],
@@ -203,6 +215,7 @@ fn decode_new_token(
         mint: mint.to_string(),
         bonding_curve: bonding_curve.to_string(),
         creator: creator.to_string(),
+        feed_source: feed_source.to_string(),
         name,
         symbol,
         uri,
@@ -216,6 +229,7 @@ fn decode_new_token(
 fn decode_buy(
     slot: u64,
     signature: &str,
+    feed_source: &str,
     detected_at: Instant,
     meta: Option<&TransactionStatusMeta>,
     data: &[u8],
@@ -249,6 +263,7 @@ fn decode_buy(
     Some(PumpBuyEvent {
         mint: mint.to_string(),
         buyer,
+        feed_source: feed_source.to_string(),
         token_program,
         sol_amount_lamports,
         instruction_data: data.to_vec(),
