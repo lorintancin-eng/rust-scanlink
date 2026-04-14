@@ -215,6 +215,9 @@ pub async fn run(
         }
     }
     reload_hotlists(&shared).await?;
+    if let Err(err) = shared.db.backfill_entity_graph().await {
+        warn!("entity graph backfill failed during startup: {}", err);
+    }
 
     let (internal_tx, mut internal_rx) = mpsc::unbounded_channel::<InternalMessage>();
     let mut candidates: HashMap<String, Candidate> = HashMap::new();

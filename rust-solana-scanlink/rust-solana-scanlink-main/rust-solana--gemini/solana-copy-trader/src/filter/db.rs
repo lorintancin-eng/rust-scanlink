@@ -683,6 +683,83 @@ impl FilterDb {
         .await
     }
 
+    pub async fn backfill_entity_graph(&self) -> Result<()> {
+        self.with_conn(move |conn| {
+            let tx = conn.unchecked_transaction()?;
+
+            tx.execute(
+                "INSERT INTO funder_profiles(address, wallet_count, rug_exposure, last_seen_ms)
+                 SELECT first_funder, COUNT(*), 0, MAX(fetched_at_ms)
+                 FROM buyer_profiles
+                 WHERE first_funder IS NOT NULL AND TRIM(first_funder) != ''
+                 GROUP BY first_funder
+                 ON CONFLICT(address) DO UPDATE SET
+                    wallet_count = MAX(wallet_count, excluded.wallet_count),
+                    last_seen_ms = MAX(last_seen_ms, excluded.last_seen_ms)",
+                [],
+            )?;
+
+            tx.execute(
+                "INSERT INTO funder_profiles(address, wallet_count, rug_exposure, last_seen_ms)
+                 SELECT first_funder, COUNT(*), MAX(rug_count), MAX(fetched_at_ms)
+                 FROM creator_profiles
+                 WHERE first_funder IS NOT NULL AND TRIM(first_funder) != ''
+                 GROUP BY first_funder
+                 ON CONFLICT(address) DO UPDATE SET
+                    wallet_count = MAX(wallet_count, excluded.wallet_count),
+                    rug_exposure = MAX(rug_exposure, excluded.rug_exposure),
+                    last_seen_ms = MAX(last_seen_ms, excluded.last_seen_ms)",
+                [],
+            )?;
+
+            tx.execute(
+                "INSERT INTO address_clusters(cluster_id, address, cluster_type, score)
+                 SELECT 'funder:' || first_funder, address, 'creator_funder', 100
+                 FROM creator_profiles
+                 WHERE first_funder IS NOT NULL AND TRIM(first_funder) != ''
+                 ON CONFLICT(cluster_id, address) DO UPDATE SET
+                    cluster_type = excluded.cluster_type,
+                    score = MAX(score, excluded.score)",
+                [],
+            )?;
+
+            tx.execute(
+                "INSERT INTO address_clusters(cluster_id, address, cluster_type, score)
+                 SELECT 'funder:' || first_funder, address, 'buyer_funder', 50
+                 FROM buyer_profiles
+                 WHERE first_funder IS NOT NULL AND TRIM(first_funder) != ''
+                 ON CONFLICT(cluster_id, address) DO UPDATE SET
+                    cluster_type = excluded.cluster_type,
+                    score = MAX(score, excluded.score)",
+                [],
+            )?;
+
+            tx.execute(
+                "INSERT INTO cluster_edges(src, dst, edge_type, weight)
+                 SELECT first_funder, address, 'funds_creator_cached', MAX(total_tokens, 1)
+                 FROM creator_profiles
+                 WHERE first_funder IS NOT NULL AND TRIM(first_funder) != ''
+                 ON CONFLICT(src, dst, edge_type) DO UPDATE SET
+                    weight = MAX(weight, excluded.weight)",
+                [],
+            )?;
+
+            tx.execute(
+                "INSERT INTO cluster_edges(src, dst, edge_type, weight)
+                 SELECT first_funder, address, 'funds_buyer_cached', 1
+                 FROM buyer_profiles
+                 WHERE first_funder IS NOT NULL AND TRIM(first_funder) != ''
+                 ON CONFLICT(src, dst, edge_type) DO UPDATE SET
+                    weight = MAX(weight, excluded.weight)",
+                [],
+            )?;
+
+            tx.commit()?;
+            Ok(())
+        })
+        .await
+    }
+
     async fn with_conn<F>(&self, func: F) -> Result<()>
     where
         F: FnOnce(&mut Connection) -> Result<()> + Send + 'static,
