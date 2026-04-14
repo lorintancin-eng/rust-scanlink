@@ -26,14 +26,20 @@ pub struct AppConfig {
     pub scanner_grpc_token: Option<String>,
     /// 过滤层 Creator/地址画像查询
     pub helius_api_key: Option<String>,
+    /// 可选 CoinGecko Pro Key，用于更实时的 GeckoTerminal 热点池
+    pub coingecko_api_key: Option<String>,
     /// 过滤层本地状态
     pub filter_db_path: String,
     pub smart_money_file: String,
     pub smart_money_funder_file: String,
     pub blocked_buyers_file: String,
     pub creator_blacklist_file: String,
+    pub dynamic_hot_keywords_file: String,
     pub latency_metrics_file: String,
     pub filter_hot_reload_secs: u64,
+    pub dynamic_hot_refresh_secs: u64,
+    pub dynamic_hot_keywords_enabled: bool,
+    pub dynamic_hot_keywords_limit: usize,
     pub smart_money_window_secs: u64,
     pub smart_money_fast_window_ms: u64,
     pub smart_money_soft_window_ms: u64,
@@ -57,6 +63,8 @@ pub struct AppConfig {
     pub filter_min_score: u32,
     pub filter_fast_min_score: u32,
     pub filter_soft_min_score: u32,
+    pub dynamic_narrative_bonus_per_hit: u32,
+    pub dynamic_narrative_bonus_cap: u32,
     pub scanner_idle_timeout_secs: u64,
     pub creator_gate_timeout_ms: u64,
     pub creator_min_wallet_age_days: u64,
@@ -173,6 +181,9 @@ impl AppConfig {
             helius_api_key: std::env::var("HELIUS_API_KEY")
                 .ok()
                 .filter(|s| !s.trim().is_empty()),
+            coingecko_api_key: std::env::var("COINGECKO_API_KEY")
+                .ok()
+                .filter(|s| !s.trim().is_empty()),
             filter_db_path: env_or("FILTER_DB_PATH", "data/filter.sqlite3"),
             smart_money_file: env_or("SMART_MONEY_FILE", "data/smart_money.txt"),
             smart_money_funder_file: env_or(
@@ -181,8 +192,15 @@ impl AppConfig {
             ),
             blocked_buyers_file: env_or("BLOCKED_BUYERS_FILE", "data/blocked_buyers.txt"),
             creator_blacklist_file: env_or("CREATOR_BLACKLIST_FILE", "data/creator_blacklist.txt"),
+            dynamic_hot_keywords_file: env_or(
+                "DYNAMIC_HOT_KEYWORDS_FILE",
+                "data/dynamic_hot_keywords.txt",
+            ),
             latency_metrics_file: env_or("LATENCY_METRICS_FILE", "data/filter_latency.jsonl"),
             filter_hot_reload_secs: env_parse("FILTER_HOT_RELOAD_SECS", 300),
+            dynamic_hot_refresh_secs: env_parse("DYNAMIC_HOT_REFRESH_SECS", 60),
+            dynamic_hot_keywords_enabled: env_parse("DYNAMIC_HOT_KEYWORDS_ENABLED", true),
+            dynamic_hot_keywords_limit: env_parse("DYNAMIC_HOT_KEYWORDS_LIMIT", 40),
             smart_money_window_secs: env_parse("SMART_MONEY_WINDOW_SECS", 60),
             smart_money_fast_window_ms: env_parse("SMART_MONEY_FAST_WINDOW_MS", 650),
             smart_money_soft_window_ms: env_parse("SMART_MONEY_SOFT_WINDOW_MS", 1_500),
@@ -215,6 +233,8 @@ impl AppConfig {
             filter_min_score: env_parse("FILTER_MIN_SCORE", 60),
             filter_fast_min_score: env_parse("FILTER_FAST_MIN_SCORE", 48),
             filter_soft_min_score: env_parse("FILTER_SOFT_MIN_SCORE", 58),
+            dynamic_narrative_bonus_per_hit: env_parse("DYNAMIC_NARRATIVE_BONUS_PER_HIT", 3),
+            dynamic_narrative_bonus_cap: env_parse("DYNAMIC_NARRATIVE_BONUS_CAP", 6),
             scanner_idle_timeout_secs: env_parse("SCANNER_IDLE_TIMEOUT_SECS", 30),
             creator_gate_timeout_ms: env_parse("CREATOR_GATE_TIMEOUT_MS", 1_500),
             creator_min_wallet_age_days: env_parse("CREATOR_MIN_WALLET_AGE_DAYS", 1),

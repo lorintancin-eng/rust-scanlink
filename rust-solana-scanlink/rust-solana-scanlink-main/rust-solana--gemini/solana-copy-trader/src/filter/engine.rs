@@ -23,6 +23,10 @@ const GATE1_BLACK_KEYWORDS: &[&str] = &[
     "test", "rug", "scam", "fake", "honeypot", "rugpull", "ponzi",
 ];
 const GATE1_WHITE_KEYWORDS: &[&str] = &["ai", "agent", "trump", "pepe", "maga"];
+const DYNAMIC_KEYWORD_STOPWORDS: &[&str] = &[
+    "the", "and", "for", "with", "from", "that", "this", "your", "coin", "token", "official",
+    "solana", "pump", "pumpfun", "community", "just", "latest", "launch", "new", "best",
+];
 const CREATOR_CACHE_TTL_MS: u64 = 24 * 60 * 60 * 1000;
 const BUYER_CACHE_TTL_MS: u64 = 6 * 60 * 60 * 1000;
 const FACTORY_WINDOW_MS: u64 = 5 * 60 * 1000;
@@ -72,6 +76,7 @@ struct Candidate {
     discovered_at_ms: u64,
     status: CandidateStatus,
     narrative_keywords: Vec<String>,
+    dynamic_narrative_keywords: Vec<String>,
     early_buys: Vec<PumpBuyEvent>,
     buy_signatures: HashSet<String>,
     creator_profile: Option<CreatorProfile>,
@@ -86,6 +91,7 @@ struct HotLists {
     smart_money: HashSet<String>,
     smart_money_funders: HashSet<String>,
     blocked_buyers: HashSet<String>,
+    dynamic_hot_keywords: HashSet<String>,
 }
 
 #[derive(Debug)]
@@ -199,6 +205,11 @@ pub async fn run(
         db,
         hotlists: Arc::new(RwLock::new(HotLists::default())),
     };
+    if config.dynamic_hot_keywords_enabled {
+        if let Err(err) = refresh_dynamic_hot_keywords(&shared).await {
+            warn!("dynamic hot keyword refresh failed during startup: {}", err);
+        }
+    }
     reload_hotlists(&shared).await?;
 
     let (internal_tx, mut internal_rx) = mpsc::unbounded_channel::<InternalMessage>();
@@ -209,6 +220,11 @@ pub async fn run(
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut hot_reload = tokio::time::interval(Duration::from_secs(config.filter_hot_reload_secs));
     hot_reload.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut dynamic_hot_refresh = tokio::time::interval(Duration::from_secs(
+        config.dynamic_hot_refresh_secs.max(30),
+    ));
+    dynamic_hot_refresh.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    dynamic_hot_refresh.tick().await;
 
     loop {
         tokio::select! {
@@ -322,6 +338,13 @@ pub async fn run(
                     warn!("filter: hot reload failed: {}", err);
                 }
             }
+            _ = dynamic_hot_refresh.tick(), if shared.config.dynamic_hot_keywords_enabled => {
+                if let Err(err) = refresh_dynamic_hot_keywords(&shared).await {
+                    warn!("dynamic hot keyword refresh failed: {}", err);
+                } else if let Err(err) = reload_hotlists(&shared).await {
+                    warn!("filter: hot reload after dynamic refresh failed: {}", err);
+                }
+            }
         }
     }
 
@@ -332,6 +355,7 @@ struct Gate1Decision {
     passed: bool,
     reason: String,
     narrative_keywords: Vec<String>,
+    dynamic_narrative_keywords: Vec<String>,
 }
 
 async fn handle_new_token(
@@ -397,6 +421,7 @@ async fn handle_new_token(
             discovered_at_ms: token.discovered_at_ms,
             status: CandidateStatus::CreatorPending,
             narrative_keywords: gate1.narrative_keywords,
+            dynamic_narrative_keywords: gate1.dynamic_narrative_keywords,
             early_buys: Vec::new(),
             buy_signatures: HashSet::new(),
             creator_profile: None,
@@ -643,6 +668,51 @@ fn spawn_score_task(
     });
 }
 
+fn collect_narrative_keywords(
+    token: &NewToken,
+    dynamic_hot_keywords: &HashSet<String>,
+) -> (Vec<String>, Vec<String>) {
+    let haystack = format!("{} {}", token.name, token.symbol);
+    let tokens = tokenize_keyword_text(&haystack);
+
+    let mut narrative_keywords: Vec<String> = GATE1_WHITE_KEYWORDS
+        .iter()
+        .filter(|kw| tokens.contains(**kw))
+        .map(|kw| (*kw).to_string())
+        .collect();
+
+    let mut dynamic_narrative_keywords: Vec<String> = dynamic_hot_keywords
+        .iter()
+        .filter(|kw| tokens.contains(kw.as_str()))
+        .cloned()
+        .collect();
+
+    dynamic_narrative_keywords.sort();
+    dynamic_narrative_keywords.dedup();
+    narrative_keywords.extend(dynamic_narrative_keywords.iter().cloned());
+    narrative_keywords.sort();
+    narrative_keywords.dedup();
+
+    (narrative_keywords, dynamic_narrative_keywords)
+}
+
+fn tokenize_keyword_text(input: &str) -> HashSet<String> {
+    let mut terms = HashSet::new();
+    let mut current = String::new();
+    for ch in input.to_lowercase().chars() {
+        if ch.is_alphanumeric() {
+            current.push(ch);
+        } else if !current.is_empty() {
+            terms.insert(current.clone());
+            current.clear();
+        }
+    }
+    if !current.is_empty() {
+        terms.insert(current);
+    }
+    terms
+}
+
 async fn gate1_check(
     shared: &SharedState,
     creator_window: &mut HashMap<String, VecDeque<u64>>,
@@ -654,6 +724,7 @@ async fn gate1_check(
             passed: false,
             reason: "gate1 reject: creator blacklist hit".to_string(),
             narrative_keywords: Vec::new(),
+            dynamic_narrative_keywords: Vec::new(),
         };
     }
 
@@ -675,6 +746,7 @@ async fn gate1_check(
                 window.len()
             ),
             narrative_keywords: Vec::new(),
+            dynamic_narrative_keywords: Vec::new(),
         };
     }
 
@@ -683,6 +755,7 @@ async fn gate1_check(
             passed: false,
             reason: "gate1 reject: empty name or symbol".to_string(),
             narrative_keywords: Vec::new(),
+            dynamic_narrative_keywords: Vec::new(),
         };
     }
     if token.symbol.chars().count() > 10 {
@@ -693,6 +766,7 @@ async fn gate1_check(
                 token.symbol.chars().count()
             ),
             narrative_keywords: Vec::new(),
+            dynamic_narrative_keywords: Vec::new(),
         };
     }
 
@@ -706,19 +780,18 @@ async fn gate1_check(
             passed: false,
             reason: format!("gate1 reject: blacklist keyword {}", keyword),
             narrative_keywords: Vec::new(),
+            dynamic_narrative_keywords: Vec::new(),
         };
     }
 
-    let narrative_keywords = GATE1_WHITE_KEYWORDS
-        .iter()
-        .filter(|kw| lower.contains(**kw))
-        .map(|kw| (*kw).to_string())
-        .collect();
+    let (narrative_keywords, dynamic_narrative_keywords) =
+        collect_narrative_keywords(token, &hotlists.dynamic_hot_keywords);
 
     Gate1Decision {
         passed: true,
         reason: "gate1 pass".to_string(),
         narrative_keywords,
+        dynamic_narrative_keywords,
     }
 }
 
@@ -1290,8 +1363,15 @@ async fn score_candidate(shared: &SharedState, mut candidate: Candidate) -> Scor
         .await
         .unwrap_or(0.0);
     let buyer_quality_score = (buyer_quality_pct * 15.0).round().clamp(0.0, 15.0) as u32;
-    let total_score =
-        sm_count_score + sm_sol_score + momentum_score + curve_score + buyer_quality_score;
+    let dynamic_narrative_bonus = ((candidate.dynamic_narrative_keywords.len() as u32)
+        .saturating_mul(shared.config.dynamic_narrative_bonus_per_hit))
+    .min(shared.config.dynamic_narrative_bonus_cap);
+    let total_score = sm_count_score
+        + sm_sol_score
+        + momentum_score
+        + curve_score
+        + buyer_quality_score
+        + dynamic_narrative_bonus;
     let required_score = match trigger.path {
         Gate3Path::Fast => shared
             .config
@@ -1303,7 +1383,7 @@ async fn score_candidate(shared: &SharedState, mut candidate: Candidate) -> Scor
             .min(shared.config.filter_min_score),
     };
     let reason = format!(
-        "mode={} path={} participants={} capital={} momentum={} curve={} buyer_quality={} total={} required={} | matched={} eligible={} sol={:.2} fastest={}ms narrative={}",
+        "mode={} path={} participants={} capital={} momentum={} curve={} buyer_quality={} narrative_bonus={} total={} required={} | matched={} eligible={} sol={:.2} fastest={}ms narrative={}",
         smart_money_mode_label(stats.mode),
         gate3_path_label(trigger.path),
         sm_count_score,
@@ -1311,6 +1391,7 @@ async fn score_candidate(shared: &SharedState, mut candidate: Candidate) -> Scor
         momentum_score,
         curve_score,
         buyer_quality_score,
+        dynamic_narrative_bonus,
         total_score,
         required_score,
         stats.unique_sm_wallets.len(),
@@ -1733,26 +1814,281 @@ fn extract_first_funder(item: &Value, address: &str) -> Option<String> {
         })
 }
 
+async fn refresh_dynamic_hot_keywords(shared: &SharedState) -> Result<()> {
+    let keywords = fetch_dynamic_hot_keywords(shared).await?;
+    if keywords.is_empty() {
+        anyhow::bail!("dynamic keyword sources returned no usable keywords");
+    }
+
+    write_plaintext_lines(&shared.config.dynamic_hot_keywords_file, &keywords).await?;
+    info!(
+        "Dynamic hot keywords refreshed | count={} | sample={}",
+        keywords.len(),
+        keywords
+            .iter()
+            .take(8)
+            .cloned()
+            .collect::<Vec<_>>()
+            .join("|")
+    );
+    Ok(())
+}
+
+async fn fetch_dynamic_hot_keywords(shared: &SharedState) -> Result<Vec<String>> {
+    let mut keyword_scores: HashMap<String, u32> = HashMap::new();
+    let mut source_count = 0usize;
+
+    match fetch_coingecko_trending_search_keywords(shared).await {
+        Ok(keywords) => {
+            score_dynamic_keywords(&mut keyword_scores, keywords, 4);
+            source_count += 1;
+        }
+        Err(err) => warn!("dynamic keywords: coingecko search trending failed: {}", err),
+    }
+
+    if let Some(api_key) = shared.config.coingecko_api_key.as_deref() {
+        match fetch_coingecko_solana_trending_pool_keywords(shared, api_key).await {
+            Ok(keywords) => {
+                score_dynamic_keywords(&mut keyword_scores, keywords, 5);
+                source_count += 1;
+            }
+            Err(err) => warn!("dynamic keywords: coingecko solana trending pools failed: {}", err),
+        }
+    }
+
+    match fetch_dex_boosted_keywords(shared).await {
+        Ok(keywords) => {
+            score_dynamic_keywords(&mut keyword_scores, keywords, 3);
+            source_count += 1;
+        }
+        Err(err) => warn!("dynamic keywords: dexscreener boosted tokens failed: {}", err),
+    }
+
+    if source_count == 0 {
+        anyhow::bail!("all dynamic keyword sources failed");
+    }
+
+    let mut ranked: Vec<(String, u32)> = keyword_scores.into_iter().collect();
+    ranked.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+    Ok(ranked
+        .into_iter()
+        .take(shared.config.dynamic_hot_keywords_limit.max(1))
+        .map(|(keyword, _)| keyword)
+        .collect())
+}
+
+async fn fetch_coingecko_trending_search_keywords(shared: &SharedState) -> Result<Vec<String>> {
+    let payload: Value = shared
+        .http
+        .get("https://api.coingecko.com/api/v3/search/trending")
+        .send()
+        .await
+        .context("CoinGecko trending search request failed")?
+        .error_for_status()
+        .context("CoinGecko trending search response invalid")?
+        .json()
+        .await
+        .context("CoinGecko trending search json decode failed")?;
+
+    let mut texts = Vec::new();
+    if let Some(coins) = payload.get("coins").and_then(Value::as_array) {
+        for coin in coins {
+            let item = coin.get("item").unwrap_or(coin);
+            collect_keyword_source_texts(item, &mut texts);
+        }
+    }
+    if let Some(categories) = payload.get("categories").and_then(Value::as_array) {
+        for category in categories {
+            collect_keyword_source_texts(category, &mut texts);
+        }
+    }
+    Ok(extract_dynamic_keywords_from_texts(texts))
+}
+
+async fn fetch_coingecko_solana_trending_pool_keywords(
+    shared: &SharedState,
+    api_key: &str,
+) -> Result<Vec<String>> {
+    let payload: Value = shared
+        .http
+        .get("https://pro-api.coingecko.com/api/v3/onchain/networks/solana/trending_pools")
+        .header("x-cg-pro-api-key", api_key)
+        .query(&[("include", "base_token"), ("duration", "1h")])
+        .send()
+        .await
+        .context("CoinGecko solana trending pools request failed")?
+        .error_for_status()
+        .context("CoinGecko solana trending pools response invalid")?
+        .json()
+        .await
+        .context("CoinGecko solana trending pools json decode failed")?;
+
+    let mut texts = Vec::new();
+    if let Some(data) = payload.get("data").and_then(Value::as_array) {
+        for item in data {
+            collect_keyword_source_texts(item, &mut texts);
+            if let Some(attrs) = item.get("attributes") {
+                collect_keyword_source_texts(attrs, &mut texts);
+            }
+        }
+    }
+    if let Some(included) = payload.get("included").and_then(Value::as_array) {
+        for item in included {
+            collect_keyword_source_texts(item, &mut texts);
+            if let Some(attrs) = item.get("attributes") {
+                collect_keyword_source_texts(attrs, &mut texts);
+            }
+        }
+    }
+    Ok(extract_dynamic_keywords_from_texts(texts))
+}
+
+async fn fetch_dex_boosted_keywords(shared: &SharedState) -> Result<Vec<String>> {
+    let mut token_addresses = Vec::new();
+    for endpoint in [
+        "https://api.dexscreener.com/token-boosts/latest/v1",
+        "https://api.dexscreener.com/token-boosts/top/v1",
+    ] {
+        let payload: Value = shared
+            .http
+            .get(endpoint)
+            .send()
+            .await
+            .with_context(|| format!("DexScreener request failed: {}", endpoint))?
+            .error_for_status()
+            .with_context(|| format!("DexScreener response invalid: {}", endpoint))?
+            .json()
+            .await
+            .with_context(|| format!("DexScreener json decode failed: {}", endpoint))?;
+
+        collect_solana_token_addresses(&payload, &mut token_addresses);
+    }
+
+    token_addresses.sort();
+    token_addresses.dedup();
+    token_addresses.truncate(30);
+    if token_addresses.is_empty() {
+        anyhow::bail!("DexScreener returned no boosted Solana tokens");
+    }
+
+    let token_url = format!(
+        "https://api.dexscreener.com/tokens/v1/solana/{}",
+        token_addresses.join(",")
+    );
+    let payload: Value = shared
+        .http
+        .get(token_url)
+        .send()
+        .await
+        .context("DexScreener token metadata request failed")?
+        .error_for_status()
+        .context("DexScreener token metadata response invalid")?
+        .json()
+        .await
+        .context("DexScreener token metadata json decode failed")?;
+
+    let mut texts = Vec::new();
+    if let Some(items) = payload
+        .as_array()
+        .or_else(|| payload.get("pairs").and_then(Value::as_array))
+        .or_else(|| payload.get("data").and_then(Value::as_array))
+    {
+        for item in items {
+            if let Some(base_token) = item.get("baseToken") {
+                collect_keyword_source_texts(base_token, &mut texts);
+            }
+            collect_keyword_source_texts(item, &mut texts);
+        }
+    }
+    Ok(extract_dynamic_keywords_from_texts(texts))
+}
+
+fn collect_solana_token_addresses(payload: &Value, out: &mut Vec<String>) {
+    if let Some(items) = payload
+        .as_array()
+        .or_else(|| payload.get("data").and_then(Value::as_array))
+    {
+        for item in items {
+            let Some(chain_id) = item.get("chainId").and_then(Value::as_str) else {
+                continue;
+            };
+            if chain_id != "solana" {
+                continue;
+            }
+            if let Some(address) = item.get("tokenAddress").and_then(Value::as_str) {
+                out.push(address.to_string());
+            }
+        }
+    }
+}
+
+fn collect_keyword_source_texts(value: &Value, out: &mut Vec<String>) {
+    for key in ["name", "symbol", "token_name", "token_symbol"] {
+        if let Some(text) = value.get(key).and_then(Value::as_str) {
+            out.push(text.to_string());
+        }
+    }
+}
+
+fn extract_dynamic_keywords_from_texts(texts: Vec<String>) -> Vec<String> {
+    let mut keywords = Vec::new();
+    for text in texts {
+        for token in tokenize_keyword_text(&text) {
+            if should_keep_dynamic_keyword(&token) {
+                keywords.push(token);
+            }
+        }
+    }
+    keywords
+}
+
+fn should_keep_dynamic_keyword(token: &str) -> bool {
+    let len = token.chars().count();
+    if len < 2 || len > 24 {
+        return false;
+    }
+    if token.chars().all(|ch| ch.is_ascii_digit()) {
+        return false;
+    }
+    !DYNAMIC_KEYWORD_STOPWORDS.contains(&token)
+}
+
+fn score_dynamic_keywords(
+    scores: &mut HashMap<String, u32>,
+    keywords: Vec<String>,
+    weight: u32,
+) {
+    let mut seen = HashSet::new();
+    for keyword in keywords {
+        if seen.insert(keyword.clone()) {
+            *scores.entry(keyword).or_default() += weight;
+        }
+    }
+}
+
 async fn reload_hotlists(shared: &SharedState) -> Result<()> {
     let blacklist = load_plaintext_set(&shared.config.creator_blacklist_file).await?;
     let smart_money = load_plaintext_set(&shared.config.smart_money_file).await?;
     let smart_money_funders = load_plaintext_set(&shared.config.smart_money_funder_file).await?;
     let blocked_buyers = load_plaintext_set(&shared.config.blocked_buyers_file).await?;
+    let dynamic_hot_keywords = load_plaintext_set(&shared.config.dynamic_hot_keywords_file).await?;
     {
         let mut hotlists = shared.hotlists.write().await;
         hotlists.creator_blacklist = blacklist.iter().cloned().collect();
         hotlists.smart_money = smart_money.iter().cloned().collect();
         hotlists.smart_money_funders = smart_money_funders.iter().cloned().collect();
         hotlists.blocked_buyers = blocked_buyers.iter().cloned().collect();
+        hotlists.dynamic_hot_keywords = dynamic_hot_keywords.iter().cloned().collect();
     }
     shared.db.sync_blacklist(&blacklist).await?;
     shared.db.sync_smart_money(&smart_money).await?;
     info!(
-        "Filter hotlists loaded | blacklist={} | smart_money={} | smart_money_funders={} | blocked_buyers={}",
+        "Filter hotlists loaded | blacklist={} | smart_money={} | smart_money_funders={} | blocked_buyers={} | dynamic_hot_keywords={}",
         blacklist.len(),
         smart_money.len(),
         smart_money_funders.len(),
         blocked_buyers.len(),
+        dynamic_hot_keywords.len(),
     );
     if shared.config.disable_smart_money_filter {
         warn!(
@@ -1789,6 +2125,21 @@ async fn load_plaintext_set(path: &str) -> Result<Vec<String>> {
         .filter(|line| !line.is_empty() && !line.starts_with('#'))
         .map(ToOwned::to_owned)
         .collect())
+}
+
+async fn write_plaintext_lines(path: &str, lines: &[String]) -> Result<()> {
+    let path_ref = std::path::Path::new(path);
+    if let Some(parent) = path_ref.parent() {
+        tokio::fs::create_dir_all(parent).await?;
+    }
+    let mut content = lines.join("\n");
+    if !content.is_empty() {
+        content.push('\n');
+    }
+    tokio::fs::write(path_ref, content)
+        .await
+        .with_context(|| format!("write output file failed: {}", path_ref.display()))?;
+    Ok(())
 }
 
 async fn append_jsonl(path: &str, value: &Value) -> Result<()> {
@@ -1958,13 +2309,18 @@ mod tests {
             scanner_grpc_url: String::new(),
             scanner_grpc_token: None,
             helius_api_key: None,
+            coingecko_api_key: None,
             filter_db_path: String::new(),
             smart_money_file: String::new(),
             smart_money_funder_file: String::new(),
             blocked_buyers_file: String::new(),
             creator_blacklist_file: String::new(),
+            dynamic_hot_keywords_file: String::new(),
             latency_metrics_file: String::new(),
             filter_hot_reload_secs: 0,
+            dynamic_hot_refresh_secs: 60,
+            dynamic_hot_keywords_enabled: true,
+            dynamic_hot_keywords_limit: 40,
             smart_money_window_secs: 60,
             smart_money_fast_window_ms: 650,
             smart_money_soft_window_ms: 1_500,
@@ -1988,6 +2344,8 @@ mod tests {
             filter_min_score: 60,
             filter_fast_min_score: 48,
             filter_soft_min_score: 58,
+            dynamic_narrative_bonus_per_hit: 3,
+            dynamic_narrative_bonus_cap: 6,
             scanner_idle_timeout_secs: 0,
             creator_gate_timeout_ms: 1_500,
             creator_min_wallet_age_days: 1,
@@ -2130,6 +2488,7 @@ mod tests {
             discovered_at_ms: 0,
             status: CandidateStatus::Active,
             narrative_keywords: Vec::new(),
+            dynamic_narrative_keywords: Vec::new(),
             early_buys: Vec::new(),
             buy_signatures: HashSet::new(),
             creator_profile: None,
@@ -2179,6 +2538,7 @@ mod tests {
             discovered_at_ms: 0,
             status: CandidateStatus::Active,
             narrative_keywords: Vec::new(),
+            dynamic_narrative_keywords: Vec::new(),
             early_buys: Vec::new(),
             buy_signatures: HashSet::new(),
             creator_profile: None,
@@ -2229,6 +2589,7 @@ mod tests {
             discovered_at_ms: 0,
             status: CandidateStatus::Active,
             narrative_keywords: Vec::new(),
+            dynamic_narrative_keywords: Vec::new(),
             early_buys: Vec::new(),
             buy_signatures: HashSet::new(),
             creator_profile: None,
@@ -2270,6 +2631,40 @@ mod tests {
             gate3_reject_path("gate3 reject: creator self-buy detected"),
             "creator_self_buy"
         );
+    }
+
+    #[test]
+    fn narrative_keywords_use_token_boundaries() {
+        let token = NewToken {
+            mint: "mint".to_string(),
+            name: "Paid in Full".to_string(),
+            symbol: "PAID".to_string(),
+            uri: String::new(),
+            creator: "creator".to_string(),
+            bonding_curve: String::new(),
+            signature: String::new(),
+            slot: 0,
+            discovered_at_ms: 0,
+            is_v2: true,
+        };
+        let mut dynamic = HashSet::new();
+        dynamic.insert("full".to_string());
+        let (all_keywords, dynamic_keywords) = collect_narrative_keywords(&token, &dynamic);
+        assert!(!all_keywords.iter().any(|kw| kw == "ai"));
+        assert!(dynamic_keywords.iter().any(|kw| kw == "full"));
+    }
+
+    #[test]
+    fn dynamic_keyword_stopwords_are_filtered() {
+        let keywords = extract_dynamic_keywords_from_texts(vec![
+            "The Official Solana Coin".to_string(),
+            "Agent Pepe AI".to_string(),
+        ]);
+        assert!(!keywords.iter().any(|kw| kw == "the"));
+        assert!(!keywords.iter().any(|kw| kw == "official"));
+        assert!(keywords.iter().any(|kw| kw == "agent"));
+        assert!(keywords.iter().any(|kw| kw == "pepe"));
+        assert!(keywords.iter().any(|kw| kw == "ai"));
     }
 
     #[test]

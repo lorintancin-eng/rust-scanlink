@@ -206,6 +206,16 @@ async fn main() -> Result<()> {
         config.smart_money_funder_file,
         config.blocked_buyers_file,
     );
+    info!(
+        "Dynamic hot keywords: enabled={} refresh_secs={} limit={} bonus_per_hit={} cap={} file={} | coingecko_pro={}",
+        config.dynamic_hot_keywords_enabled,
+        config.dynamic_hot_refresh_secs,
+        config.dynamic_hot_keywords_limit,
+        config.dynamic_narrative_bonus_per_hit,
+        config.dynamic_narrative_bonus_cap,
+        config.dynamic_hot_keywords_file,
+        config.coingecko_api_key.is_some(),
+    );
 
     let rpc_client = Arc::new(RpcClient::new_with_commitment(
         config.rpc_url.clone(),
