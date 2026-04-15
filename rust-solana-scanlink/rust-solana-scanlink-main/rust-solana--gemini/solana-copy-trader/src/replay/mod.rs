@@ -13,8 +13,10 @@ pub async fn run(config: &AppConfig) -> Result<ReplayReport> {
     let from_ms = config
         .replay_from_ms
         .unwrap_or_else(|| to_ms.saturating_sub(config.replay_window_minutes * 60_000));
+    let mut report_to_ms = to_ms;
     let report_db_path = if config.replay_pipeline_enabled {
         let pipeline = player::run_pipeline(config, from_ms, to_ms).await?;
+        report_to_ms = now_ms();
         info!(
             "Replay pipeline complete | source_events={} replayed={} buy_signals={} duration_ms={} speedup={:.1} replay_db={}",
             pipeline.source_event_count,
@@ -29,7 +31,7 @@ pub async fn run(config: &AppConfig) -> Result<ReplayReport> {
         &config.filter_db_path
     };
     let db = FilterDb::new(report_db_path).await?;
-    let report = build_replay_report(&db, from_ms, to_ms).await?;
+    let report = build_replay_report(&db, from_ms, report_to_ms).await?;
     write_report(&config.replay_report_file, &report).await?;
     info!(
         "Replay report ready | from_ms={} | to_ms={} | decisions={} | pass={} | source_db={} | output={}",
