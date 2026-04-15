@@ -24,7 +24,7 @@ use std::str::FromStr;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
-use tokio::sync::{mpsc, Semaphore};
+use tokio::sync::{mpsc, RwLock, Semaphore};
 use tracing::{error, info, warn};
 
 use autosell::{AutoSellManager, Position, SellAccountSnapshot, SellSignal};
@@ -40,7 +40,7 @@ use tx::{
     blockhash,
     builder::TxBuilder,
     confirm::{format_mcap_usd, format_price_gmgn, BuyConfirmer},
-    execution_router::{ExecutionPlan, ExecutionProfile},
+    execution_router::{ExecutionFeedback, ExecutionPlan, ExecutionProfile},
     sell_executor::SellExecutor,
     sender::TxSender,
 };
@@ -61,6 +61,89 @@ struct BuyPathTimings {
 
 struct RuntimeGuard {
     path: PathBuf,
+}
+
+fn execution_feedback_from_receipts(
+    execution_plan: &ExecutionPlan,
+    receipts: &[ExecutionReceiptRecord],
+) -> ExecutionFeedback {
+    let mut sample_count = 0usize;
+    let mut success_count = 0usize;
+
+    for receipt in receipts {
+        if receipt.status == "dry_run" {
+            continue;
+        }
+        sample_count = sample_count.saturating_add(1);
+        if execution_status_is_success(&receipt.status) {
+            success_count = success_count.saturating_add(1);
+        }
+    }
+
+    let success_rate_bps = if sample_count == 0 {
+        10_000
+    } else {
+        ((success_count as u128) * 10_000u128 / sample_count as u128) as u32
+    };
+    let recent_failure_streak = receipts
+        .iter()
+        .rev()
+        .filter(|receipt| receipt.status != "dry_run")
+        .take_while(|receipt| execution_status_is_failure(&receipt.status))
+        .count();
+
+    let prefer_fanout = execution_plan.send_jito && sample_count >= 4 && success_rate_bps < 8_000;
+    let prefer_zero_slot = execution_plan.send_zero_slot
+        && sample_count >= 4
+        && (success_rate_bps < 7_000 || recent_failure_streak >= 2);
+
+    let fee_boost_bps = if sample_count < 4 {
+        10_000
+    } else if success_rate_bps < 5_000 {
+        13_500
+    } else if success_rate_bps < 7_500 {
+        12_000
+    } else if recent_failure_streak >= 2 {
+        11_500
+    } else {
+        10_000
+    };
+    let tip_boost_bps = if sample_count < 4 {
+        10_000
+    } else if success_rate_bps < 5_000 {
+        14_000
+    } else if success_rate_bps < 7_500 {
+        12_500
+    } else if recent_failure_streak >= 2 {
+        11_500
+    } else {
+        10_000
+    };
+
+    ExecutionFeedback {
+        sample_count,
+        success_rate_bps,
+        recent_failure_streak,
+        prefer_fanout,
+        prefer_zero_slot,
+        fee_boost_bps,
+        tip_boost_bps,
+    }
+}
+
+fn execution_status_is_success(status: &str) -> bool {
+    matches!(
+        status,
+        "submitted" | "confirmed" | "landed" | "bundle_accepted" | "success"
+    )
+}
+
+fn execution_status_is_failure(status: &str) -> bool {
+    status.ends_with("_failed")
+        || matches!(
+            status,
+            "dropped" | "expired" | "rejected" | "not_landed" | "bundle_rejected"
+        )
 }
 
 fn format_latency(duration: Duration) -> String {
@@ -276,12 +359,61 @@ async fn main() -> Result<()> {
         config.replay_db_path,
         config.replay_report_file,
     );
+    info!(
+        "Execution feedback: window_secs={} refresh_secs={}",
+        config.execution_feedback_window_secs,
+        config.execution_feedback_refresh_secs,
+    );
 
     let rpc_client = Arc::new(RpcClient::new_with_commitment(
         config.rpc_url.clone(),
         solana_sdk::commitment_config::CommitmentConfig::confirmed(),
     ));
     let execution_db = Arc::new(FilterDb::new(&config.filter_db_path).await?);
+    let execution_feedback = Arc::new(RwLock::new(ExecutionFeedback::default()));
+
+    if config.execution_feedback_refresh_secs > 0 {
+        let execution_db_task = execution_db.clone();
+        let execution_plan_task = execution_plan.clone();
+        let feedback_state = execution_feedback.clone();
+        let feedback_cfg = config.clone();
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(Duration::from_secs(
+                feedback_cfg.execution_feedback_refresh_secs.max(5),
+            ));
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            loop {
+                interval.tick().await;
+                let to_ms = current_time_ms();
+                let from_ms = to_ms.saturating_sub(
+                    feedback_cfg
+                        .execution_feedback_window_secs
+                        .saturating_mul(1000),
+                );
+                match execution_db_task
+                    .list_execution_receipts_window(from_ms, to_ms)
+                    .await
+                {
+                    Ok(receipts) => {
+                        let feedback =
+                            execution_feedback_from_receipts(&execution_plan_task, &receipts);
+                        info!(
+                            "Execution feedback refreshed | samples={} success_bps={} failure_streak={} fanout={} zero_slot={} fee_boost_bps={} tip_boost_bps={}",
+                            feedback.sample_count,
+                            feedback.success_rate_bps,
+                            feedback.recent_failure_streak,
+                            feedback.prefer_fanout,
+                            feedback.prefer_zero_slot,
+                            feedback.fee_boost_bps,
+                            feedback.tip_boost_bps,
+                        );
+                        *feedback_state.write().await = feedback;
+                    }
+                    Err(err) => warn!("execution feedback refresh failed | {}", err),
+                }
+            }
+        });
+    }
 
     let balance = rpc_client.get_balance(&config.pubkey)?;
     info!("SOL balance: {:.4}", balance as f64 / 1e9);
@@ -402,11 +534,13 @@ async fn main() -> Result<()> {
     info!("主流程已启动，等待扫描事件与 BuySignal");
 
     while let Some(signal) = buy_signal_rx.recv().await {
+        let feedback = execution_feedback.read().await.clone();
         let execution_profile = execution_plan.profile_for_signal(
             &signal.path,
             signal.quality_score,
             signal.urgency_score,
             signal.execution_confidence,
+            &feedback,
         );
         let Ok(token_mint) = Pubkey::from_str(&signal.token.mint) else {
             warn!("执行层：mint 无效，跳过 {}", signal.token.mint);

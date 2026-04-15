@@ -240,6 +240,7 @@ struct SharedState {
     db: FilterDb,
     hotlists: Arc<RwLock<HotLists>>,
     address_snapshot_cache: Arc<RwLock<HashMap<String, CachedAddressSnapshot>>>,
+    address_snapshot_refreshes: Arc<RwLock<HashSet<String>>>,
 }
 
 pub async fn run(
@@ -259,6 +260,7 @@ pub async fn run(
         db,
         hotlists: Arc::new(RwLock::new(HotLists::default())),
         address_snapshot_cache: Arc::new(RwLock::new(HashMap::new())),
+        address_snapshot_refreshes: Arc::new(RwLock::new(HashSet::new())),
     };
     if config.dynamic_hot_keywords_enabled {
         if let Err(err) = refresh_dynamic_hot_keywords(&shared).await {
@@ -2084,33 +2086,88 @@ async fn fetch_address_snapshot(
         Some(snapshot) => Some(snapshot),
         None => get_persisted_address_snapshot(shared, address, u64::MAX).await,
     };
-    match fetch_address_snapshot_helius(shared, api_key, address).await {
-        Ok(snapshot) => {
-            cache_address_snapshot(shared, address, snapshot.clone(), "helius").await;
-            Ok(snapshot)
-        }
-        Err(helius_err) => {
-            warn!(
-                "address snapshot helius fallback | address={} | {}",
-                address, helius_err
-            );
-            if let Some(mut snapshot) = stale_snapshot {
-                snapshot.source = format!("stale:{}", snapshot.source);
+
+    if let Some(mut snapshot) = stale_snapshot {
+        snapshot.source = format!("stale:{}", snapshot.source);
+        maybe_spawn_address_snapshot_refresh(shared, address.to_string(), api_key.to_string()).await;
+        warn!(
+            "address snapshot stale-while-revalidate | address={} | source={}",
+            address, snapshot.source
+        );
+        return Ok(snapshot);
+    }
+
+    fetch_address_snapshot_blocking(shared, api_key, address).await
+}
+
+async fn fetch_address_snapshot_live(
+    shared: &SharedState,
+    api_key: &str,
+    address: &str,
+) -> Result<AddressSnapshot> {
+    if !api_key.trim().is_empty() {
+        match fetch_address_snapshot_helius(shared, api_key, address).await {
+            Ok(snapshot) => return Ok(snapshot),
+            Err(helius_err) => {
                 warn!(
-                    "address snapshot stale fallback | address={} | source={}",
-                    address, snapshot.source
+                    "address snapshot helius fallback | address={} | {}",
+                    address, helius_err
                 );
-                return Ok(snapshot);
             }
-            let snapshot = fetch_address_snapshot_rpc(shared, address).await?;
-            warn!(
-                "address snapshot rpc fallback | address={} | source={}",
-                address, snapshot.source
-            );
-            cache_address_snapshot(shared, address, snapshot.clone(), "rpc").await;
-            Ok(snapshot)
         }
     }
+
+    let snapshot = fetch_address_snapshot_rpc(shared, address).await?;
+    warn!(
+        "address snapshot rpc fallback | address={} | source={}",
+        address, snapshot.source
+    );
+    Ok(snapshot)
+}
+
+async fn maybe_spawn_address_snapshot_refresh(
+    shared: &SharedState,
+    address: String,
+    api_key: String,
+) {
+    {
+        let mut inflight = shared.address_snapshot_refreshes.write().await;
+        if !inflight.insert(address.clone()) {
+            return;
+        }
+    }
+
+    let shared = shared.clone();
+    tokio::spawn(async move {
+        let refresh_result = fetch_address_snapshot_live(&shared, &api_key, &address).await;
+        match refresh_result {
+            Ok(snapshot) => {
+                let source = snapshot.source.clone();
+                cache_address_snapshot(&shared, &address, snapshot, &source).await;
+                info!(
+                    "address snapshot refresh complete | address={} | source={}",
+                    address, source
+                );
+            }
+            Err(err) => {
+                warn!("address snapshot refresh failed | address={} | {}", address, err);
+            }
+        }
+
+        let mut inflight = shared.address_snapshot_refreshes.write().await;
+        inflight.remove(&address);
+    });
+}
+
+async fn fetch_address_snapshot_blocking(
+    shared: &SharedState,
+    api_key: &str,
+    address: &str,
+) -> Result<AddressSnapshot> {
+    let snapshot = fetch_address_snapshot_live(shared, api_key, address).await?;
+    let source = snapshot.source.clone();
+    cache_address_snapshot(shared, address, snapshot.clone(), &source).await;
+    Ok(snapshot)
 }
 
 async fn fetch_address_snapshot_helius(
@@ -3642,6 +3699,8 @@ mod tests {
             scanner_catchup_window_ms: 120_000,
             scanner_catchup_max_events: 1024,
             scanner_failover_stale_ms: 15_000,
+            execution_feedback_window_secs: 300,
+            execution_feedback_refresh_secs: 15,
             creator_gate_timeout_ms: 1_500,
             creator_min_wallet_age_days: 1,
             creator_fresh_wallet_token_limit: 2,
