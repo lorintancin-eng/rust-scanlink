@@ -75,6 +75,10 @@ const CREATOR_FUNDER_CLUSTER_MAX_SHARE: f64 = 0.85;
 pub struct BuySignal {
     pub token: NewToken,
     pub score: u32,
+    pub quality_score: u32,
+    pub urgency_score: u32,
+    pub execution_confidence: u32,
+    pub path: String,
     pub reason: String,
     pub sm_count: usize,
     pub sm_sol_total: f64,
@@ -155,6 +159,9 @@ struct ScoreDecision {
     passed: bool,
     gate: String,
     score: u32,
+    quality_score: u32,
+    urgency_score: u32,
+    execution_confidence: u32,
     reason: String,
     signal: Option<BuySignal>,
     mode: String,
@@ -1384,7 +1391,7 @@ async fn smart_money_stats(candidate: &Candidate, shared: &SharedState) -> Windo
     let soft_threshold = effective_soft_threshold(&shared.config, mode);
     let mut unique_sm_wallets = HashSet::new();
     let mut eligible_buyers = HashSet::new();
-    let mut unique_funders = HashSet::new();
+    let mut unique_funders: HashSet<String> = HashSet::new();
     let mut eligible_sol_total = 0.0f64;
     let mut sm_sol_total = 0.0f64;
     let creator_first_funder = candidate
@@ -1413,7 +1420,7 @@ async fn smart_money_stats(candidate: &Candidate, shared: &SharedState) -> Windo
             .get(&buyer)
             .and_then(|profile| profile.first_funder.clone());
         if let Some(funder) = buyer_funder.as_ref() {
-            unique_funders.insert(funder);
+            unique_funders.insert(funder.clone());
         }
         let buy_sol = buy.sol_amount_lamports as f64 / 1e9;
         eligible_sol_total += buy_sol;
@@ -1517,6 +1524,9 @@ async fn score_candidate(shared: &SharedState, mut candidate: Candidate) -> Scor
             passed: false,
             gate: "gate3".to_string(),
             score: 0,
+            quality_score: 0,
+            urgency_score: 0,
+            execution_confidence: 0,
             reason: format!(
                 "gate3 reject: below threshold | mode={} | matched={} | fast_threshold={} | soft_threshold={} | sol={:.2} | fast_sol={:.2} | soft_sol={:.2} | first_buys={}",
                 smart_money_mode_label(stats.mode),
@@ -1584,12 +1594,19 @@ async fn score_candidate(shared: &SharedState, mut candidate: Candidate) -> Scor
     let dynamic_narrative_bonus = ((candidate.dynamic_narrative_keywords.len() as u32)
         .saturating_mul(shared.config.dynamic_narrative_bonus_per_hit))
     .min(shared.config.dynamic_narrative_bonus_cap);
-    let total_score = sm_count_score
-        + sm_sol_score
-        + momentum_score
-        + curve_score
-        + buyer_quality_score
-        + dynamic_narrative_bonus;
+    let funder_diversity_penalty = if stats.eligible_buyers >= GATE3_MIN_UNIQUE_FUNDERS
+        && stats.unique_funders < GATE3_MIN_UNIQUE_FUNDERS
+    {
+        SINGLE_FUNDER_SCORE_PENALTY
+    } else {
+        0
+    };
+    let quality_score = sm_count_score + sm_sol_score + curve_score + buyer_quality_score
+        - funder_diversity_penalty
+            .min(sm_count_score + sm_sol_score + curve_score + buyer_quality_score);
+    let urgency_score = momentum_score + dynamic_narrative_bonus;
+    let execution_confidence = quality_score.saturating_add(urgency_score).min(100);
+    let total_score = quality_score + urgency_score;
     let required_score = match trigger.path {
         Gate3Path::Fast => shared
             .config
@@ -1628,6 +1645,9 @@ async fn score_candidate(shared: &SharedState, mut candidate: Candidate) -> Scor
             passed: false,
             gate: "gate4".to_string(),
             score: total_score,
+            quality_score,
+            urgency_score,
+            execution_confidence,
             reason,
             signal: None,
             mode: smart_money_mode_label(stats.mode).to_string(),
@@ -1643,6 +1663,9 @@ async fn score_candidate(shared: &SharedState, mut candidate: Candidate) -> Scor
             passed: false,
             gate: "gate4".to_string(),
             score: total_score,
+            quality_score,
+            urgency_score,
+            execution_confidence,
             reason: format!("{} | missing trigger buy context", reason),
             signal: None,
             mode: smart_money_mode_label(stats.mode).to_string(),
@@ -1658,10 +1681,17 @@ async fn score_candidate(shared: &SharedState, mut candidate: Candidate) -> Scor
         passed: true,
         gate: "pass".to_string(),
         score: total_score,
+        quality_score,
+        urgency_score,
+        execution_confidence,
         reason: reason.clone(),
         signal: Some(BuySignal {
             token: candidate.token,
             score: total_score,
+            quality_score,
+            urgency_score,
+            execution_confidence,
+            path: gate3_path_label(trigger.path).to_string(),
             reason,
             sm_count: stats.unique_sm_wallets.len(),
             sm_sol_total: stats.sm_sol_total,

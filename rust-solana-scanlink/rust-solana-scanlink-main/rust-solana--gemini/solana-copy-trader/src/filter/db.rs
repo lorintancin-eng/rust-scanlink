@@ -196,6 +196,23 @@ pub struct PostTradeOutcomeRecord {
 }
 
 #[derive(Debug, Clone)]
+pub struct ExecutionReceiptRecord {
+    pub mint: String,
+    pub signature: Option<String>,
+    pub route_label: String,
+    pub status: String,
+    pub detail: String,
+    pub path: String,
+    pub quality_score: u32,
+    pub urgency_score: u32,
+    pub execution_confidence: u32,
+    pub priority_fee_micro_lamport: u64,
+    pub jito_tip_lamports: u64,
+    pub zero_slot_tip_lamports: u64,
+    pub recorded_at_ms: u64,
+}
+
+#[derive(Debug, Clone)]
 pub struct ClusterMemberRecord {
     pub cluster_id: String,
     pub address: String,
@@ -777,6 +794,36 @@ impl FilterDb {
                     record.metric_60s,
                     record.peak_metric,
                     record.drawdown_metric,
+                    record.recorded_at_ms,
+                ],
+            )?;
+            Ok(())
+        })
+        .await
+    }
+
+    pub async fn insert_execution_receipt(&self, record: &ExecutionReceiptRecord) -> Result<()> {
+        let record = record.clone();
+        self.with_conn(move |conn| {
+            conn.execute(
+                "INSERT INTO execution_receipts(
+                    mint, signature, route_label, status, detail, path, quality_score,
+                    urgency_score, execution_confidence, priority_fee_micro_lamport,
+                    jito_tip_lamports, zero_slot_tip_lamports, recorded_at_ms
+                 ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+                params![
+                    record.mint,
+                    record.signature,
+                    record.route_label,
+                    record.status,
+                    record.detail,
+                    record.path,
+                    record.quality_score,
+                    record.urgency_score,
+                    record.execution_confidence,
+                    record.priority_fee_micro_lamport,
+                    record.jito_tip_lamports,
+                    record.zero_slot_tip_lamports,
                     record.recorded_at_ms,
                 ],
             )?;
@@ -1427,6 +1474,22 @@ fn init_db(path: &Path) -> Result<()> {
             metric_60s REAL,
             peak_metric REAL,
             drawdown_metric REAL,
+            recorded_at_ms INTEGER NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS execution_receipts (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            mint TEXT NOT NULL,
+            signature TEXT,
+            route_label TEXT NOT NULL,
+            status TEXT NOT NULL,
+            detail TEXT NOT NULL,
+            path TEXT NOT NULL,
+            quality_score INTEGER NOT NULL DEFAULT 0,
+            urgency_score INTEGER NOT NULL DEFAULT 0,
+            execution_confidence INTEGER NOT NULL DEFAULT 0,
+            priority_fee_micro_lamport INTEGER NOT NULL DEFAULT 0,
+            jito_tip_lamports INTEGER NOT NULL DEFAULT 0,
+            zero_slot_tip_lamports INTEGER NOT NULL DEFAULT 0,
             recorded_at_ms INTEGER NOT NULL
         );",
     )?;

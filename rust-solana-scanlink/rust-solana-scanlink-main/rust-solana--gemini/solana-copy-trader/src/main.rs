@@ -23,13 +23,13 @@ use std::process;
 use std::str::FromStr;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::sync::{mpsc, Semaphore};
 use tracing::{error, info, warn};
 
 use autosell::{AutoSellManager, Position, SellAccountSnapshot, SellSignal};
 use config::AppConfig;
-use filter::BuySignal as SniperBuySignal;
+use filter::{BuySignal as SniperBuySignal, ExecutionReceiptRecord, FilterDb};
 use groups::CopyGroup;
 use grpc::{AccountSubscriber, AccountUpdate, AtaBalanceCache, BondingCurveCache};
 use processor::prefetch::PrefetchCache;
@@ -40,7 +40,7 @@ use tx::{
     blockhash,
     builder::TxBuilder,
     confirm::{format_mcap_usd, format_price_gmgn, BuyConfirmer},
-    execution_router::ExecutionPlan,
+    execution_router::{ExecutionPlan, ExecutionProfile},
     sell_executor::SellExecutor,
     sender::TxSender,
 };
@@ -69,6 +69,13 @@ fn format_latency(duration: Duration) -> String {
     } else {
         format!("{}us", duration.as_micros())
     }
+}
+
+fn current_time_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_millis() as u64)
+        .unwrap_or_default()
 }
 
 impl RuntimeGuard {
@@ -267,6 +274,7 @@ async fn main() -> Result<()> {
         config.rpc_url.clone(),
         solana_sdk::commitment_config::CommitmentConfig::confirmed(),
     ));
+    let execution_db = Arc::new(FilterDb::new(&config.filter_db_path).await?);
 
     let balance = rpc_client.get_balance(&config.pubkey)?;
     info!("SOL balance: {:.4}", balance as f64 / 1e9);
@@ -387,6 +395,12 @@ async fn main() -> Result<()> {
     info!("主流程已启动，等待扫描事件与 BuySignal");
 
     while let Some(signal) = buy_signal_rx.recv().await {
+        let execution_profile = execution_plan.profile_for_signal(
+            &signal.path,
+            signal.quality_score,
+            signal.urgency_score,
+            signal.execution_confidence,
+        );
         let Ok(token_mint) = Pubkey::from_str(&signal.token.mint) else {
             warn!("执行层：mint 无效，跳过 {}", signal.token.mint);
             continue;
@@ -394,15 +408,38 @@ async fn main() -> Result<()> {
 
         if !config.execution_enabled {
             info!(
-                "Dry-run shortlist | mint={} | symbol={} | score={} | sm={} | sol={:.2} | plan={} | reason={}",
+                "Dry-run shortlist | mint={} | symbol={} | score={} | sm={} | sol={:.2} | exec={} | reason={}",
                 signal.token.mint,
                 signal.token.symbol,
                 signal.score,
                 signal.sm_count,
                 signal.sm_sol_total,
-                execution_plan.summary(),
+                execution_profile.summary(),
                 signal.reason,
             );
+            if let Err(err) = execution_db
+                .insert_execution_receipt(&ExecutionReceiptRecord {
+                    mint: signal.token.mint.clone(),
+                    signature: None,
+                    route_label: execution_profile.route_label.clone(),
+                    status: "dry_run".to_string(),
+                    detail: signal.reason.clone(),
+                    path: signal.path.clone(),
+                    quality_score: signal.quality_score,
+                    urgency_score: signal.urgency_score,
+                    execution_confidence: signal.execution_confidence,
+                    priority_fee_micro_lamport: execution_profile
+                        .adjusted_priority_fee(config.priority_fee_micro_lamport),
+                    jito_tip_lamports: execution_profile
+                        .adjusted_tip_lamports(config.jito_buy_tip_lamports),
+                    zero_slot_tip_lamports: execution_profile
+                        .adjusted_tip_lamports(config.zero_slot_tip_lamports),
+                    recorded_at_ms: current_time_ms(),
+                })
+                .await
+            {
+                warn!("execution dry-run receipt failed | {}", err);
+            }
             continue;
         }
 
@@ -455,6 +492,7 @@ async fn main() -> Result<()> {
         let stats = tg_stats.clone();
         let limiter = buy_exec_limiter.clone();
         let group = sniper_group.clone();
+        let execution_db = execution_db.clone();
         let wallets = vec![signal.trigger_trade.buyer];
         let target_instruction_data = signal.trigger_trade.instruction_data.clone();
         let detected_at = signal.trigger_trade.detected_at;
@@ -480,6 +518,8 @@ async fn main() -> Result<()> {
                 &acct_sub,
                 &tg,
                 &stats,
+                execution_profile,
+                &execution_db,
             )
             .await;
         });
@@ -508,6 +548,8 @@ async fn execute_buy(
     _account_subscriber: &Arc<AccountSubscriber>,
     tg: &TgNotifier,
     tg_stats: &Arc<TgStats>,
+    execution_profile: ExecutionProfile,
+    execution_db: &Arc<FilterDb>,
 ) {
     let start = Instant::now();
     let detect_to_exec = detected_at.elapsed();
@@ -515,7 +557,10 @@ async fn execute_buy(
         queue: detect_to_exec,
         ..Default::default()
     };
-    let config = group.to_app_config(base_config);
+    let mut config = group.to_app_config(base_config);
+    config.priority_fee_micro_lamport =
+        execution_profile.adjusted_priority_fee(config.priority_fee_micro_lamport);
+    let effective_tip_lamports = execution_profile.adjusted_tip_lamports(group.tip_buy_lamports);
     let execution_plan = ExecutionPlan::from_config(&config);
 
     let prefetch_wait_start = Instant::now();
@@ -625,7 +670,7 @@ async fn execute_buy(
                     &config.keypair,
                     blockhash,
                     &fee_account,
-                    group.tip_buy_lamports,
+                    effective_tip_lamports,
                     &[],
                 )
             } else if execution_plan.prefers_jito() {
@@ -636,7 +681,7 @@ async fn execute_buy(
                     &config.keypair,
                     blockhash,
                     &tip,
-                    group.tip_buy_lamports,
+                    effective_tip_lamports,
                     &[],
                 )
             } else {
@@ -647,15 +692,56 @@ async fn execute_buy(
             match tx_result {
                 Ok(transaction) => {
                     let send_call_start = Instant::now();
-                    match tx_sender.fire_and_forget(&transaction, None) {
-                        Ok(sig) => {
-                            timings.send_call = send_call_start.elapsed();
+                    let send_result = if execution_profile.use_all_channels
+                        && !execution_profile.allow_zero_slot
+                    {
+                        match tx_sender
+                            .send_all_channels_with_opts(&transaction, None, true)
+                            .await
+                        {
+                            Ok(result) if result.success => {
+                                let signature = result.signature.unwrap_or_else(|| {
+                                    transaction.signatures.first().copied().unwrap_or_default()
+                                });
+                                Ok((
+                                    signature,
+                                    format!(
+                                        "fanout success channels={}/{}",
+                                        result.channels_succeeded, result.channels_sent
+                                    ),
+                                    result.elapsed,
+                                ))
+                            }
+                            Ok(result) => Err(anyhow::anyhow!(
+                                "fanout send failed channels={}/{}",
+                                result.channels_succeeded,
+                                result.channels_sent
+                            )),
+                            Err(err) => Err(err),
+                        }
+                    } else {
+                        tx_sender.fire_and_forget(&transaction, None).map(|sig| {
+                            (
+                                sig,
+                                execution_profile.route_label.clone(),
+                                Duration::default(),
+                            )
+                        })
+                    };
+
+                    match send_result {
+                        Ok((sig, route_detail, send_elapsed)) => {
+                            timings.send_call = if send_elapsed > Duration::default() {
+                                send_elapsed
+                            } else {
+                                send_call_start.elapsed()
+                            };
                             let total_latency = start.elapsed();
                             let sig_str = sig.to_string();
                             let buy_usd = sol_usd.sol_to_usd(buy_sol);
 
                             info!(
-                                "Buy submitted: [{}] {} | {:.4} SOL (${:.2}) | est {:.0} tokens | price={} | mcap={} | route={} | queue={} | prefetch={} | quote_build={} | tx_build={} | send_call={} | total={} | sig={}",
+                                "Buy submitted: [{}] {} | {:.4} SOL (${:.2}) | est {:.0} tokens | price={} | mcap={} | route={} | detail={} | queue={} | prefetch={} | quote_build={} | tx_build={} | send_call={} | total={} | sig={}",
                                 group.name,
                                 &mint.to_string()[..12],
                                 buy_sol,
@@ -663,7 +749,8 @@ async fn execute_buy(
                                 estimated_tokens_raw as f64 / 1e6,
                                 format_price_gmgn(entry_price_usd),
                                 format_mcap_usd(entry_mcap_usd),
-                                execution_plan.summary(),
+                                execution_profile.summary(),
+                                route_detail,
                                 format_latency(timings.queue),
                                 format_latency(timings.prefetch_wait),
                                 format_latency(timings.quote_build),
@@ -672,6 +759,26 @@ async fn execute_buy(
                                 format_latency(total_latency),
                                 &sig_str[..16.min(sig_str.len())],
                             );
+                            if let Err(err) = execution_db
+                                .insert_execution_receipt(&ExecutionReceiptRecord {
+                                    mint: mint.to_string(),
+                                    signature: Some(sig_str.clone()),
+                                    route_label: execution_profile.route_label.clone(),
+                                    status: "submitted".to_string(),
+                                    detail: route_detail,
+                                    path: execution_profile.signal_path.clone(),
+                                    quality_score: execution_profile.quality_score,
+                                    urgency_score: execution_profile.urgency_score,
+                                    execution_confidence: execution_profile.execution_confidence,
+                                    priority_fee_micro_lamport: config.priority_fee_micro_lamport,
+                                    jito_tip_lamports: effective_tip_lamports,
+                                    zero_slot_tip_lamports: effective_tip_lamports,
+                                    recorded_at_ms: current_time_ms(),
+                                })
+                                .await
+                            {
+                                warn!("execution receipt insert failed | {}", err);
+                            }
 
                             tg.send(TgEvent::BuySubmitted {
                                 group_name: group.name.clone(),
@@ -717,6 +824,26 @@ async fn execute_buy(
                                 err
                             );
                             tg_stats.buy_failed.fetch_add(1, Ordering::Relaxed);
+                            if let Err(receipt_err) = execution_db
+                                .insert_execution_receipt(&ExecutionReceiptRecord {
+                                    mint: mint.to_string(),
+                                    signature: None,
+                                    route_label: execution_profile.route_label.clone(),
+                                    status: "send_failed".to_string(),
+                                    detail: err.to_string(),
+                                    path: execution_profile.signal_path.clone(),
+                                    quality_score: execution_profile.quality_score,
+                                    urgency_score: execution_profile.urgency_score,
+                                    execution_confidence: execution_profile.execution_confidence,
+                                    priority_fee_micro_lamport: config.priority_fee_micro_lamport,
+                                    jito_tip_lamports: effective_tip_lamports,
+                                    zero_slot_tip_lamports: effective_tip_lamports,
+                                    recorded_at_ms: current_time_ms(),
+                                })
+                                .await
+                            {
+                                warn!("execution send_failed receipt failed | {}", receipt_err);
+                            }
                             tg.send(TgEvent::BuyFailed {
                                 group_name: group.name.clone(),
                                 mint: *mint,
@@ -733,6 +860,26 @@ async fn execute_buy(
                         err
                     );
                     tg_stats.buy_failed.fetch_add(1, Ordering::Relaxed);
+                    if let Err(receipt_err) = execution_db
+                        .insert_execution_receipt(&ExecutionReceiptRecord {
+                            mint: mint.to_string(),
+                            signature: None,
+                            route_label: execution_profile.route_label.clone(),
+                            status: "build_failed".to_string(),
+                            detail: err.to_string(),
+                            path: execution_profile.signal_path.clone(),
+                            quality_score: execution_profile.quality_score,
+                            urgency_score: execution_profile.urgency_score,
+                            execution_confidence: execution_profile.execution_confidence,
+                            priority_fee_micro_lamport: config.priority_fee_micro_lamport,
+                            jito_tip_lamports: effective_tip_lamports,
+                            zero_slot_tip_lamports: effective_tip_lamports,
+                            recorded_at_ms: current_time_ms(),
+                        })
+                        .await
+                    {
+                        warn!("execution build_failed receipt failed | {}", receipt_err);
+                    }
                 }
             }
         }
