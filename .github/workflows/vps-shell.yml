@@ -1,0 +1,27 @@
+name: Run Command On VPS
+
+on:
+  workflow_dispatch:
+    inputs:
+      command:
+        description: Shell command to run inside /home/ubuntu/rust-scanlink
+        required: true
+        default: pwd && ls -la
+        type: string
+
+jobs:
+  run-vps-command:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Execute command on VPS
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.VPS_HOST }}
+          username: ${{ secrets.VPS_USER }}
+          key: ${{ secrets.VPS_SSH_KEY }}
+          port: ${{ secrets.VPS_PORT }}
+          script_stop: true
+          script: |
+            set -euo pipefail
+            cd /home/ubuntu/rust-scanlink
+            ${{ inputs.command }}
