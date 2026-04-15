@@ -33,6 +33,7 @@ pub async fn run(config: &AppConfig) -> Result<ReplayReport> {
     let db = FilterDb::new(report_db_path).await?;
     let report = build_replay_report(&db, from_ms, report_to_ms).await?;
     write_report(&config.replay_report_file, &report).await?;
+    log_report_summary(&report);
     info!(
         "Replay report ready | from_ms={} | to_ms={} | decisions={} | pass={} | source_db={} | output={}",
         report.from_ms,
@@ -43,6 +44,37 @@ pub async fn run(config: &AppConfig) -> Result<ReplayReport> {
         config.replay_report_file,
     );
     Ok(report)
+}
+
+fn log_report_summary(report: &ReplayReport) {
+    let gate_summary = top_named_counts(&report.gate_breakdown, 4);
+    let path_summary = top_named_counts(&report.path_breakdown, 4);
+    let first_hit_summary = top_named_counts(&report.first_hit_breakdown, 4);
+    info!(
+        "Replay summary | raw_events={} decisions={} pass={} reject={} overall_p50={}ms overall_p90={}ms pass_p50={}ms first_hit_p50={}ms gates={} paths={} first_hits={}",
+        report.raw_event_count,
+        report.decision_count,
+        report.pass_count,
+        report.reject_count,
+        report.overall_latency_ms.p50,
+        report.overall_latency_ms.p90,
+        report.pass_latency_ms.p50,
+        report.first_hit_lag_ms.p50,
+        gate_summary,
+        path_summary,
+        first_hit_summary,
+    );
+}
+
+fn top_named_counts(rows: &[crate::analytics::attribution::NamedCount], limit: usize) -> String {
+    if rows.is_empty() {
+        return "-".to_string();
+    }
+    rows.iter()
+        .take(limit)
+        .map(|row| format!("{}={}", row.name, row.count))
+        .collect::<Vec<_>>()
+        .join(",")
 }
 
 fn now_ms() -> u64 {
