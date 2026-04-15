@@ -157,6 +157,9 @@ async fn run_stream(
                     Some(UpdateOneof::Pong(_)) => {
                         debug!("scanner: deshred pong | feed={}", endpoint.label);
                     }
+                    Some(UpdateOneof::Slot(_)) => {
+                        debug!("scanner: deshred slot update | feed={}", endpoint.label);
+                    }
                     None => {}
                 }
             }
