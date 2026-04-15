@@ -1,6 +1,6 @@
 use crate::config::AppConfig;
 use crate::filter::{FeedHealthRecord, FilterDb};
-use crate::scanner::failover::FeedHealthEvent;
+use crate::scanner::failover::{FailoverController, FeedHealthEvent};
 use crate::scanner::feed::FeedEndpoint;
 use crate::scanner::{decoder, ScannerEvent, PUMP_PROGRAM_ID};
 use anyhow::{Context, Result};
@@ -9,7 +9,7 @@ use std::{
     collections::HashMap,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, Mutex};
 use tokio::time::{sleep, timeout, Instant};
 use tonic::transport::ClientTlsConfig;
 use tracing::{debug, error, info, warn};
@@ -24,6 +24,7 @@ pub async fn start_feed_loop(
     endpoint: FeedEndpoint,
     tx: mpsc::Sender<ScannerEvent>,
     db: Option<FilterDb>,
+    failover: std::sync::Arc<Mutex<FailoverController>>,
 ) -> Result<()> {
     let mut retry_delay = Duration::from_secs(1);
     const MAX_DELAY: Duration = Duration::from_secs(30);
@@ -32,6 +33,8 @@ pub async fn start_feed_loop(
         record_feed_health(
             db.as_ref(),
             cfg.as_ref(),
+            &endpoint,
+            &failover,
             FeedHealthEvent::new(
                 endpoint.label.clone(),
                 endpoint.url.clone(),
@@ -50,6 +53,8 @@ pub async fn start_feed_loop(
                 record_feed_health(
                     db.as_ref(),
                     cfg.as_ref(),
+                    &endpoint,
+                    &failover,
                     FeedHealthEvent::new(
                         endpoint.label.clone(),
                         endpoint.url.clone(),
@@ -69,6 +74,8 @@ pub async fn start_feed_loop(
                 record_feed_health(
                     db.as_ref(),
                     cfg.as_ref(),
+                    &endpoint,
+                    &failover,
                     FeedHealthEvent::new(
                         endpoint.label.clone(),
                         endpoint.url.clone(),
@@ -115,6 +122,8 @@ async fn run_stream(
     record_feed_health(
         db,
         cfg,
+        endpoint,
+        failover,
         FeedHealthEvent::new(
             endpoint.label.clone(),
             endpoint.url.clone(),
@@ -177,12 +186,20 @@ async fn run_stream(
     }
 }
 
-async fn record_feed_health(db: Option<&FilterDb>, cfg: &AppConfig, event: FeedHealthEvent) {
+async fn record_feed_health(
+    db: Option<&FilterDb>,
+    cfg: &AppConfig,
+    endpoint: &FeedEndpoint,
+    failover: &std::sync::Arc<Mutex<FailoverController>>,
+    event: FeedHealthEvent,
+) {
     if !cfg.persist_feed_health {
+        observe_health_change(failover, endpoint, &event).await;
         return;
     }
 
     let Some(db) = db else {
+        observe_health_change(failover, endpoint, &event).await;
         return;
     };
 
@@ -198,6 +215,7 @@ async fn record_feed_health(db: Option<&FilterDb>, cfg: &AppConfig, event: FeedH
     {
         warn!("scanner: insert deshred feed health failed | {}", err);
     }
+    observe_health_change(failover, endpoint, &event).await;
 }
 
 fn build_subscribe_request() -> SubscribeDeshredRequest {
@@ -216,6 +234,26 @@ fn build_subscribe_request() -> SubscribeDeshredRequest {
         deshred_transactions,
         slots: HashMap::new(),
         ping: None,
+    }
+}
+
+async fn observe_health_change(
+    failover: &std::sync::Arc<Mutex<FailoverController>>,
+    endpoint: &FeedEndpoint,
+    event: &FeedHealthEvent,
+) {
+    let change = {
+        let mut guard = failover.lock().await;
+        guard.observe_health(endpoint.kind, event)
+    };
+    if let Some(change) = change {
+        info!(
+            "scanner: preferred {:?} feed switched | prev={} | next={} | reason={}",
+            change.kind,
+            change.previous_label.as_deref().unwrap_or("-"),
+            change.preferred_label.as_deref().unwrap_or("-"),
+            change.reason,
+        );
     }
 }
 

@@ -1,3 +1,5 @@
+mod player;
+
 use crate::analytics::attribution::{build_replay_report, ReplayReport};
 use crate::config::AppConfig;
 use crate::filter::FilterDb;
@@ -11,15 +13,31 @@ pub async fn run(config: &AppConfig) -> Result<ReplayReport> {
     let from_ms = config
         .replay_from_ms
         .unwrap_or_else(|| to_ms.saturating_sub(config.replay_window_minutes * 60_000));
-    let db = FilterDb::new(&config.filter_db_path).await?;
+    let report_db_path = if config.replay_pipeline_enabled {
+        let pipeline = player::run_pipeline(config, from_ms, to_ms).await?;
+        info!(
+            "Replay pipeline complete | source_events={} replayed={} buy_signals={} duration_ms={} speedup={:.1} replay_db={}",
+            pipeline.source_event_count,
+            pipeline.replayed_event_count,
+            pipeline.emitted_buy_signals,
+            pipeline.elapsed_ms,
+            pipeline.speedup,
+            config.replay_db_path,
+        );
+        &config.replay_db_path
+    } else {
+        &config.filter_db_path
+    };
+    let db = FilterDb::new(report_db_path).await?;
     let report = build_replay_report(&db, from_ms, to_ms).await?;
     write_report(&config.replay_report_file, &report).await?;
     info!(
-        "Replay report ready | from_ms={} | to_ms={} | decisions={} | pass={} | output={}",
+        "Replay report ready | from_ms={} | to_ms={} | decisions={} | pass={} | source_db={} | output={}",
         report.from_ms,
         report.to_ms,
         report.decision_count,
         report.pass_count,
+        report_db_path,
         config.replay_report_file,
     );
     Ok(report)

@@ -1091,6 +1091,36 @@ impl FilterDb {
         .context("query feed_first_hits window failed")?
     }
 
+    pub async fn list_feed_health_window(
+        &self,
+        from_ms: u64,
+        to_ms: u64,
+    ) -> Result<Vec<FeedHealthRecord>> {
+        let path = self.path.clone();
+        tokio::task::spawn_blocking(move || {
+            let conn = open_conn(path.as_path())?;
+            let mut stmt = conn.prepare(
+                "SELECT feed_label, feed_url, status, detail, ts_ms
+                 FROM feed_health
+                 WHERE ts_ms BETWEEN ?1 AND ?2
+                 ORDER BY ts_ms ASC",
+            )?;
+            let rows = stmt.query_map(params![from_ms, to_ms], |row| {
+                Ok(FeedHealthRecord {
+                    feed_label: row.get(0)?,
+                    feed_url: row.get(1)?,
+                    status: row.get(2)?,
+                    detail: row.get(3)?,
+                    ts_ms: row.get(4)?,
+                })
+            })?;
+            rows.collect::<std::result::Result<Vec<_>, _>>()
+                .map_err(Into::into)
+        })
+        .await
+        .context("query feed_health window failed")?
+    }
+
     pub async fn list_gate3_snapshots_window(
         &self,
         from_ms: u64,
@@ -1232,6 +1262,46 @@ impl FilterDb {
         })
         .await
         .context("query post_trade_outcomes window failed")?
+    }
+
+    pub async fn list_execution_receipts_window(
+        &self,
+        from_ms: u64,
+        to_ms: u64,
+    ) -> Result<Vec<ExecutionReceiptRecord>> {
+        let path = self.path.clone();
+        tokio::task::spawn_blocking(move || {
+            let conn = open_conn(path.as_path())?;
+            let mut stmt = conn.prepare(
+                "SELECT mint, signature, route_label, status, detail, path, quality_score,
+                        urgency_score, execution_confidence, priority_fee_micro_lamport,
+                        jito_tip_lamports, zero_slot_tip_lamports, recorded_at_ms
+                 FROM execution_receipts
+                 WHERE recorded_at_ms BETWEEN ?1 AND ?2
+                 ORDER BY recorded_at_ms ASC",
+            )?;
+            let rows = stmt.query_map(params![from_ms, to_ms], |row| {
+                Ok(ExecutionReceiptRecord {
+                    mint: row.get(0)?,
+                    signature: row.get(1)?,
+                    route_label: row.get(2)?,
+                    status: row.get(3)?,
+                    detail: row.get(4)?,
+                    path: row.get(5)?,
+                    quality_score: row.get::<_, u64>(6)? as u32,
+                    urgency_score: row.get::<_, u64>(7)? as u32,
+                    execution_confidence: row.get::<_, u64>(8)? as u32,
+                    priority_fee_micro_lamport: row.get(9)?,
+                    jito_tip_lamports: row.get(10)?,
+                    zero_slot_tip_lamports: row.get(11)?,
+                    recorded_at_ms: row.get(12)?,
+                })
+            })?;
+            rows.collect::<std::result::Result<Vec<_>, _>>()
+                .map_err(Into::into)
+        })
+        .await
+        .context("query execution_receipts window failed")?
     }
 
     pub async fn upsert_cluster_member(&self, record: &ClusterMemberRecord) -> Result<()> {
@@ -1383,20 +1453,19 @@ impl FilterDb {
         .await
     }
 
-    async fn with_conn<F>(&self, func: F) -> Result<()>
+    async fn with_conn<F, T>(&self, func: F) -> Result<T>
     where
-        F: FnOnce(&mut Connection) -> Result<()> + Send + 'static,
+        F: FnOnce(&mut Connection) -> Result<T> + Send + 'static,
+        T: Send + 'static,
     {
         let _guard = self.write_lock.lock().await;
         let path = self.path.clone();
         tokio::task::spawn_blocking(move || {
             let mut conn = open_conn(path.as_path())?;
-            func(&mut conn)?;
-            Ok::<_, anyhow::Error>(())
+            func(&mut conn)
         })
         .await
-        .context("sqlite write task failed")??;
-        Ok(())
+        .context("sqlite write task failed")?
     }
 }
 

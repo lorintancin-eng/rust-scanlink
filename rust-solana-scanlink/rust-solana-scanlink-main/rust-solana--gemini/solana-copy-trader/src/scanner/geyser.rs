@@ -1,7 +1,8 @@
 use crate::config::AppConfig;
 use crate::filter::{FeedFirstHitRecord, FeedHealthRecord, FilterDb};
-use crate::scanner::failover::FeedHealthEvent;
+use crate::scanner::failover::{FailoverController, FeedFirstHitEvent, FeedHealthEvent};
 use crate::scanner::feed::{FeedEndpoint, FeedKind};
+use crate::scanner::raw_event::raw_event_to_scanner_event;
 use crate::scanner::{decoder, deshred, ScannerEvent, PUMP_PROGRAM_ID};
 use anyhow::{Context, Result};
 use futures::StreamExt;
@@ -10,7 +11,7 @@ use std::{
     sync::Arc,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, Mutex};
 use tokio::time::{sleep, timeout, Instant};
 use tonic::transport::ClientTlsConfig;
 use tracing::{debug, error, info, warn};
@@ -70,16 +71,25 @@ pub async fn start(cfg: Arc<AppConfig>, tx: mpsc::Sender<ScannerEvent>) -> Resul
             None
         }
     };
+    let failover = Arc::new(Mutex::new(FailoverController::new(
+        cfg.scanner_failover_stale_ms,
+    )));
 
     let (raw_tx, mut raw_rx) = mpsc::channel::<ScannerEvent>(4096);
+
+    if let Some(db) = db.as_ref() {
+        replay_pending_raw_events(cfg.as_ref(), db, &raw_tx).await?;
+    }
 
     for endpoint in processed_endpoints {
         let cfg_clone = cfg.clone();
         let tx_clone = raw_tx.clone();
         let db_clone = db.clone();
+        let failover_clone = failover.clone();
         tokio::spawn(async move {
             if let Err(err) =
-                start_processed_feed_loop(cfg_clone, endpoint, tx_clone, db_clone).await
+                start_processed_feed_loop(cfg_clone, endpoint, tx_clone, db_clone, failover_clone)
+                    .await
             {
                 error!("scanner: processed feed task exited | {}", err);
             }
@@ -90,9 +100,11 @@ pub async fn start(cfg: Arc<AppConfig>, tx: mpsc::Sender<ScannerEvent>) -> Resul
         let cfg_clone = cfg.clone();
         let tx_clone = raw_tx.clone();
         let db_clone = db.clone();
+        let failover_clone = failover.clone();
         tokio::spawn(async move {
             if let Err(err) =
-                deshred::start_feed_loop(cfg_clone, endpoint, tx_clone, db_clone).await
+                deshred::start_feed_loop(cfg_clone, endpoint, tx_clone, db_clone, failover_clone)
+                    .await
             {
                 error!("scanner: deshred feed task exited | {}", err);
             }
@@ -105,7 +117,17 @@ pub async fn start(cfg: Arc<AppConfig>, tx: mpsc::Sender<ScannerEvent>) -> Resul
     let mut last_cleanup_ms = now_ms();
     while let Some(event) = raw_rx.recv().await {
         let now = now_ms();
-        if should_forward_event(&mut seen, &event, now, &mut last_cleanup_ms, db.as_ref()).await? {
+        if should_forward_event(
+            &mut seen,
+            &event,
+            now,
+            &mut last_cleanup_ms,
+            db.as_ref(),
+            cfg.as_ref(),
+            failover.as_ref(),
+        )
+        .await?
+        {
             if tx.send(event).await.is_err() {
                 return Ok(());
             }
@@ -162,6 +184,8 @@ async fn should_forward_event(
     now_ms: u64,
     last_cleanup_ms: &mut u64,
     db: Option<&FilterDb>,
+    cfg: &AppConfig,
+    failover: &Arc<Mutex<FailoverController>>,
 ) -> Result<bool> {
     if now_ms.saturating_sub(*last_cleanup_ms) >= 30_000 || seen.len() > SCANNER_DEDUP_MAX_KEYS {
         seen.retain(|_, entry| now_ms.saturating_sub(entry.last_seen_ms) <= SCANNER_DEDUP_TTL_MS);
@@ -221,6 +245,21 @@ async fn should_forward_event(
                 })
                 .await?;
             }
+            observe_first_hit(
+                failover,
+                FeedFirstHitEvent::new(
+                    event_key.clone(),
+                    event_type,
+                    mint.to_string(),
+                    signature.to_string(),
+                    slot,
+                    feed_source.to_string(),
+                    now_ms,
+                ),
+                db,
+                cfg,
+            )
+            .await;
             seen.insert(event_key, first_seen);
             Ok(true)
         }
@@ -253,6 +292,7 @@ async fn start_processed_feed_loop(
     endpoint: FeedEndpoint,
     tx: mpsc::Sender<ScannerEvent>,
     db: Option<FilterDb>,
+    failover: Arc<Mutex<FailoverController>>,
 ) -> Result<()> {
     debug_assert_eq!(endpoint.kind, FeedKind::Processed);
     let mut retry_delay = Duration::from_secs(1);
@@ -262,6 +302,8 @@ async fn start_processed_feed_loop(
         record_feed_health(
             db.as_ref(),
             cfg.as_ref(),
+            &endpoint,
+            &failover,
             FeedHealthEvent::new(
                 endpoint.label.clone(),
                 endpoint.url.clone(),
@@ -280,6 +322,8 @@ async fn start_processed_feed_loop(
                 record_feed_health(
                     db.as_ref(),
                     cfg.as_ref(),
+                    &endpoint,
+                    &failover,
                     FeedHealthEvent::new(
                         endpoint.label.clone(),
                         endpoint.url.clone(),
@@ -299,6 +343,8 @@ async fn start_processed_feed_loop(
                 record_feed_health(
                     db.as_ref(),
                     cfg.as_ref(),
+                    &endpoint,
+                    &failover,
                     FeedHealthEvent::new(
                         endpoint.label.clone(),
                         endpoint.url.clone(),
@@ -345,6 +391,8 @@ async fn run_processed_stream(
     record_feed_health(
         db,
         cfg,
+        endpoint,
+        failover,
         FeedHealthEvent::new(
             endpoint.label.clone(),
             endpoint.url.clone(),
@@ -411,12 +459,20 @@ async fn run_processed_stream(
     }
 }
 
-async fn record_feed_health(db: Option<&FilterDb>, cfg: &AppConfig, event: FeedHealthEvent) {
+async fn record_feed_health(
+    db: Option<&FilterDb>,
+    cfg: &AppConfig,
+    endpoint: &FeedEndpoint,
+    failover: &Arc<Mutex<FailoverController>>,
+    event: FeedHealthEvent,
+) {
     if !cfg.persist_feed_health {
+        observe_health_change(failover, endpoint, &event, None).await;
         return;
     }
 
     let Some(db) = db else {
+        observe_health_change(failover, endpoint, &event, None).await;
         return;
     };
 
@@ -432,6 +488,7 @@ async fn record_feed_health(db: Option<&FilterDb>, cfg: &AppConfig, event: FeedH
     {
         warn!("scanner: insert feed health failed | {}", err);
     }
+    observe_health_change(failover, endpoint, &event, Some(db)).await;
 }
 
 fn build_subscribe_request() -> SubscribeRequest {
@@ -461,4 +518,132 @@ fn now_ms() -> u64 {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis() as u64
+}
+
+async fn observe_health_change(
+    failover: &Arc<Mutex<FailoverController>>,
+    endpoint: &FeedEndpoint,
+    event: &FeedHealthEvent,
+    db: Option<&FilterDb>,
+) {
+    let change = {
+        let mut guard = failover.lock().await;
+        guard.observe_health(endpoint.kind, event)
+    };
+    if let Some(change) = change {
+        log_selection_change(db, &change, &endpoint.url).await;
+    }
+}
+
+async fn observe_first_hit(
+    failover: &Arc<Mutex<FailoverController>>,
+    event: FeedFirstHitEvent,
+    db: Option<&FilterDb>,
+    cfg: &AppConfig,
+) {
+    let change = {
+        let mut guard = failover.lock().await;
+        guard.observe_first_hit(&event.feed_source, event.detected_at_ms)
+    };
+    if let Some(change) = change {
+        if cfg.persist_feed_health {
+            log_selection_change(db, &change, "").await;
+        } else {
+            info!(
+                "scanner: preferred {:?} feed switched | prev={} | next={} | reason={}",
+                change.kind,
+                change.previous_label.as_deref().unwrap_or("-"),
+                change.preferred_label.as_deref().unwrap_or("-"),
+                change.reason,
+            );
+        }
+    }
+}
+
+async fn log_selection_change(
+    db: Option<&FilterDb>,
+    change: &crate::scanner::failover::FeedSelectionChange,
+    feed_url: &str,
+) {
+    info!(
+        "scanner: preferred {:?} feed switched | prev={} | next={} | reason={}",
+        change.kind,
+        change.previous_label.as_deref().unwrap_or("-"),
+        change.preferred_label.as_deref().unwrap_or("-"),
+        change.reason,
+    );
+    let Some(db) = db else {
+        return;
+    };
+    let detail = format!(
+        "prev={} next={} reason={}",
+        change.previous_label.as_deref().unwrap_or("-"),
+        change.preferred_label.as_deref().unwrap_or("-"),
+        change.reason
+    );
+    if let Err(err) = db
+        .insert_feed_health(&FeedHealthRecord {
+            feed_label: format!("preferred_{:?}", change.kind).to_ascii_lowercase(),
+            feed_url: feed_url.to_string(),
+            status: "preferred_switch".to_string(),
+            detail,
+            ts_ms: change.ts_ms,
+        })
+        .await
+    {
+        warn!("scanner: insert preferred feed health failed | {}", err);
+    }
+}
+
+async fn replay_pending_raw_events(
+    cfg: &AppConfig,
+    db: &FilterDb,
+    tx: &mpsc::Sender<ScannerEvent>,
+) -> Result<()> {
+    if cfg.scanner_catchup_window_ms == 0 || cfg.scanner_catchup_max_events == 0 {
+        return Ok(());
+    }
+
+    let to_ms = now_ms();
+    let from_ms = to_ms.saturating_sub(cfg.scanner_catchup_window_ms);
+    let raw_events = db.list_raw_events_window(from_ms, to_ms).await?;
+    if raw_events.is_empty() {
+        return Ok(());
+    }
+    let decided_mints: HashSet<String> = db
+        .list_filter_results_window(from_ms, to_ms)
+        .await?
+        .into_iter()
+        .map(|record| record.mint)
+        .collect();
+    let mut unresolved = raw_events
+        .into_iter()
+        .filter(|record| !decided_mints.contains(&record.mint))
+        .collect::<Vec<_>>();
+    unresolved.sort_by_key(|record| record.recorded_at_ms);
+    if unresolved.len() > cfg.scanner_catchup_max_events {
+        let skip = unresolved
+            .len()
+            .saturating_sub(cfg.scanner_catchup_max_events);
+        unresolved.drain(0..skip);
+    }
+
+    let mut replayed = 0usize;
+    for record in unresolved {
+        if let Some(event) = raw_event_to_scanner_event(&record)? {
+            if tx.send(event).await.is_err() {
+                break;
+            }
+            replayed = replayed.saturating_add(1);
+        }
+    }
+
+    if replayed > 0 {
+        info!(
+            "scanner: replayed {} unresolved raw events from last {}ms before live feed start",
+            replayed, cfg.scanner_catchup_window_ms
+        );
+    }
+
+    Ok(())
 }

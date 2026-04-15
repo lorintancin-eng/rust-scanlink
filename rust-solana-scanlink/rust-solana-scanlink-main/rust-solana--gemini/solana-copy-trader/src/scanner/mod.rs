@@ -3,6 +3,7 @@ pub mod deshred;
 pub mod failover;
 pub mod feed;
 pub mod geyser;
+pub mod raw_event;
 
 pub use decoder::{NewToken, PumpBuyEvent, ScannerEvent};
 

@@ -47,9 +47,11 @@ pub struct AppConfig {
     pub latency_metrics_file: String,
     pub replay_db_path: String,
     pub replay_mode_enabled: bool,
+    pub replay_pipeline_enabled: bool,
     pub replay_from_ms: Option<u64>,
     pub replay_to_ms: Option<u64>,
     pub replay_window_minutes: u64,
+    pub replay_speedup: f64,
     pub replay_report_file: String,
     pub filter_hot_reload_secs: u64,
     pub dynamic_hot_refresh_secs: u64,
@@ -94,6 +96,9 @@ pub struct AppConfig {
     pub risk_creator_funder_penalty_score: u32,
     pub risk_penalty_cap: u32,
     pub scanner_idle_timeout_secs: u64,
+    pub scanner_catchup_window_ms: u64,
+    pub scanner_catchup_max_events: usize,
+    pub scanner_failover_stale_ms: u64,
     pub creator_gate_timeout_ms: u64,
     pub creator_min_wallet_age_days: u64,
     pub creator_fresh_wallet_token_limit: u32,
@@ -249,6 +254,7 @@ impl AppConfig {
             filter_db_path: env_or("FILTER_DB_PATH", "data/filter.sqlite3"),
             replay_db_path: env_or("REPLAY_DB_PATH", "data/replay.sqlite3"),
             replay_mode_enabled: env_parse("REPLAY_MODE_ENABLED", false),
+            replay_pipeline_enabled: env_parse("REPLAY_PIPELINE_ENABLED", false),
             replay_from_ms: std::env::var("REPLAY_FROM_MS")
                 .ok()
                 .and_then(|value| value.parse().ok()),
@@ -256,6 +262,7 @@ impl AppConfig {
                 .ok()
                 .and_then(|value| value.parse().ok()),
             replay_window_minutes: env_parse("REPLAY_WINDOW_MINUTES", 60),
+            replay_speedup: env_parse("REPLAY_SPEEDUP", 50.0),
             replay_report_file: env_or("REPLAY_REPORT_FILE", "data/replay_report.json"),
             smart_money_file: env_or("SMART_MONEY_FILE", "data/smart_money.txt"),
             smart_money_funder_file: env_or(
@@ -321,6 +328,9 @@ impl AppConfig {
             risk_creator_funder_penalty_score: env_parse("RISK_CREATOR_FUNDER_PENALTY_SCORE", 7),
             risk_penalty_cap: env_parse("RISK_PENALTY_CAP", 18),
             scanner_idle_timeout_secs: env_parse("SCANNER_IDLE_TIMEOUT_SECS", 30),
+            scanner_catchup_window_ms: env_parse("SCANNER_CATCHUP_WINDOW_MS", 120_000),
+            scanner_catchup_max_events: env_parse("SCANNER_CATCHUP_MAX_EVENTS", 1024),
+            scanner_failover_stale_ms: env_parse("SCANNER_FAILOVER_STALE_MS", 15_000),
             creator_gate_timeout_ms: env_parse("CREATOR_GATE_TIMEOUT_MS", 1_500),
             creator_min_wallet_age_days: env_parse("CREATOR_MIN_WALLET_AGE_DAYS", 1),
             creator_fresh_wallet_token_limit: env_parse("CREATOR_FRESH_WALLET_TOKEN_LIMIT", 2),

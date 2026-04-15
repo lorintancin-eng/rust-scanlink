@@ -1,6 +1,7 @@
 use crate::filter::{
-    FilterDb, FilterResultRecord, FilterTimingRecord, Gate3SnapshotRecord, LabelSuggestionRecord,
-    PostTradeOutcomeRecord, RawEventRecord, ScoringBreakdownRecord,
+    ExecutionReceiptRecord, FeedFirstHitRecord, FeedHealthRecord, FilterDb, FilterResultRecord,
+    FilterTimingRecord, Gate3SnapshotRecord, LabelSuggestionRecord, PostTradeOutcomeRecord,
+    ScoringBreakdownRecord,
 };
 use anyhow::Result;
 use serde::Serialize;
@@ -17,9 +18,14 @@ pub struct ReplayReport {
     pub overall_latency_ms: PercentileSummary,
     pub pass_latency_ms: PercentileSummary,
     pub feed_breakdown: Vec<NamedCount>,
+    pub first_hit_breakdown: Vec<NamedCount>,
+    pub feed_health_breakdown: Vec<NamedCount>,
     pub gate_breakdown: Vec<NamedCount>,
     pub path_breakdown: Vec<NamedCount>,
     pub label_breakdown: Vec<NamedCount>,
+    pub execution_status_breakdown: Vec<NamedCount>,
+    pub execution_route_breakdown: Vec<NamedCount>,
+    pub first_hit_lag_ms: PercentileSummary,
     pub top_passes: Vec<PassSummary>,
     pub outcome_summary: OutcomeSummary,
 }
@@ -65,13 +71,18 @@ pub async fn build_replay_report(db: &FilterDb, from_ms: u64, to_ms: u64) -> Res
     let raw_events = db.list_raw_events_window(from_ms, to_ms).await?;
     let filter_results = db.list_filter_results_window(from_ms, to_ms).await?;
     let filter_timings = db.list_filter_timings_window(from_ms, to_ms).await?;
+    let feed_health = db.list_feed_health_window(from_ms, to_ms).await?;
+    let feed_first_hits = db.list_feed_first_hits_window(from_ms, to_ms).await?;
     let _gate3_snapshots: Vec<Gate3SnapshotRecord> =
         db.list_gate3_snapshots_window(from_ms, to_ms).await?;
     let scoring_breakdowns = db.list_scoring_breakdowns_window(from_ms, to_ms).await?;
     let label_suggestions = db.list_label_suggestions_window(from_ms, to_ms).await?;
     let outcomes = db.list_post_trade_outcomes_window(from_ms, to_ms).await?;
+    let execution_receipts = db.list_execution_receipts_window(from_ms, to_ms).await?;
 
     let feed_breakdown = count_by(raw_events.iter(), |row| row.feed_source.clone());
+    let first_hit_breakdown = count_by(feed_first_hits.iter(), |row| row.first_feed_source.clone());
+    let feed_health_breakdown = count_by(feed_health.iter(), feed_health_key);
     let gate_breakdown = count_by(filter_results.iter(), |row| {
         if row.passed {
             "pass".to_string()
@@ -83,6 +94,9 @@ pub async fn build_replay_report(db: &FilterDb, from_ms: u64, to_ms: u64) -> Res
     });
     let path_breakdown = count_by(filter_timings.iter(), |row| row.path.clone());
     let label_breakdown = count_by(label_suggestions.iter(), |row| row.label_type.clone());
+    let execution_status_breakdown = count_by(execution_receipts.iter(), |row| row.status.clone());
+    let execution_route_breakdown =
+        count_by(execution_receipts.iter(), |row| row.route_label.clone());
 
     let pass_count = filter_results.iter().filter(|row| row.passed).count();
     let reject_count = filter_results.len().saturating_sub(pass_count);
@@ -93,6 +107,8 @@ pub async fn build_replay_report(db: &FilterDb, from_ms: u64, to_ms: u64) -> Res
             .filter(|row| row.decision == "pass")
             .map(|row| row.latency_ms),
     );
+    let first_hit_lag_ms =
+        summarize_latency(feed_first_hits.iter().map(|row| row.lag_to_latest_ms));
     let top_passes = build_top_passes(&filter_results, &filter_timings, &scoring_breakdowns);
     let outcome_summary = summarize_outcomes(&outcomes);
 
@@ -106,9 +122,14 @@ pub async fn build_replay_report(db: &FilterDb, from_ms: u64, to_ms: u64) -> Res
         overall_latency_ms,
         pass_latency_ms,
         feed_breakdown,
+        first_hit_breakdown,
+        feed_health_breakdown,
         gate_breakdown,
         path_breakdown,
         label_breakdown,
+        execution_status_breakdown,
+        execution_route_breakdown,
+        first_hit_lag_ms,
         top_passes,
         outcome_summary,
     })
@@ -187,6 +208,10 @@ fn summarize_outcomes(outcomes: &[PostTradeOutcomeRecord]) -> OutcomeSummary {
             .sum::<f64>()
             / count,
     }
+}
+
+fn feed_health_key(row: &FeedHealthRecord) -> String {
+    format!("{}:{}", row.feed_label, row.status)
 }
 
 fn count_by<T, F>(items: impl Iterator<Item = T>, mut key_fn: F) -> Vec<NamedCount>

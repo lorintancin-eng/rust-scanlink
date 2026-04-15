@@ -183,10 +183,13 @@ async fn main() -> Result<()> {
     let config = Arc::new(AppConfig::from_env()?);
     if config.replay_mode_enabled {
         info!(
-            "Mode: replay | from_ms={:?} | to_ms={:?} | window_minutes={} | report={}",
+            "Mode: replay | pipeline={} | from_ms={:?} | to_ms={:?} | window_minutes={} | speedup={:.1} | replay_db={} | report={}",
+            config.replay_pipeline_enabled,
             config.replay_from_ms,
             config.replay_to_ms,
             config.replay_window_minutes,
+            config.replay_speedup,
+            config.replay_db_path,
             config.replay_report_file,
         );
         replay::run(config.as_ref()).await?;
@@ -248,7 +251,7 @@ async fn main() -> Result<()> {
         config.coingecko_api_key.is_some(),
     );
     info!(
-        "Scanner feeds: mode={} | primary_label={} primary_url={} | secondary_label={} secondary_url={} | deshred_label={} deshred_url={} | persist_raw_events={} gate3_sequences={} scoring_breakdowns={} labels={} replay_db={} replay_report={}",
+        "Scanner feeds: mode={} | primary_label={} primary_url={} | secondary_label={} secondary_url={} | deshred_label={} deshred_url={} | persist_raw_events={} gate3_sequences={} scoring_breakdowns={} labels={} feed_health={} catchup_window_ms={} catchup_max_events={} failover_stale_ms={} replay_db={} replay_report={}",
         config.scanner_mode,
         config.scanner_primary_feed_label,
         config.scanner_grpc_url,
@@ -266,6 +269,10 @@ async fn main() -> Result<()> {
         config.persist_gate3_sequences,
         config.persist_scoring_breakdowns,
         config.persist_label_suggestions,
+        config.persist_feed_health,
+        config.scanner_catchup_window_ms,
+        config.scanner_catchup_max_events,
+        config.scanner_failover_stale_ms,
         config.replay_db_path,
         config.replay_report_file,
     );
