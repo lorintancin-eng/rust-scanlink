@@ -18,7 +18,7 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p artifact
-          gh run download "${{ inputs.build_run_id }}" -n rust-scanlink-trader-linux -D artifact
+          gh run download "${{ inputs.build_run_id }}" -R "${{ github.repository }}" -n rust-scanlink-trader-linux -D artifact
           test -f artifact/rust-scanlink-trader
           chmod 755 artifact/rust-scanlink-trader
           ls -l artifact/rust-scanlink-trader
