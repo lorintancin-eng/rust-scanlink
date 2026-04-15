@@ -41,6 +41,15 @@ struct SeenSignal {
 pub async fn start(cfg: Arc<AppConfig>, tx: mpsc::Sender<ScannerEvent>) -> Result<()> {
     let processed_endpoints = build_processed_endpoints(cfg.as_ref());
     let deshred_endpoint = build_deshred_endpoint(cfg.as_ref());
+    let processed_labels = processed_endpoints
+        .iter()
+        .map(|endpoint| endpoint.label.as_str())
+        .collect::<Vec<_>>()
+        .join(",");
+    let deshred_label = deshred_endpoint
+        .as_ref()
+        .map(|endpoint| endpoint.label.as_str())
+        .unwrap_or("-");
 
     match cfg.scanner_mode {
         crate::scanner::feed::ScannerMode::ProcessedOnly if processed_endpoints.is_empty() => {
@@ -62,6 +71,20 @@ pub async fn start(cfg: Arc<AppConfig>, tx: mpsc::Sender<ScannerEvent>) -> Resul
     if processed_endpoints.is_empty() && deshred_endpoint.is_none() {
         anyhow::bail!("scanner feed list is empty");
     }
+
+    info!(
+        "scanner: starting feeds | mode={} | processed_feeds={} [{}] | deshred_feed={} | dedup_ttl_ms={} | dedup_max_keys={}",
+        cfg.scanner_mode,
+        processed_endpoints.len(),
+        if processed_labels.is_empty() {
+            "-"
+        } else {
+            processed_labels.as_str()
+        },
+        deshred_label,
+        SCANNER_DEDUP_TTL_MS,
+        SCANNER_DEDUP_MAX_KEYS,
+    );
 
     let db = match FilterDb::new(&cfg.filter_db_path).await {
         Ok(db) => Some(db),

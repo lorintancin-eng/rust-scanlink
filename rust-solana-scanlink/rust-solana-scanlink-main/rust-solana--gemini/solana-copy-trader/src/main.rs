@@ -28,6 +28,7 @@ use tokio::sync::{mpsc, RwLock, Semaphore};
 use tracing::{error, info, warn};
 
 use autosell::{AutoSellManager, Position, SellAccountSnapshot, SellSignal};
+use analytics::runtime::{build_runtime_report, log_runtime_report, persist_runtime_report};
 use config::AppConfig;
 use filter::{BuySignal as SniperBuySignal, ExecutionReceiptRecord, FilterDb};
 use groups::CopyGroup;
@@ -362,6 +363,13 @@ async fn main() -> Result<()> {
         config.execution_feedback_window_secs,
         config.execution_feedback_refresh_secs,
     );
+    info!(
+        "Runtime report: enabled={} interval_secs={} window_secs={} file={}",
+        config.runtime_report_enabled,
+        config.runtime_report_interval_secs,
+        config.runtime_report_window_secs,
+        config.runtime_report_file,
+    );
 
     let rpc_client = Arc::new(RpcClient::new_with_commitment(
         config.rpc_url.clone(),
@@ -409,6 +417,39 @@ async fn main() -> Result<()> {
                     }
                     Err(err) => warn!("execution feedback refresh failed | {}", err),
                 }
+            }
+        });
+    }
+
+    if config.runtime_report_enabled && config.runtime_report_interval_secs > 0 {
+        let runtime_db = execution_db.clone();
+        let runtime_cfg = config.clone();
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(Duration::from_secs(
+                runtime_cfg.runtime_report_interval_secs.max(10),
+            ));
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            loop {
+                let to_ms = current_time_ms();
+                let from_ms = to_ms.saturating_sub(
+                    runtime_cfg
+                        .runtime_report_window_secs
+                        .saturating_mul(1000),
+                );
+                match build_runtime_report(runtime_db.as_ref(), runtime_cfg.as_ref(), from_ms, to_ms)
+                    .await
+                {
+                    Ok(report) => {
+                        log_runtime_report(&report);
+                        if let Err(err) =
+                            persist_runtime_report(&report, &runtime_cfg.runtime_report_file).await
+                        {
+                            warn!("runtime report persist failed | {}", err);
+                        }
+                    }
+                    Err(err) => warn!("runtime report refresh failed | {}", err),
+                }
+                interval.tick().await;
             }
         });
     }
