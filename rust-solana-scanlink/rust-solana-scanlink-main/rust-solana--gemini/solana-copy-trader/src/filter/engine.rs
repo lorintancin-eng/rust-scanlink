@@ -16,6 +16,7 @@ use crate::scanner::{
 };
 use anyhow::{Context, Result};
 use futures::stream::{self, StreamExt};
+use reqwest::StatusCode;
 use serde_json::{json, Value};
 use solana_client::rpc_client::{GetConfirmedSignaturesForAddress2Config, RpcClient};
 use solana_sdk::{commitment_config::CommitmentConfig, pubkey::Pubkey};
@@ -241,6 +242,7 @@ struct SharedState {
     hotlists: Arc<RwLock<HotLists>>,
     address_snapshot_cache: Arc<RwLock<HashMap<String, CachedAddressSnapshot>>>,
     address_snapshot_refreshes: Arc<RwLock<HashSet<String>>>,
+    address_snapshot_helius_cooldown_until_ms: Arc<RwLock<u64>>,
 }
 
 pub async fn run(
@@ -261,6 +263,7 @@ pub async fn run(
         hotlists: Arc::new(RwLock::new(HotLists::default())),
         address_snapshot_cache: Arc::new(RwLock::new(HashMap::new())),
         address_snapshot_refreshes: Arc::new(RwLock::new(HashSet::new())),
+        address_snapshot_helius_cooldown_until_ms: Arc::new(RwLock::new(0)),
     };
     if config.dynamic_hot_keywords_enabled {
         if let Err(err) = refresh_dynamic_hot_keywords(&shared).await {
@@ -2105,7 +2108,8 @@ async fn fetch_address_snapshot_live(
     api_key: &str,
     address: &str,
 ) -> Result<AddressSnapshot> {
-    if !api_key.trim().is_empty() {
+    let helius_cooldown_remaining_ms = helius_snapshot_cooldown_remaining_ms(shared).await;
+    if !api_key.trim().is_empty() && helius_cooldown_remaining_ms == 0 {
         match fetch_address_snapshot_helius(shared, api_key, address).await {
             Ok(snapshot) => return Ok(snapshot),
             Err(helius_err) => {
@@ -2115,9 +2119,19 @@ async fn fetch_address_snapshot_live(
                 );
             }
         }
+    } else if !api_key.trim().is_empty() && helius_cooldown_remaining_ms > 0 {
+        warn!(
+            "address snapshot helius cooldown active | address={} | cooldown_remaining_ms={}",
+            address, helius_cooldown_remaining_ms
+        );
     }
 
-    let snapshot = fetch_address_snapshot_rpc(shared, address).await?;
+    let mut snapshot = fetch_address_snapshot_rpc(shared, address).await?;
+    if !api_key.trim().is_empty() && helius_cooldown_remaining_ms > 0 {
+        snapshot.source = format!("rpc:helius_cooldown:{}ms", helius_cooldown_remaining_ms);
+    } else if !api_key.trim().is_empty() {
+        snapshot.source = "rpc:helius_fallback".to_string();
+    }
     warn!(
         "address snapshot rpc fallback | address={} | source={}",
         address, snapshot.source
@@ -2179,48 +2193,81 @@ async fn fetch_address_snapshot_helius(
         "https://api-mainnet.helius-rpc.com/v0/addresses/{}/transactions",
         address
     );
-    let items: Vec<Value> = shared
-        .http
-        .get(url)
-        .query(&[
-            ("api-key", api_key),
-            ("commitment", "confirmed"),
-            ("limit", "1"),
-            ("sort-order", "asc"),
-        ])
-        .send()
-        .await
-        .with_context(|| format!("Helius oldest tx query failed: {}", address))?
-        .error_for_status()
-        .with_context(|| format!("Helius oldest tx response invalid: {}", address))?
-        .json()
-        .await
-        .context("Helius oldest tx json decode failed")?;
+    let retry_limit = shared.config.address_snapshot_helius_retry_limit.max(1);
+    let retry_delay_ms = shared.config.address_snapshot_helius_retry_delay_ms.max(50);
+    let mut last_error = None;
 
-    let oldest_tx_ms = items
-        .first()
-        .and_then(|item| item.get("timestamp"))
-        .and_then(Value::as_u64)
-        .map(|ts| ts * 1000)
-        .unwrap_or_default();
-    let wallet_age_days = if oldest_tx_ms == 0 {
-        0
-    } else {
-        now_ms()
-            .saturating_sub(oldest_tx_ms)
-            .checked_div(DAY_MS)
-            .unwrap_or_default() as u32
-    };
-    let first_funder = items
-        .first()
-        .and_then(|item| extract_first_funder(item, address));
+    for attempt in 0..retry_limit {
+        let response = shared
+            .http
+            .get(url.clone())
+            .query(&[
+                ("api-key", api_key),
+                ("commitment", "confirmed"),
+                ("limit", "1"),
+                ("sort-order", "asc"),
+            ])
+            .send()
+            .await
+            .with_context(|| format!("Helius oldest tx query failed: {}", address))?;
+        let status = response.status();
+        if status == StatusCode::TOO_MANY_REQUESTS {
+            let cooldown_ms = retry_after_to_ms(response.headers())
+                .unwrap_or(shared.config.address_snapshot_provider_cooldown_ms.max(1_000));
+            set_helius_snapshot_cooldown(shared, cooldown_ms).await;
+            anyhow::bail!(
+                "Helius oldest tx rate limited: {} | cooldown_ms={}",
+                address,
+                cooldown_ms
+            );
+        }
+        if status.is_server_error() && attempt + 1 < retry_limit {
+            last_error = Some(anyhow::anyhow!(
+                "Helius oldest tx server error: {} | status={}",
+                address,
+                status
+            ));
+            tokio::time::sleep(Duration::from_millis(retry_delay_ms)).await;
+            continue;
+        }
+        let items: Vec<Value> = response
+            .error_for_status()
+            .with_context(|| format!("Helius oldest tx response invalid: {}", address))?
+            .json()
+            .await
+            .context("Helius oldest tx json decode failed")?;
 
-    Ok(AddressSnapshot {
-        oldest_tx_ms,
-        wallet_age_days,
-        first_funder,
-        source: "helius".to_string(),
-    })
+        clear_helius_snapshot_cooldown(shared).await;
+
+        let oldest_tx_ms = items
+            .first()
+            .and_then(|item| item.get("timestamp"))
+            .and_then(Value::as_u64)
+            .map(|ts| ts * 1000)
+            .unwrap_or_default();
+        let wallet_age_days = if oldest_tx_ms == 0 {
+            0
+        } else {
+            now_ms()
+                .saturating_sub(oldest_tx_ms)
+                .checked_div(DAY_MS)
+                .unwrap_or_default() as u32
+        };
+        let first_funder = items
+            .first()
+            .and_then(|item| extract_first_funder(item, address));
+
+        return Ok(AddressSnapshot {
+            oldest_tx_ms,
+            wallet_age_days,
+            first_funder,
+            source: "helius".to_string(),
+        });
+    }
+
+    Err(last_error.unwrap_or_else(|| {
+        anyhow::anyhow!("Helius oldest tx failed without detailed error: {}", address)
+    }))
 }
 
 async fn fetch_address_snapshot_rpc(
@@ -2342,6 +2389,27 @@ async fn cache_address_snapshot_memory(
             fetched_at_ms,
         },
     );
+}
+
+async fn helius_snapshot_cooldown_remaining_ms(shared: &SharedState) -> u64 {
+    let guard = shared.address_snapshot_helius_cooldown_until_ms.read().await;
+    guard.saturating_sub(now_ms())
+}
+
+async fn set_helius_snapshot_cooldown(shared: &SharedState, cooldown_ms: u64) {
+    let until_ms = now_ms().saturating_add(cooldown_ms);
+    let mut guard = shared.address_snapshot_helius_cooldown_until_ms.write().await;
+    *guard = (*guard).max(until_ms);
+}
+
+async fn clear_helius_snapshot_cooldown(shared: &SharedState) {
+    let mut guard = shared.address_snapshot_helius_cooldown_until_ms.write().await;
+    *guard = 0;
+}
+
+fn retry_after_to_ms(headers: &reqwest::header::HeaderMap) -> Option<u64> {
+    let value = headers.get(reqwest::header::RETRY_AFTER)?.to_str().ok()?.trim();
+    value.parse::<u64>().ok().map(|seconds| seconds.saturating_mul(1000))
 }
 
 fn extract_first_funder(item: &Value, address: &str) -> Option<String> {
