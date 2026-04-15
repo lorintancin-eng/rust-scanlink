@@ -1,5 +1,5 @@
 use crate::config::AppConfig;
-use crate::filter::db::{FeedHealthRecord, FilterDb};
+use crate::filter::{FeedHealthRecord, FilterDb};
 use crate::scanner::failover::FeedHealthEvent;
 use crate::scanner::feed::FeedEndpoint;
 use crate::scanner::{decoder, ScannerEvent, PUMP_PROGRAM_ID};
@@ -211,6 +211,7 @@ fn build_subscribe_request() -> SubscribeDeshredRequest {
 
     SubscribeDeshredRequest {
         deshred_transactions,
+        slots: HashMap::new(),
         ping: None,
     }
 }

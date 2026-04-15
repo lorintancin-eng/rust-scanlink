@@ -12,8 +12,7 @@ use crate::scanner::{
 use anyhow::{Context, Result};
 use futures::stream::{self, StreamExt};
 use serde_json::{json, Value};
-use solana_client::rpc_config::RpcSignaturesForAddressConfig;
-use solana_client::rpc_client::RpcClient;
+use solana_client::rpc_client::{GetConfirmedSignaturesForAddress2Config, RpcClient};
 use solana_sdk::{commitment_config::CommitmentConfig, pubkey::Pubkey};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::str::FromStr;
@@ -1307,12 +1306,12 @@ fn gate3_reject_reason(
         ));
     }
     if stats.buy_count >= GATE3_CLUSTER_DIVERSITY_MIN_BUYS
-        && stats.unique_buyers.len() >= GATE3_MIN_UNIQUE_FUNDERS
+        && stats.eligible_buyers >= GATE3_MIN_UNIQUE_FUNDERS
         && stats.unique_funders < GATE3_MIN_UNIQUE_FUNDERS
     {
         return Some(format!(
             "gate3 reject: low funder diversity | unique_buyers={} | unique_funders={} | first_buys={}",
-            stats.unique_buyers.len(),
+            stats.eligible_buyers,
             stats.unique_funders,
             stats.buy_count,
         ));
@@ -1987,7 +1986,7 @@ async fn fetch_address_snapshot_rpc(shared: &SharedState, address: &str) -> Resu
     tokio::task::spawn_blocking(move || {
         let signatures = rpc.get_signatures_for_address_with_config(
             &address,
-            RpcSignaturesForAddressConfig {
+            GetConfirmedSignaturesForAddress2Config {
                 before: None,
                 until: None,
                 limit: Some(1_000),
@@ -2878,7 +2877,7 @@ async fn persist_candidate_analytics(
         let dynamic_bonus = ((candidate.dynamic_narrative_keywords.len() as u32)
             .saturating_mul(shared.config.dynamic_narrative_bonus_per_hit))
         .min(shared.config.dynamic_narrative_bonus_cap);
-        let funder_diversity_penalty = if stats.unique_buyers.len() >= GATE3_MIN_UNIQUE_FUNDERS
+        let funder_diversity_penalty = if stats.eligible_buyers >= GATE3_MIN_UNIQUE_FUNDERS
             && stats.unique_funders < GATE3_MIN_UNIQUE_FUNDERS
         {
             SINGLE_FUNDER_SCORE_PENALTY

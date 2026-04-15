@@ -1,5 +1,5 @@
 use crate::config::AppConfig;
-use crate::filter::db::{FeedFirstHitRecord, FeedHealthRecord, FilterDb};
+use crate::filter::{FeedFirstHitRecord, FeedHealthRecord, FilterDb};
 use crate::scanner::failover::FeedHealthEvent;
 use crate::scanner::feed::{FeedEndpoint, FeedKind};
 use crate::scanner::{decoder, deshred, ScannerEvent, PUMP_PROGRAM_ID};
