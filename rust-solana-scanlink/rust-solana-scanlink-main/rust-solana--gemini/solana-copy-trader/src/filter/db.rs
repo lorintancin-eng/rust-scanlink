@@ -34,6 +34,16 @@ pub struct FunderProfile {
     pub last_seen_ms: u64,
 }
 
+#[derive(Debug, Clone, Default)]
+pub struct AddressSnapshotRecord {
+    pub address: String,
+    pub oldest_tx_ms: u64,
+    pub wallet_age_days: u32,
+    pub first_funder: Option<String>,
+    pub source: String,
+    pub fetched_at_ms: u64,
+}
+
 #[derive(Debug, Clone)]
 pub struct FilterResultRecord {
     pub mint: String,
@@ -347,6 +357,36 @@ impl FilterDb {
         .context("query funder_profiles failed")?
     }
 
+    pub async fn get_address_snapshot(
+        &self,
+        address: &str,
+    ) -> Result<Option<AddressSnapshotRecord>> {
+        let path = self.path.clone();
+        let address = address.to_string();
+        tokio::task::spawn_blocking(move || {
+            let conn = open_conn(path.as_path())?;
+            conn.query_row(
+                "SELECT address, oldest_tx_ms, wallet_age_days, first_funder, source, fetched_at_ms
+                 FROM address_snapshots WHERE address = ?1",
+                params![address],
+                |row| {
+                    Ok(AddressSnapshotRecord {
+                        address: row.get(0)?,
+                        oldest_tx_ms: row.get(1)?,
+                        wallet_age_days: row.get(2)?,
+                        first_funder: row.get(3)?,
+                        source: row.get(4)?,
+                        fetched_at_ms: row.get(5)?,
+                    })
+                },
+            )
+            .optional()
+            .map_err(Into::into)
+        })
+        .await
+        .context("query address_snapshots failed")?
+    }
+
     pub async fn upsert_funder_profile(&self, profile: &FunderProfile) -> Result<()> {
         let profile = profile.clone();
         self.with_conn(move |conn| {
@@ -362,6 +402,36 @@ impl FilterDb {
                     profile.wallet_count,
                     profile.rug_exposure,
                     profile.last_seen_ms,
+                ],
+            )?;
+            Ok(())
+        })
+        .await
+    }
+
+    pub async fn upsert_address_snapshot(&self, snapshot: &AddressSnapshotRecord) -> Result<()> {
+        let snapshot = snapshot.clone();
+        self.with_conn(move |conn| {
+            conn.execute(
+                "INSERT INTO address_snapshots(address, oldest_tx_ms, wallet_age_days, first_funder, source, fetched_at_ms)
+                 VALUES(?1, ?2, ?3, ?4, ?5, ?6)
+                 ON CONFLICT(address) DO UPDATE SET
+                    oldest_tx_ms = CASE
+                        WHEN address_snapshots.oldest_tx_ms = 0 THEN excluded.oldest_tx_ms
+                        WHEN excluded.oldest_tx_ms = 0 THEN address_snapshots.oldest_tx_ms
+                        ELSE MIN(address_snapshots.oldest_tx_ms, excluded.oldest_tx_ms)
+                    END,
+                    wallet_age_days = MAX(address_snapshots.wallet_age_days, excluded.wallet_age_days),
+                    first_funder = COALESCE(address_snapshots.first_funder, excluded.first_funder),
+                    source = excluded.source,
+                    fetched_at_ms = MAX(address_snapshots.fetched_at_ms, excluded.fetched_at_ms)",
+                params![
+                    snapshot.address,
+                    snapshot.oldest_tx_ms,
+                    snapshot.wallet_age_days,
+                    snapshot.first_funder,
+                    snapshot.source,
+                    snapshot.fetched_at_ms,
                 ],
             )?;
             Ok(())
@@ -856,6 +926,14 @@ fn init_db(path: &Path) -> Result<()> {
             wallet_count INTEGER NOT NULL DEFAULT 0,
             rug_exposure INTEGER NOT NULL DEFAULT 0,
             last_seen_ms INTEGER NOT NULL DEFAULT 0
+        );
+        CREATE TABLE IF NOT EXISTS address_snapshots (
+            address TEXT PRIMARY KEY,
+            oldest_tx_ms INTEGER NOT NULL DEFAULT 0,
+            wallet_age_days INTEGER NOT NULL DEFAULT 0,
+            first_funder TEXT,
+            source TEXT NOT NULL DEFAULT '',
+            fetched_at_ms INTEGER NOT NULL DEFAULT 0
         );
         CREATE TABLE IF NOT EXISTS smart_money (
             address TEXT PRIMARY KEY,

@@ -1,8 +1,8 @@
 use crate::config::AppConfig;
 use crate::filter::db::{
-    BuyerProfile, ClusterEdgeRecord, ClusterMemberRecord, CreatorProfile, DynamicKeywordRecord,
-    FeedHealthRecord, FilterDb, FilterResultRecord, FilterTimingRecord, FunderProfile,
-    Gate3SequenceRecord, Gate3SnapshotRecord, LabelSuggestionRecord, RawEventRecord,
+    AddressSnapshotRecord, BuyerProfile, ClusterEdgeRecord, ClusterMemberRecord, CreatorProfile,
+    DynamicKeywordRecord, FeedHealthRecord, FilterDb, FilterResultRecord, FilterTimingRecord,
+    FunderProfile, Gate3SequenceRecord, Gate3SnapshotRecord, LabelSuggestionRecord, RawEventRecord,
     RiskSignalRecord, ScoringBreakdownRecord,
 };
 use crate::processor::pumpfun::BondingCurveState;
@@ -1901,16 +1901,25 @@ async fn fetch_address_snapshot(
     api_key: &str,
     address: &str,
 ) -> Result<AddressSnapshot> {
-    if let Some(snapshot) = get_cached_address_snapshot(shared, address, ADDRESS_SNAPSHOT_CACHE_TTL_MS)
-        .await
+    if let Some(snapshot) =
+        get_cached_address_snapshot(shared, address, ADDRESS_SNAPSHOT_CACHE_TTL_MS).await
     {
         return Ok(snapshot);
     }
 
-    let stale_snapshot = get_cached_address_snapshot(shared, address, u64::MAX).await;
+    if let Some(snapshot) =
+        get_persisted_address_snapshot(shared, address, ADDRESS_SNAPSHOT_CACHE_TTL_MS).await
+    {
+        return Ok(snapshot);
+    }
+
+    let stale_snapshot = match get_cached_address_snapshot(shared, address, u64::MAX).await {
+        Some(snapshot) => Some(snapshot),
+        None => get_persisted_address_snapshot(shared, address, u64::MAX).await,
+    };
     match fetch_address_snapshot_helius(shared, api_key, address).await {
         Ok(snapshot) => {
-            cache_address_snapshot(shared, address, snapshot.clone()).await;
+            cache_address_snapshot(shared, address, snapshot.clone(), "helius").await;
             Ok(snapshot)
         }
         Err(helius_err) => {
@@ -1922,7 +1931,7 @@ async fn fetch_address_snapshot(
                 return Ok(snapshot);
             }
             let snapshot = fetch_address_snapshot_rpc(shared, address).await?;
-            cache_address_snapshot(shared, address, snapshot.clone()).await;
+            cache_address_snapshot(shared, address, snapshot.clone(), "rpc").await;
             Ok(snapshot)
         }
     }
@@ -1980,7 +1989,10 @@ async fn fetch_address_snapshot_helius(
     })
 }
 
-async fn fetch_address_snapshot_rpc(shared: &SharedState, address: &str) -> Result<AddressSnapshot> {
+async fn fetch_address_snapshot_rpc(
+    shared: &SharedState,
+    address: &str,
+) -> Result<AddressSnapshot> {
     let address = Pubkey::from_str(address).context("invalid snapshot address")?;
     let rpc = shared.rpc_client.clone();
     tokio::task::spawn_blocking(move || {
@@ -2029,17 +2041,69 @@ async fn get_cached_address_snapshot(
     Some(entry.snapshot.clone())
 }
 
+async fn get_persisted_address_snapshot(
+    shared: &SharedState,
+    address: &str,
+    max_age_ms: u64,
+) -> Option<AddressSnapshot> {
+    let record = shared
+        .db
+        .get_address_snapshot(address)
+        .await
+        .ok()
+        .flatten()?;
+    if now_ms().saturating_sub(record.fetched_at_ms) > max_age_ms {
+        return None;
+    }
+
+    let snapshot = AddressSnapshot {
+        oldest_tx_ms: record.oldest_tx_ms,
+        wallet_age_days: record.wallet_age_days,
+        first_funder: record.first_funder,
+    };
+    cache_address_snapshot_memory(shared, address, snapshot.clone(), record.fetched_at_ms).await;
+    Some(snapshot)
+}
+
 async fn cache_address_snapshot(
     shared: &SharedState,
     address: &str,
     snapshot: AddressSnapshot,
+    source: &str,
+) {
+    let fetched_at_ms = now_ms();
+    cache_address_snapshot_memory(shared, address, snapshot.clone(), fetched_at_ms).await;
+    if let Err(err) = shared
+        .db
+        .upsert_address_snapshot(&AddressSnapshotRecord {
+            address: address.to_string(),
+            oldest_tx_ms: snapshot.oldest_tx_ms,
+            wallet_age_days: snapshot.wallet_age_days,
+            first_funder: snapshot.first_funder.clone(),
+            source: source.to_string(),
+            fetched_at_ms,
+        })
+        .await
+    {
+        warn!(
+            "address snapshot persist failed | address={} | {}",
+            address, err
+        );
+    }
+}
+
+async fn cache_address_snapshot_memory(
+    shared: &SharedState,
+    address: &str,
+    snapshot: AddressSnapshot,
+    fetched_at_ms: u64,
 ) {
     let mut cache = shared.address_snapshot_cache.write().await;
     cache.insert(
         address.to_string(),
         CachedAddressSnapshot {
             snapshot,
-            fetched_at_ms: now_ms(),
+            fetched_at_ms,
         },
     );
 }
@@ -2884,13 +2948,9 @@ async fn persist_candidate_analytics(
         } else {
             0
         };
-        let quality_score = participants_score
-            + capital_score
-            + curve_score
-            + buyer_quality_score
-            - funder_diversity_penalty.min(
-                participants_score + capital_score + curve_score + buyer_quality_score,
-            );
+        let quality_score = participants_score + capital_score + curve_score + buyer_quality_score
+            - funder_diversity_penalty
+                .min(participants_score + capital_score + curve_score + buyer_quality_score);
         let urgency_score = momentum_score + dynamic_bonus;
         let total_score = quality_score + urgency_score;
         let required_score = match path {
