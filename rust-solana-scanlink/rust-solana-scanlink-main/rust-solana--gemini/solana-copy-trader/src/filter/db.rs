@@ -34,6 +34,16 @@ pub struct FunderProfile {
     pub last_seen_ms: u64,
 }
 
+#[derive(Debug, Clone, Default)]
+pub struct AddressSnapshotRecord {
+    pub address: String,
+    pub oldest_tx_ms: u64,
+    pub wallet_age_days: u32,
+    pub first_funder: Option<String>,
+    pub source: String,
+    pub fetched_at_ms: u64,
+}
+
 #[derive(Debug, Clone)]
 pub struct FilterResultRecord {
     pub mint: String,
@@ -83,6 +93,41 @@ pub struct FeedHealthRecord {
     pub status: String,
     pub detail: String,
     pub ts_ms: u64,
+}
+
+#[derive(Debug, Clone)]
+pub struct FeedFirstHitRecord {
+    pub event_key: String,
+    pub event_type: String,
+    pub mint: String,
+    pub signature: String,
+    pub slot: u64,
+    pub first_feed_source: String,
+    pub first_seen_ms: u64,
+    pub last_feed_source: String,
+    pub last_seen_ms: u64,
+    pub distinct_source_count: usize,
+    pub lag_to_latest_ms: u64,
+}
+
+#[derive(Debug, Clone)]
+pub struct RawEventSourceStatRecord {
+    pub feed_source: String,
+    pub event_type: String,
+    pub event_count: usize,
+    pub first_seen_ms: u64,
+    pub last_seen_ms: u64,
+}
+
+#[derive(Debug, Clone)]
+pub struct FeedLatencyStatRecord {
+    pub feed_source: String,
+    pub event_type: String,
+    pub first_hit_count: usize,
+    pub cross_feed_match_count: usize,
+    pub avg_lag_ms: f64,
+    pub avg_cross_feed_lag_ms: f64,
+    pub max_lag_ms: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -147,6 +192,24 @@ pub struct DynamicKeywordRecord {
 }
 
 #[derive(Debug, Clone)]
+pub struct UriPatternRecord {
+    pub pattern: String,
+    pub label: String,
+    pub risk_score: i32,
+    pub mint_count: u32,
+    pub last_seen_ms: u64,
+}
+
+#[derive(Debug, Clone)]
+pub struct CreatorTemplateRecord {
+    pub creator: String,
+    pub template_hash: String,
+    pub repeat_count: u32,
+    pub last_mint: Option<String>,
+    pub updated_at_ms: u64,
+}
+
+#[derive(Debug, Clone)]
 pub struct LabelSuggestionRecord {
     pub label_type: String,
     pub subject: String,
@@ -154,6 +217,37 @@ pub struct LabelSuggestionRecord {
     pub score: i32,
     pub mint: Option<String>,
     pub created_at_ms: u64,
+}
+
+#[derive(Debug, Clone)]
+pub struct PostTradeOutcomeRecord {
+    pub mint: String,
+    pub path: String,
+    pub score: u32,
+    pub metric_type: String,
+    pub metric_10s: Option<f64>,
+    pub metric_30s: Option<f64>,
+    pub metric_60s: Option<f64>,
+    pub peak_metric: Option<f64>,
+    pub drawdown_metric: Option<f64>,
+    pub recorded_at_ms: u64,
+}
+
+#[derive(Debug, Clone)]
+pub struct ExecutionReceiptRecord {
+    pub mint: String,
+    pub signature: Option<String>,
+    pub route_label: String,
+    pub status: String,
+    pub detail: String,
+    pub path: String,
+    pub quality_score: u32,
+    pub urgency_score: u32,
+    pub execution_confidence: u32,
+    pub priority_fee_micro_lamport: u64,
+    pub jito_tip_lamports: u64,
+    pub zero_slot_tip_lamports: u64,
+    pub recorded_at_ms: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -332,6 +426,36 @@ impl FilterDb {
         .context("query funder_profiles failed")?
     }
 
+    pub async fn get_address_snapshot(
+        &self,
+        address: &str,
+    ) -> Result<Option<AddressSnapshotRecord>> {
+        let path = self.path.clone();
+        let address = address.to_string();
+        tokio::task::spawn_blocking(move || {
+            let conn = open_conn(path.as_path())?;
+            conn.query_row(
+                "SELECT address, oldest_tx_ms, wallet_age_days, first_funder, source, fetched_at_ms
+                 FROM address_snapshots WHERE address = ?1",
+                params![address],
+                |row| {
+                    Ok(AddressSnapshotRecord {
+                        address: row.get(0)?,
+                        oldest_tx_ms: row.get(1)?,
+                        wallet_age_days: row.get(2)?,
+                        first_funder: row.get(3)?,
+                        source: row.get(4)?,
+                        fetched_at_ms: row.get(5)?,
+                    })
+                },
+            )
+            .optional()
+            .map_err(Into::into)
+        })
+        .await
+        .context("query address_snapshots failed")?
+    }
+
     pub async fn upsert_funder_profile(&self, profile: &FunderProfile) -> Result<()> {
         let profile = profile.clone();
         self.with_conn(move |conn| {
@@ -347,6 +471,36 @@ impl FilterDb {
                     profile.wallet_count,
                     profile.rug_exposure,
                     profile.last_seen_ms,
+                ],
+            )?;
+            Ok(())
+        })
+        .await
+    }
+
+    pub async fn upsert_address_snapshot(&self, snapshot: &AddressSnapshotRecord) -> Result<()> {
+        let snapshot = snapshot.clone();
+        self.with_conn(move |conn| {
+            conn.execute(
+                "INSERT INTO address_snapshots(address, oldest_tx_ms, wallet_age_days, first_funder, source, fetched_at_ms)
+                 VALUES(?1, ?2, ?3, ?4, ?5, ?6)
+                 ON CONFLICT(address) DO UPDATE SET
+                    oldest_tx_ms = CASE
+                        WHEN address_snapshots.oldest_tx_ms = 0 THEN excluded.oldest_tx_ms
+                        WHEN excluded.oldest_tx_ms = 0 THEN address_snapshots.oldest_tx_ms
+                        ELSE MIN(address_snapshots.oldest_tx_ms, excluded.oldest_tx_ms)
+                    END,
+                    wallet_age_days = MAX(address_snapshots.wallet_age_days, excluded.wallet_age_days),
+                    first_funder = COALESCE(address_snapshots.first_funder, excluded.first_funder),
+                    source = excluded.source,
+                    fetched_at_ms = MAX(address_snapshots.fetched_at_ms, excluded.fetched_at_ms)",
+                params![
+                    snapshot.address,
+                    snapshot.oldest_tx_ms,
+                    snapshot.wallet_age_days,
+                    snapshot.first_funder,
+                    snapshot.source,
+                    snapshot.fetched_at_ms,
                 ],
             )?;
             Ok(())
@@ -449,6 +603,38 @@ impl FilterDb {
         .await
     }
 
+    pub async fn upsert_feed_first_hit(&self, record: &FeedFirstHitRecord) -> Result<()> {
+        let record = record.clone();
+        self.with_conn(move |conn| {
+            conn.execute(
+                "INSERT INTO feed_first_hits(
+                    event_key, event_type, mint, signature, slot, first_feed_source, first_seen_ms,
+                    last_feed_source, last_seen_ms, distinct_source_count, lag_to_latest_ms
+                 ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
+                 ON CONFLICT(event_key) DO UPDATE SET
+                    last_feed_source = excluded.last_feed_source,
+                    last_seen_ms = excluded.last_seen_ms,
+                    distinct_source_count = excluded.distinct_source_count,
+                    lag_to_latest_ms = excluded.lag_to_latest_ms",
+                params![
+                    record.event_key,
+                    record.event_type,
+                    record.mint,
+                    record.signature,
+                    record.slot,
+                    record.first_feed_source,
+                    record.first_seen_ms,
+                    record.last_feed_source,
+                    record.last_seen_ms,
+                    record.distinct_source_count as u64,
+                    record.lag_to_latest_ms,
+                ],
+            )?;
+            Ok(())
+        })
+        .await
+    }
+
     pub async fn insert_gate3_snapshot(&self, record: &Gate3SnapshotRecord) -> Result<()> {
         let record = record.clone();
         self.with_conn(move |conn| {
@@ -538,7 +724,11 @@ impl FilterDb {
         .await
     }
 
-    pub async fn replace_risk_signals(&self, mint: &str, signals: &[RiskSignalRecord]) -> Result<()> {
+    pub async fn replace_risk_signals(
+        &self,
+        mint: &str,
+        signals: &[RiskSignalRecord],
+    ) -> Result<()> {
         let mint = mint.to_string();
         let signals = signals.to_vec();
         self.with_conn(move |conn| {
@@ -572,7 +762,10 @@ impl FilterDb {
         let keywords = keywords.to_vec();
         self.with_conn(move |conn| {
             let tx = conn.unchecked_transaction()?;
-            tx.execute("DELETE FROM dynamic_keywords WHERE source = ?1", params![source])?;
+            tx.execute(
+                "DELETE FROM dynamic_keywords WHERE source = ?1",
+                params![source],
+            )?;
             for keyword in keywords {
                 tx.execute(
                     "INSERT INTO dynamic_keywords(keyword, source, score, expires_at_ms)
@@ -586,6 +779,104 @@ impl FilterDb {
                 )?;
             }
             tx.commit()?;
+            Ok(())
+        })
+        .await
+    }
+
+    pub async fn upsert_uri_pattern(&self, record: &UriPatternRecord) -> Result<()> {
+        let record = record.clone();
+        self.with_conn(move |conn| {
+            conn.execute(
+                "INSERT INTO uri_patterns(pattern, label, risk_score, mint_count, last_seen_ms)
+                 VALUES(?1, ?2, ?3, ?4, ?5)
+                 ON CONFLICT(pattern) DO UPDATE SET
+                    label = excluded.label,
+                    risk_score = CASE
+                        WHEN excluded.risk_score > uri_patterns.risk_score THEN excluded.risk_score
+                        ELSE uri_patterns.risk_score
+                    END,
+                    mint_count = uri_patterns.mint_count + excluded.mint_count,
+                    last_seen_ms = excluded.last_seen_ms",
+                params![
+                    record.pattern,
+                    record.label,
+                    record.risk_score,
+                    record.mint_count,
+                    record.last_seen_ms,
+                ],
+            )?;
+            Ok(())
+        })
+        .await
+    }
+
+    pub async fn record_creator_template(
+        &self,
+        creator: &str,
+        template_hash: &str,
+        last_mint: Option<&str>,
+        updated_at_ms: u64,
+    ) -> Result<u32> {
+        let creator = creator.to_string();
+        let template_hash = template_hash.to_string();
+        let last_mint = last_mint.map(str::to_string);
+        self.with_conn(move |conn| {
+            let existing: Option<u32> = conn
+                .query_row(
+                    "SELECT repeat_count
+                     FROM creator_templates
+                     WHERE creator = ?1 AND template_hash = ?2",
+                    params![&creator, &template_hash],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            let next_count = existing.unwrap_or(0).saturating_add(1);
+            conn.execute(
+                "INSERT INTO creator_templates(creator, template_hash, repeat_count, last_mint, updated_at_ms)
+                 VALUES(?1, ?2, ?3, ?4, ?5)
+                 ON CONFLICT(creator, template_hash) DO UPDATE SET
+                    repeat_count = excluded.repeat_count,
+                    last_mint = excluded.last_mint,
+                    updated_at_ms = excluded.updated_at_ms",
+                params![&creator, &template_hash, next_count, last_mint, updated_at_ms],
+            )?;
+            Ok(next_count)
+        })
+        .await
+    }
+
+    pub async fn get_funder_blacklist_reason(&self, address: &str) -> Result<Option<String>> {
+        let address = address.to_string();
+        self.with_conn(move |conn| {
+            Ok(conn
+                .query_row(
+                    "SELECT reason FROM funder_blacklist WHERE address = ?1",
+                    params![address],
+                    |row| row.get(0),
+                )
+                .optional()?)
+        })
+        .await
+    }
+
+    pub async fn upsert_funder_blacklist(
+        &self,
+        address: &str,
+        reason: &str,
+        updated_at_ms: u64,
+    ) -> Result<()> {
+        let address = address.to_string();
+        let reason = reason.to_string();
+        self.with_conn(move |conn| {
+            conn.execute(
+                "INSERT INTO funder_blacklist(address, reason, updated_at_ms)
+                 VALUES(?1, ?2, ?3)
+                 ON CONFLICT(address) DO UPDATE SET
+                    reason = excluded.reason,
+                    updated_at_ms = excluded.updated_at_ms",
+                params![address, reason, updated_at_ms],
+            )?;
             Ok(())
         })
         .await
@@ -609,6 +900,497 @@ impl FilterDb {
             Ok(())
         })
         .await
+    }
+
+    pub async fn upsert_post_trade_outcome(&self, record: &PostTradeOutcomeRecord) -> Result<()> {
+        let record = record.clone();
+        self.with_conn(move |conn| {
+            conn.execute(
+                "INSERT INTO post_trade_outcomes(
+                    mint, path, score, metric_type, metric_10s, metric_30s, metric_60s,
+                    peak_metric, drawdown_metric, recorded_at_ms
+                 ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+                 ON CONFLICT(mint) DO UPDATE SET
+                    path = excluded.path,
+                    score = excluded.score,
+                    metric_type = excluded.metric_type,
+                    metric_10s = excluded.metric_10s,
+                    metric_30s = excluded.metric_30s,
+                    metric_60s = excluded.metric_60s,
+                    peak_metric = excluded.peak_metric,
+                    drawdown_metric = excluded.drawdown_metric,
+                    recorded_at_ms = excluded.recorded_at_ms",
+                params![
+                    record.mint,
+                    record.path,
+                    record.score,
+                    record.metric_type,
+                    record.metric_10s,
+                    record.metric_30s,
+                    record.metric_60s,
+                    record.peak_metric,
+                    record.drawdown_metric,
+                    record.recorded_at_ms,
+                ],
+            )?;
+            Ok(())
+        })
+        .await
+    }
+
+    pub async fn insert_execution_receipt(&self, record: &ExecutionReceiptRecord) -> Result<()> {
+        let record = record.clone();
+        self.with_conn(move |conn| {
+            conn.execute(
+                "INSERT INTO execution_receipts(
+                    mint, signature, route_label, status, detail, path, quality_score,
+                    urgency_score, execution_confidence, priority_fee_micro_lamport,
+                    jito_tip_lamports, zero_slot_tip_lamports, recorded_at_ms
+                 ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+                params![
+                    record.mint,
+                    record.signature,
+                    record.route_label,
+                    record.status,
+                    record.detail,
+                    record.path,
+                    record.quality_score,
+                    record.urgency_score,
+                    record.execution_confidence,
+                    record.priority_fee_micro_lamport,
+                    record.jito_tip_lamports,
+                    record.zero_slot_tip_lamports,
+                    record.recorded_at_ms,
+                ],
+            )?;
+            Ok(())
+        })
+        .await
+    }
+
+    pub async fn list_filter_results_window(
+        &self,
+        from_ms: u64,
+        to_ms: u64,
+    ) -> Result<Vec<FilterResultRecord>> {
+        let path = self.path.clone();
+        tokio::task::spawn_blocking(move || {
+            let conn = open_conn(path.as_path())?;
+            let mut stmt = conn.prepare(
+                "SELECT mint, creator, symbol, passed, reject_gate, score, reason, ts
+                 FROM filter_results
+                 WHERE ts BETWEEN ?1 AND ?2
+                 ORDER BY ts ASC",
+            )?;
+            let rows = stmt.query_map(params![from_ms, to_ms], |row| {
+                Ok(FilterResultRecord {
+                    mint: row.get(0)?,
+                    creator: row.get(1)?,
+                    symbol: row.get(2)?,
+                    passed: row.get::<_, i64>(3)? != 0,
+                    reject_gate: row.get(4)?,
+                    score: row.get(5)?,
+                    reason: row.get(6)?,
+                    ts: row.get(7)?,
+                })
+            })?;
+            rows.collect::<std::result::Result<Vec<_>, _>>()
+                .map_err(Into::into)
+        })
+        .await
+        .context("query filter_results window failed")?
+    }
+
+    pub async fn list_filter_timings_window(
+        &self,
+        from_ms: u64,
+        to_ms: u64,
+    ) -> Result<Vec<FilterTimingRecord>> {
+        let path = self.path.clone();
+        tokio::task::spawn_blocking(move || {
+            let conn = open_conn(path.as_path())?;
+            let mut stmt = conn.prepare(
+                "SELECT mint, decision, mode, path, detected_at_ms, gate1_at_ms, gate2_at_ms,
+                        gate3_open_at_ms, gate3_trigger_at_ms, gate4_at_ms, final_at_ms,
+                        latency_ms, early_buy_count, matched_buyers
+                 FROM filter_timelines
+                 WHERE final_at_ms BETWEEN ?1 AND ?2
+                 ORDER BY final_at_ms ASC",
+            )?;
+            let rows = stmt.query_map(params![from_ms, to_ms], |row| {
+                Ok(FilterTimingRecord {
+                    mint: row.get(0)?,
+                    decision: row.get(1)?,
+                    mode: row.get(2)?,
+                    path: row.get(3)?,
+                    detected_at_ms: row.get(4)?,
+                    gate1_at_ms: row.get(5)?,
+                    gate2_at_ms: row.get(6)?,
+                    gate3_open_at_ms: row.get(7)?,
+                    gate3_trigger_at_ms: row.get(8)?,
+                    gate4_at_ms: row.get(9)?,
+                    final_at_ms: row.get(10)?,
+                    latency_ms: row.get(11)?,
+                    early_buy_count: row.get::<_, u64>(12)? as usize,
+                    matched_buyers: row.get::<_, u64>(13)? as usize,
+                })
+            })?;
+            rows.collect::<std::result::Result<Vec<_>, _>>()
+                .map_err(Into::into)
+        })
+        .await
+        .context("query filter_timelines window failed")?
+    }
+
+    pub async fn list_raw_events_window(
+        &self,
+        from_ms: u64,
+        to_ms: u64,
+    ) -> Result<Vec<RawEventRecord>> {
+        let path = self.path.clone();
+        tokio::task::spawn_blocking(move || {
+            let conn = open_conn(path.as_path())?;
+            let mut stmt = conn.prepare(
+                "SELECT feed_source, event_type, slot, signature, mint, actor, recorded_at_ms, payload_json
+                 FROM raw_events
+                 WHERE recorded_at_ms BETWEEN ?1 AND ?2
+                 ORDER BY recorded_at_ms ASC",
+            )?;
+            let rows = stmt.query_map(params![from_ms, to_ms], |row| {
+                Ok(RawEventRecord {
+                    feed_source: row.get(0)?,
+                    event_type: row.get(1)?,
+                    slot: row.get(2)?,
+                    signature: row.get(3)?,
+                    mint: row.get(4)?,
+                    actor: row.get(5)?,
+                    recorded_at_ms: row.get(6)?,
+                    payload_json: row.get(7)?,
+                })
+            })?;
+            rows.collect::<std::result::Result<Vec<_>, _>>()
+                .map_err(Into::into)
+        })
+        .await
+        .context("query raw_events window failed")?
+    }
+
+    pub async fn list_raw_event_source_stats_window(
+        &self,
+        from_ms: u64,
+        to_ms: u64,
+    ) -> Result<Vec<RawEventSourceStatRecord>> {
+        let path = self.path.clone();
+        tokio::task::spawn_blocking(move || {
+            let conn = open_conn(path.as_path())?;
+            let mut stmt = conn.prepare(
+                "SELECT feed_source, event_type, COUNT(*), MIN(recorded_at_ms), MAX(recorded_at_ms)
+                 FROM raw_events
+                 WHERE recorded_at_ms BETWEEN ?1 AND ?2
+                 GROUP BY feed_source, event_type
+                 ORDER BY COUNT(*) DESC, feed_source ASC, event_type ASC",
+            )?;
+            let rows = stmt.query_map(params![from_ms, to_ms], |row| {
+                Ok(RawEventSourceStatRecord {
+                    feed_source: row.get(0)?,
+                    event_type: row.get(1)?,
+                    event_count: row.get::<_, u64>(2)? as usize,
+                    first_seen_ms: row.get(3)?,
+                    last_seen_ms: row.get(4)?,
+                })
+            })?;
+            rows.collect::<std::result::Result<Vec<_>, _>>()
+                .map_err(Into::into)
+        })
+        .await
+        .context("query raw_events source stats window failed")?
+    }
+
+    pub async fn list_feed_first_hits_window(
+        &self,
+        from_ms: u64,
+        to_ms: u64,
+    ) -> Result<Vec<FeedFirstHitRecord>> {
+        let path = self.path.clone();
+        tokio::task::spawn_blocking(move || {
+            let conn = open_conn(path.as_path())?;
+            let mut stmt = conn.prepare(
+                "SELECT event_key, event_type, mint, signature, slot, first_feed_source, first_seen_ms,
+                        last_feed_source, last_seen_ms, distinct_source_count, lag_to_latest_ms
+                 FROM feed_first_hits
+                 WHERE first_seen_ms BETWEEN ?1 AND ?2
+                 ORDER BY first_seen_ms ASC",
+            )?;
+            let rows = stmt.query_map(params![from_ms, to_ms], |row| {
+                Ok(FeedFirstHitRecord {
+                    event_key: row.get(0)?,
+                    event_type: row.get(1)?,
+                    mint: row.get(2)?,
+                    signature: row.get(3)?,
+                    slot: row.get(4)?,
+                    first_feed_source: row.get(5)?,
+                    first_seen_ms: row.get(6)?,
+                    last_feed_source: row.get(7)?,
+                    last_seen_ms: row.get(8)?,
+                    distinct_source_count: row.get::<_, u64>(9)? as usize,
+                    lag_to_latest_ms: row.get(10)?,
+                })
+            })?;
+            rows.collect::<std::result::Result<Vec<_>, _>>()
+                .map_err(Into::into)
+        })
+        .await
+        .context("query feed_first_hits window failed")?
+    }
+
+    pub async fn list_feed_latency_stats_window(
+        &self,
+        from_ms: u64,
+        to_ms: u64,
+    ) -> Result<Vec<FeedLatencyStatRecord>> {
+        let path = self.path.clone();
+        tokio::task::spawn_blocking(move || {
+            let conn = open_conn(path.as_path())?;
+            let mut stmt = conn.prepare(
+                "SELECT first_feed_source, event_type, COUNT(*),
+                        SUM(CASE WHEN distinct_source_count > 1 THEN 1 ELSE 0 END),
+                        AVG(CAST(lag_to_latest_ms AS REAL)),
+                        AVG(CASE WHEN distinct_source_count > 1 THEN CAST(lag_to_latest_ms AS REAL) END),
+                        MAX(lag_to_latest_ms)
+                 FROM feed_first_hits
+                 WHERE first_seen_ms BETWEEN ?1 AND ?2
+                 GROUP BY first_feed_source, event_type
+                 ORDER BY COUNT(*) DESC, first_feed_source ASC, event_type ASC",
+            )?;
+            let rows = stmt.query_map(params![from_ms, to_ms], |row| {
+                Ok(FeedLatencyStatRecord {
+                    feed_source: row.get(0)?,
+                    event_type: row.get(1)?,
+                    first_hit_count: row.get::<_, u64>(2)? as usize,
+                    cross_feed_match_count: row.get::<_, u64>(3)? as usize,
+                    avg_lag_ms: row.get::<_, Option<f64>>(4)?.unwrap_or_default(),
+                    avg_cross_feed_lag_ms: row.get::<_, Option<f64>>(5)?.unwrap_or_default(),
+                    max_lag_ms: row.get::<_, Option<u64>>(6)?.unwrap_or_default(),
+                })
+            })?;
+            rows.collect::<std::result::Result<Vec<_>, _>>()
+                .map_err(Into::into)
+        })
+        .await
+        .context("query feed_latency_stats window failed")?
+    }
+
+    pub async fn list_feed_health_window(
+        &self,
+        from_ms: u64,
+        to_ms: u64,
+    ) -> Result<Vec<FeedHealthRecord>> {
+        let path = self.path.clone();
+        tokio::task::spawn_blocking(move || {
+            let conn = open_conn(path.as_path())?;
+            let mut stmt = conn.prepare(
+                "SELECT feed_label, feed_url, status, detail, ts_ms
+                 FROM feed_health
+                 WHERE ts_ms BETWEEN ?1 AND ?2
+                 ORDER BY ts_ms ASC",
+            )?;
+            let rows = stmt.query_map(params![from_ms, to_ms], |row| {
+                Ok(FeedHealthRecord {
+                    feed_label: row.get(0)?,
+                    feed_url: row.get(1)?,
+                    status: row.get(2)?,
+                    detail: row.get(3)?,
+                    ts_ms: row.get(4)?,
+                })
+            })?;
+            rows.collect::<std::result::Result<Vec<_>, _>>()
+                .map_err(Into::into)
+        })
+        .await
+        .context("query feed_health window failed")?
+    }
+
+    pub async fn list_gate3_snapshots_window(
+        &self,
+        from_ms: u64,
+        to_ms: u64,
+    ) -> Result<Vec<Gate3SnapshotRecord>> {
+        let path = self.path.clone();
+        tokio::task::spawn_blocking(move || {
+            let conn = open_conn(path.as_path())?;
+            let mut stmt = conn.prepare(
+                "SELECT mint, mode, path, buy_count, unique_buyers, unique_funders, matched_buyers,
+                        total_sol, matched_sol, creator_buy_sol, max_single_buyer_share,
+                        first_buy_ms, threshold_hit_ms, recorded_at_ms
+                 FROM gate3_snapshots
+                 WHERE recorded_at_ms BETWEEN ?1 AND ?2
+                 ORDER BY recorded_at_ms ASC",
+            )?;
+            let rows = stmt.query_map(params![from_ms, to_ms], |row| {
+                Ok(Gate3SnapshotRecord {
+                    mint: row.get(0)?,
+                    mode: row.get(1)?,
+                    path: row.get(2)?,
+                    buy_count: row.get::<_, u64>(3)? as usize,
+                    unique_buyers: row.get::<_, u64>(4)? as usize,
+                    unique_funders: row.get::<_, u64>(5)? as usize,
+                    matched_buyers: row.get::<_, u64>(6)? as usize,
+                    total_sol: row.get(7)?,
+                    matched_sol: row.get(8)?,
+                    creator_buy_sol: row.get(9)?,
+                    max_single_buyer_share: row.get(10)?,
+                    first_buy_ms: row.get(11)?,
+                    threshold_hit_ms: row.get(12)?,
+                    recorded_at_ms: row.get(13)?,
+                })
+            })?;
+            rows.collect::<std::result::Result<Vec<_>, _>>()
+                .map_err(Into::into)
+        })
+        .await
+        .context("query gate3_snapshots window failed")?
+    }
+
+    pub async fn list_scoring_breakdowns_window(
+        &self,
+        from_ms: u64,
+        to_ms: u64,
+    ) -> Result<Vec<ScoringBreakdownRecord>> {
+        let path = self.path.clone();
+        tokio::task::spawn_blocking(move || {
+            let conn = open_conn(path.as_path())?;
+            let mut stmt = conn.prepare(
+                "SELECT mint, path, quality_score, urgency_score, execution_confidence, total_score,
+                        required_score, details_json, recorded_at_ms
+                 FROM scoring_breakdowns
+                 WHERE recorded_at_ms BETWEEN ?1 AND ?2
+                 ORDER BY recorded_at_ms ASC",
+            )?;
+            let rows = stmt.query_map(params![from_ms, to_ms], |row| {
+                Ok(ScoringBreakdownRecord {
+                    mint: row.get(0)?,
+                    path: row.get(1)?,
+                    quality_score: row.get::<_, u64>(2)? as u32,
+                    urgency_score: row.get::<_, u64>(3)? as u32,
+                    execution_confidence: row.get::<_, u64>(4)? as u32,
+                    total_score: row.get::<_, u64>(5)? as u32,
+                    required_score: row.get::<_, u64>(6)? as u32,
+                    details_json: row.get(7)?,
+                    recorded_at_ms: row.get(8)?,
+                })
+            })?;
+            rows.collect::<std::result::Result<Vec<_>, _>>()
+                .map_err(Into::into)
+        })
+        .await
+        .context("query scoring_breakdowns window failed")?
+    }
+
+    pub async fn list_label_suggestions_window(
+        &self,
+        from_ms: u64,
+        to_ms: u64,
+    ) -> Result<Vec<LabelSuggestionRecord>> {
+        let path = self.path.clone();
+        tokio::task::spawn_blocking(move || {
+            let conn = open_conn(path.as_path())?;
+            let mut stmt = conn.prepare(
+                "SELECT label_type, subject, reason, score, mint, created_at_ms
+                 FROM label_suggestions
+                 WHERE created_at_ms BETWEEN ?1 AND ?2
+                 ORDER BY created_at_ms ASC",
+            )?;
+            let rows = stmt.query_map(params![from_ms, to_ms], |row| {
+                Ok(LabelSuggestionRecord {
+                    label_type: row.get(0)?,
+                    subject: row.get(1)?,
+                    reason: row.get(2)?,
+                    score: row.get(3)?,
+                    mint: row.get(4)?,
+                    created_at_ms: row.get(5)?,
+                })
+            })?;
+            rows.collect::<std::result::Result<Vec<_>, _>>()
+                .map_err(Into::into)
+        })
+        .await
+        .context("query label_suggestions window failed")?
+    }
+
+    pub async fn list_post_trade_outcomes_window(
+        &self,
+        from_ms: u64,
+        to_ms: u64,
+    ) -> Result<Vec<PostTradeOutcomeRecord>> {
+        let path = self.path.clone();
+        tokio::task::spawn_blocking(move || {
+            let conn = open_conn(path.as_path())?;
+            let mut stmt = conn.prepare(
+                "SELECT mint, path, score, metric_type, metric_10s, metric_30s, metric_60s,
+                        peak_metric, drawdown_metric, recorded_at_ms
+                 FROM post_trade_outcomes
+                 WHERE recorded_at_ms BETWEEN ?1 AND ?2
+                 ORDER BY recorded_at_ms ASC",
+            )?;
+            let rows = stmt.query_map(params![from_ms, to_ms], |row| {
+                Ok(PostTradeOutcomeRecord {
+                    mint: row.get(0)?,
+                    path: row.get(1)?,
+                    score: row.get::<_, u64>(2)? as u32,
+                    metric_type: row.get(3)?,
+                    metric_10s: row.get(4)?,
+                    metric_30s: row.get(5)?,
+                    metric_60s: row.get(6)?,
+                    peak_metric: row.get(7)?,
+                    drawdown_metric: row.get(8)?,
+                    recorded_at_ms: row.get(9)?,
+                })
+            })?;
+            rows.collect::<std::result::Result<Vec<_>, _>>()
+                .map_err(Into::into)
+        })
+        .await
+        .context("query post_trade_outcomes window failed")?
+    }
+
+    pub async fn list_execution_receipts_window(
+        &self,
+        from_ms: u64,
+        to_ms: u64,
+    ) -> Result<Vec<ExecutionReceiptRecord>> {
+        let path = self.path.clone();
+        tokio::task::spawn_blocking(move || {
+            let conn = open_conn(path.as_path())?;
+            let mut stmt = conn.prepare(
+                "SELECT mint, signature, route_label, status, detail, path, quality_score,
+                        urgency_score, execution_confidence, priority_fee_micro_lamport,
+                        jito_tip_lamports, zero_slot_tip_lamports, recorded_at_ms
+                 FROM execution_receipts
+                 WHERE recorded_at_ms BETWEEN ?1 AND ?2
+                 ORDER BY recorded_at_ms ASC",
+            )?;
+            let rows = stmt.query_map(params![from_ms, to_ms], |row| {
+                Ok(ExecutionReceiptRecord {
+                    mint: row.get(0)?,
+                    signature: row.get(1)?,
+                    route_label: row.get(2)?,
+                    status: row.get(3)?,
+                    detail: row.get(4)?,
+                    path: row.get(5)?,
+                    quality_score: row.get::<_, u64>(6)? as u32,
+                    urgency_score: row.get::<_, u64>(7)? as u32,
+                    execution_confidence: row.get::<_, u64>(8)? as u32,
+                    priority_fee_micro_lamport: row.get(9)?,
+                    jito_tip_lamports: row.get(10)?,
+                    zero_slot_tip_lamports: row.get(11)?,
+                    recorded_at_ms: row.get(12)?,
+                })
+            })?;
+            rows.collect::<std::result::Result<Vec<_>, _>>()
+                .map_err(Into::into)
+        })
+        .await
+        .context("query execution_receipts window failed")?
     }
 
     pub async fn upsert_cluster_member(&self, record: &ClusterMemberRecord) -> Result<()> {
@@ -760,20 +1542,19 @@ impl FilterDb {
         .await
     }
 
-    async fn with_conn<F>(&self, func: F) -> Result<()>
+    async fn with_conn<F, T>(&self, func: F) -> Result<T>
     where
-        F: FnOnce(&mut Connection) -> Result<()> + Send + 'static,
+        F: FnOnce(&mut Connection) -> Result<T> + Send + 'static,
+        T: Send + 'static,
     {
         let _guard = self.write_lock.lock().await;
         let path = self.path.clone();
         tokio::task::spawn_blocking(move || {
             let mut conn = open_conn(path.as_path())?;
-            func(&mut conn)?;
-            Ok::<_, anyhow::Error>(())
+            func(&mut conn)
         })
         .await
-        .context("sqlite write task failed")??;
-        Ok(())
+        .context("sqlite write task failed")?
     }
 }
 
@@ -802,6 +1583,14 @@ fn init_db(path: &Path) -> Result<()> {
             wallet_count INTEGER NOT NULL DEFAULT 0,
             rug_exposure INTEGER NOT NULL DEFAULT 0,
             last_seen_ms INTEGER NOT NULL DEFAULT 0
+        );
+        CREATE TABLE IF NOT EXISTS address_snapshots (
+            address TEXT PRIMARY KEY,
+            oldest_tx_ms INTEGER NOT NULL DEFAULT 0,
+            wallet_age_days INTEGER NOT NULL DEFAULT 0,
+            first_funder TEXT,
+            source TEXT NOT NULL DEFAULT '',
+            fetched_at_ms INTEGER NOT NULL DEFAULT 0
         );
         CREATE TABLE IF NOT EXISTS smart_money (
             address TEXT PRIMARY KEY,
@@ -859,6 +1648,30 @@ fn init_db(path: &Path) -> Result<()> {
             detail TEXT NOT NULL,
             ts_ms INTEGER NOT NULL
         );
+        CREATE TABLE IF NOT EXISTS feed_first_hits (
+            event_key TEXT PRIMARY KEY,
+            event_type TEXT NOT NULL,
+            mint TEXT NOT NULL,
+            signature TEXT NOT NULL,
+            slot INTEGER NOT NULL,
+            first_feed_source TEXT NOT NULL,
+            first_seen_ms INTEGER NOT NULL,
+            last_feed_source TEXT NOT NULL,
+            last_seen_ms INTEGER NOT NULL,
+            distinct_source_count INTEGER NOT NULL DEFAULT 1,
+            lag_to_latest_ms INTEGER NOT NULL DEFAULT 0
+        );
+        CREATE VIEW IF NOT EXISTS feed_latency_stats AS
+            SELECT
+                first_feed_source AS feed_source,
+                event_type,
+                COUNT(*) AS first_hit_count,
+                SUM(CASE WHEN distinct_source_count > 1 THEN 1 ELSE 0 END) AS cross_feed_match_count,
+                AVG(CAST(lag_to_latest_ms AS REAL)) AS avg_lag_ms,
+                AVG(CASE WHEN distinct_source_count > 1 THEN CAST(lag_to_latest_ms AS REAL) END) AS avg_cross_feed_lag_ms,
+                MAX(lag_to_latest_ms) AS max_lag_ms
+            FROM feed_first_hits
+            GROUP BY first_feed_source, event_type;
         CREATE TABLE IF NOT EXISTS gate3_snapshots (
             mint TEXT PRIMARY KEY,
             mode TEXT NOT NULL,
@@ -921,6 +1734,26 @@ fn init_db(path: &Path) -> Result<()> {
             mint TEXT,
             created_at_ms INTEGER NOT NULL
         );
+        CREATE TABLE IF NOT EXISTS uri_patterns (
+            pattern TEXT PRIMARY KEY,
+            label TEXT NOT NULL,
+            risk_score INTEGER NOT NULL DEFAULT 0,
+            mint_count INTEGER NOT NULL DEFAULT 0,
+            last_seen_ms INTEGER NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS creator_templates (
+            creator TEXT NOT NULL,
+            template_hash TEXT NOT NULL,
+            repeat_count INTEGER NOT NULL DEFAULT 0,
+            last_mint TEXT,
+            updated_at_ms INTEGER NOT NULL,
+            PRIMARY KEY(creator, template_hash)
+        );
+        CREATE TABLE IF NOT EXISTS funder_blacklist (
+            address TEXT PRIMARY KEY,
+            reason TEXT NOT NULL,
+            updated_at_ms INTEGER NOT NULL
+        );
         CREATE TABLE IF NOT EXISTS address_clusters (
             cluster_id TEXT NOT NULL,
             address TEXT NOT NULL,
@@ -934,6 +1767,34 @@ fn init_db(path: &Path) -> Result<()> {
             edge_type TEXT NOT NULL,
             weight INTEGER NOT NULL DEFAULT 0,
             PRIMARY KEY(src, dst, edge_type)
+        );
+        CREATE TABLE IF NOT EXISTS post_trade_outcomes (
+            mint TEXT PRIMARY KEY,
+            path TEXT NOT NULL,
+            score INTEGER NOT NULL DEFAULT 0,
+            metric_type TEXT NOT NULL,
+            metric_10s REAL,
+            metric_30s REAL,
+            metric_60s REAL,
+            peak_metric REAL,
+            drawdown_metric REAL,
+            recorded_at_ms INTEGER NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS execution_receipts (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            mint TEXT NOT NULL,
+            signature TEXT,
+            route_label TEXT NOT NULL,
+            status TEXT NOT NULL,
+            detail TEXT NOT NULL,
+            path TEXT NOT NULL,
+            quality_score INTEGER NOT NULL DEFAULT 0,
+            urgency_score INTEGER NOT NULL DEFAULT 0,
+            execution_confidence INTEGER NOT NULL DEFAULT 0,
+            priority_fee_micro_lamport INTEGER NOT NULL DEFAULT 0,
+            jito_tip_lamports INTEGER NOT NULL DEFAULT 0,
+            zero_slot_tip_lamports INTEGER NOT NULL DEFAULT 0,
+            recorded_at_ms INTEGER NOT NULL
         );",
     )?;
     ensure_column(

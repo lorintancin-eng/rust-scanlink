@@ -1,3 +1,4 @@
+use crate::scanner::feed::ScannerMode;
 use anyhow::{Context, Result};
 use solana_sdk::pubkey::Pubkey;
 use solana_sdk::signature::{Keypair, Signer};
@@ -26,8 +27,12 @@ pub struct AppConfig {
     pub scanner_grpc_token: Option<String>,
     pub scanner_secondary_grpc_url: Option<String>,
     pub scanner_secondary_grpc_token: Option<String>,
+    pub scanner_deshred_grpc_url: Option<String>,
+    pub scanner_deshred_grpc_token: Option<String>,
+    pub scanner_mode: ScannerMode,
     pub scanner_primary_feed_label: String,
     pub scanner_secondary_feed_label: String,
+    pub scanner_deshred_feed_label: String,
     /// 过滤层 Creator/地址画像查询
     pub helius_api_key: Option<String>,
     /// 可选 CoinGecko Pro Key，用于更实时的 GeckoTerminal 热点池
@@ -41,6 +46,13 @@ pub struct AppConfig {
     pub dynamic_hot_keywords_file: String,
     pub latency_metrics_file: String,
     pub replay_db_path: String,
+    pub replay_mode_enabled: bool,
+    pub replay_pipeline_enabled: bool,
+    pub replay_from_ms: Option<u64>,
+    pub replay_to_ms: Option<u64>,
+    pub replay_window_minutes: u64,
+    pub replay_speedup: f64,
+    pub replay_report_file: String,
     pub filter_hot_reload_secs: u64,
     pub dynamic_hot_refresh_secs: u64,
     pub dynamic_hot_keywords_enabled: bool,
@@ -75,7 +87,24 @@ pub struct AppConfig {
     pub filter_soft_min_score: u32,
     pub dynamic_narrative_bonus_per_hit: u32,
     pub dynamic_narrative_bonus_cap: u32,
+    pub risk_template_repeat_threshold: u32,
+    pub risk_template_hard_reject_threshold: u32,
+    pub risk_template_penalty_score: u32,
+    pub risk_uri_penalty_score: u32,
+    pub risk_concentration_penalty_score: u32,
+    pub risk_liquidity_penalty_score: u32,
+    pub risk_creator_funder_penalty_score: u32,
+    pub risk_penalty_cap: u32,
     pub scanner_idle_timeout_secs: u64,
+    pub scanner_catchup_window_ms: u64,
+    pub scanner_catchup_max_events: usize,
+    pub scanner_failover_stale_ms: u64,
+    pub scanner_health_snapshot_secs: u64,
+    pub execution_feedback_window_secs: u64,
+    pub execution_feedback_refresh_secs: u64,
+    pub address_snapshot_provider_cooldown_ms: u64,
+    pub address_snapshot_helius_retry_limit: u32,
+    pub address_snapshot_helius_retry_delay_ms: u64,
     pub creator_gate_timeout_ms: u64,
     pub creator_min_wallet_age_days: u64,
     pub creator_fresh_wallet_token_limit: u32,
@@ -162,6 +191,25 @@ impl AppConfig {
             .context("Invalid TARGET_WALLETS")?
             .unwrap_or_default();
 
+        let scanner_deshred_grpc_url = first_env(&["SCANNER_DESHRED_GRPC_URL", "DESHRED_GRPC_URL"])
+            .filter(|value| !value.trim().is_empty())
+            .or_else(|| {
+                first_env(&["SCANNER_GRPC_URL"]).filter(|value| supports_deshred_endpoint(value))
+            });
+        let scanner_mode = std::env::var("SCANNER_MODE")
+            .ok()
+            .filter(|s| !s.trim().is_empty())
+            .map(|value| ScannerMode::from_str(&value))
+            .transpose()
+            .map_err(anyhow::Error::msg)?
+            .unwrap_or_else(|| {
+                if scanner_deshred_grpc_url.is_some() {
+                    ScannerMode::Hybrid
+                } else {
+                    ScannerMode::ProcessedOnly
+                }
+            });
+
         Ok(Self {
             rpc_url: env_or("RPC_URL", "https://api.mainnet-beta.solana.com"),
             secondary_rpc_url: std::env::var("SECONDARY_RPC_URL").ok(),
@@ -191,11 +239,18 @@ impl AppConfig {
             scanner_secondary_grpc_url: first_env(&["SCANNER_SECONDARY_GRPC_URL"])
                 .filter(|value| !value.trim().is_empty()),
             scanner_secondary_grpc_token: first_env(&["SCANNER_SECONDARY_GRPC_TOKEN"]),
+            scanner_deshred_grpc_url,
+            scanner_deshred_grpc_token: first_env(&[
+                "SCANNER_DESHRED_GRPC_TOKEN",
+                "DESHRED_GRPC_TOKEN",
+            ]),
+            scanner_mode,
             scanner_primary_feed_label: env_or("SCANNER_PRIMARY_FEED_LABEL", "primary_processed"),
             scanner_secondary_feed_label: env_or(
                 "SCANNER_SECONDARY_FEED_LABEL",
                 "secondary_processed",
             ),
+            scanner_deshred_feed_label: env_or("SCANNER_DESHRED_FEED_LABEL", "deshred_pre_exec"),
             helius_api_key: std::env::var("HELIUS_API_KEY")
                 .ok()
                 .filter(|s| !s.trim().is_empty()),
@@ -204,6 +259,17 @@ impl AppConfig {
                 .filter(|s| !s.trim().is_empty()),
             filter_db_path: env_or("FILTER_DB_PATH", "data/filter.sqlite3"),
             replay_db_path: env_or("REPLAY_DB_PATH", "data/replay.sqlite3"),
+            replay_mode_enabled: env_parse("REPLAY_MODE_ENABLED", false),
+            replay_pipeline_enabled: env_parse("REPLAY_PIPELINE_ENABLED", false),
+            replay_from_ms: std::env::var("REPLAY_FROM_MS")
+                .ok()
+                .and_then(|value| value.parse().ok()),
+            replay_to_ms: std::env::var("REPLAY_TO_MS")
+                .ok()
+                .and_then(|value| value.parse().ok()),
+            replay_window_minutes: env_parse("REPLAY_WINDOW_MINUTES", 60),
+            replay_speedup: env_parse("REPLAY_SPEEDUP", 50.0),
+            replay_report_file: env_or("REPLAY_REPORT_FILE", "data/replay_report.json"),
             smart_money_file: env_or("SMART_MONEY_FILE", "data/smart_money.txt"),
             smart_money_funder_file: env_or(
                 "SMART_MONEY_FUNDER_FILE",
@@ -239,10 +305,7 @@ impl AppConfig {
             gate3_creator_self_buy_max_sol: env_parse("GATE3_CREATOR_SELF_BUY_MAX_SOL", 0.75),
             gate3_creator_self_buy_max_share: env_parse("GATE3_CREATOR_SELF_BUY_MAX_SHARE", 0.40),
             gate3_creator_self_buy_hard_sol: env_parse("GATE3_CREATOR_SELF_BUY_HARD_SOL", 4.00),
-            gate3_creator_self_buy_hard_share: env_parse(
-                "GATE3_CREATOR_SELF_BUY_HARD_SHARE",
-                0.55,
-            ),
+            gate3_creator_self_buy_hard_share: env_parse("GATE3_CREATOR_SELF_BUY_HARD_SHARE", 0.55),
             gate3_creator_self_buy_min_external_buyers: env_parse(
                 "GATE3_CREATOR_SELF_BUY_MIN_EXTERNAL_BUYERS",
                 3,
@@ -259,7 +322,36 @@ impl AppConfig {
             filter_soft_min_score: env_parse("FILTER_SOFT_MIN_SCORE", 58),
             dynamic_narrative_bonus_per_hit: env_parse("DYNAMIC_NARRATIVE_BONUS_PER_HIT", 3),
             dynamic_narrative_bonus_cap: env_parse("DYNAMIC_NARRATIVE_BONUS_CAP", 6),
+            risk_template_repeat_threshold: env_parse("RISK_TEMPLATE_REPEAT_THRESHOLD", 3),
+            risk_template_hard_reject_threshold: env_parse(
+                "RISK_TEMPLATE_HARD_REJECT_THRESHOLD",
+                6,
+            ),
+            risk_template_penalty_score: env_parse("RISK_TEMPLATE_PENALTY_SCORE", 8),
+            risk_uri_penalty_score: env_parse("RISK_URI_PENALTY_SCORE", 8),
+            risk_concentration_penalty_score: env_parse("RISK_CONCENTRATION_PENALTY_SCORE", 8),
+            risk_liquidity_penalty_score: env_parse("RISK_LIQUIDITY_PENALTY_SCORE", 6),
+            risk_creator_funder_penalty_score: env_parse("RISK_CREATOR_FUNDER_PENALTY_SCORE", 7),
+            risk_penalty_cap: env_parse("RISK_PENALTY_CAP", 18),
             scanner_idle_timeout_secs: env_parse("SCANNER_IDLE_TIMEOUT_SECS", 30),
+            scanner_catchup_window_ms: env_parse("SCANNER_CATCHUP_WINDOW_MS", 120_000),
+            scanner_catchup_max_events: env_parse("SCANNER_CATCHUP_MAX_EVENTS", 1024),
+            scanner_failover_stale_ms: env_parse("SCANNER_FAILOVER_STALE_MS", 15_000),
+            scanner_health_snapshot_secs: env_parse("SCANNER_HEALTH_SNAPSHOT_SECS", 30),
+            execution_feedback_window_secs: env_parse("EXECUTION_FEEDBACK_WINDOW_SECS", 300),
+            execution_feedback_refresh_secs: env_parse("EXECUTION_FEEDBACK_REFRESH_SECS", 15),
+            address_snapshot_provider_cooldown_ms: env_parse(
+                "ADDRESS_SNAPSHOT_PROVIDER_COOLDOWN_MS",
+                60_000,
+            ),
+            address_snapshot_helius_retry_limit: env_parse(
+                "ADDRESS_SNAPSHOT_HELIUS_RETRY_LIMIT",
+                2,
+            ),
+            address_snapshot_helius_retry_delay_ms: env_parse(
+                "ADDRESS_SNAPSHOT_HELIUS_RETRY_DELAY_MS",
+                250,
+            ),
             creator_gate_timeout_ms: env_parse("CREATOR_GATE_TIMEOUT_MS", 1_500),
             creator_min_wallet_age_days: env_parse("CREATOR_MIN_WALLET_AGE_DAYS", 1),
             creator_fresh_wallet_token_limit: env_parse("CREATOR_FRESH_WALLET_TOKEN_LIMIT", 2),
@@ -353,6 +445,11 @@ fn first_env(keys: &[&str]) -> Option<String> {
 
 fn is_rabbitstream_url(url: &str) -> bool {
     url.to_ascii_lowercase().contains("rabbitstream")
+}
+
+fn supports_deshred_endpoint(url: &str) -> bool {
+    let lower = url.to_ascii_lowercase();
+    lower.contains("triton.one") || lower.contains("rpcpool.com")
 }
 
 fn env_parse<T: FromStr>(key: &str, default: T) -> T {

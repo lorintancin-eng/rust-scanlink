@@ -1,9 +1,14 @@
 use crate::config::AppConfig;
 use crate::filter::db::{
-    BuyerProfile, ClusterEdgeRecord, ClusterMemberRecord, CreatorProfile, DynamicKeywordRecord,
-    FeedHealthRecord, FilterDb, FilterResultRecord, FilterTimingRecord, FunderProfile,
-    Gate3SequenceRecord, Gate3SnapshotRecord, LabelSuggestionRecord, RawEventRecord,
-    RiskSignalRecord, ScoringBreakdownRecord,
+    AddressSnapshotRecord, BuyerProfile, ClusterEdgeRecord, ClusterMemberRecord, CreatorProfile,
+    DynamicKeywordRecord, FeedHealthRecord, FilterDb, FilterResultRecord, FilterTimingRecord,
+    FunderProfile, Gate3SequenceRecord, Gate3SnapshotRecord, LabelSuggestionRecord,
+    PostTradeOutcomeRecord, RawEventRecord, RiskSignalRecord, ScoringBreakdownRecord,
+    UriPatternRecord,
+};
+use crate::filter::risk::{
+    analyze_gate1_risk, analyze_runtime_risk, derive_template_identity, Gate1RiskProfile,
+    RiskSignalSeed, RuntimeRiskInput, RuntimeRiskProfile,
 };
 use crate::processor::pumpfun::BondingCurveState;
 use crate::scanner::{
@@ -11,8 +16,9 @@ use crate::scanner::{
 };
 use anyhow::{Context, Result};
 use futures::stream::{self, StreamExt};
+use reqwest::StatusCode;
 use serde_json::{json, Value};
-use solana_client::rpc_client::RpcClient;
+use solana_client::rpc_client::{GetConfirmedSignaturesForAddress2Config, RpcClient};
 use solana_sdk::{commitment_config::CommitmentConfig, pubkey::Pubkey};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::str::FromStr;
@@ -27,8 +33,26 @@ const GATE1_BLACK_KEYWORDS: &[&str] = &[
 ];
 const GATE1_WHITE_KEYWORDS: &[&str] = &["ai", "agent", "trump", "pepe", "maga"];
 const DYNAMIC_KEYWORD_STOPWORDS: &[&str] = &[
-    "the", "and", "for", "with", "from", "that", "this", "your", "coin", "token", "official",
-    "solana", "pump", "pumpfun", "community", "just", "latest", "launch", "new", "best",
+    "the",
+    "and",
+    "for",
+    "with",
+    "from",
+    "that",
+    "this",
+    "your",
+    "coin",
+    "token",
+    "official",
+    "solana",
+    "pump",
+    "pumpfun",
+    "community",
+    "just",
+    "latest",
+    "launch",
+    "new",
+    "best",
 ];
 const CREATOR_CACHE_TTL_MS: u64 = 24 * 60 * 60 * 1000;
 const BUYER_CACHE_TTL_MS: u64 = 6 * 60 * 60 * 1000;
@@ -43,11 +67,35 @@ const HELIUS_PAGE_LIMIT: usize = 100;
 const HELIUS_MAX_PAGES: usize = 5;
 const FALLBACK_SM_THRESHOLD: usize = 2;
 const DAY_MS: u64 = 24 * 60 * 60 * 1000;
+const ADDRESS_SNAPSHOT_CACHE_TTL_MS: u64 = 15 * 60 * 1000;
+const FUNDER_WALLET_CLUSTER_LIMIT: u32 = 24;
+const FUNDER_RUG_EXPOSURE_LIMIT: u32 = 3;
+const GATE3_CLUSTER_DIVERSITY_MIN_BUYS: usize = 4;
+const GATE3_MIN_UNIQUE_FUNDERS: usize = 2;
+const SINGLE_FUNDER_SCORE_PENALTY: u32 = 6;
+const CREATOR_FUNDER_CLUSTER_MIN_BUYERS: usize = 2;
+const CREATOR_FUNDER_CLUSTER_MIN_SOL: f64 = 0.5;
+const CREATOR_FUNDER_CLUSTER_MAX_SHARE: f64 = 0.85;
+const SUSPICIOUS_FUNDER_CLUSTER_WARNING_WALLETS: u32 = 10;
+const SUSPICIOUS_FUNDER_CLUSTER_WARNING_RUG_EXPOSURE: u32 = 1;
+const SUSPICIOUS_FUNDER_CLUSTER_PENALTY_SCORE: u32 = 6;
+const SAME_FUNDER_CLUSTER_PENALTY_MIN_BUYS: usize = 3;
+const SAME_FUNDER_CLUSTER_PENALTY_SHARE: f64 = 0.66;
+const SAME_FUNDER_CLUSTER_PENALTY_SCORE: u32 = 8;
+const QUALITY_CLUSTER_MIN_UNIQUE_FUNDERS: usize = 3;
+const QUALITY_CLUSTER_MIN_HOT_FUNDERS: usize = 2;
+const QUALITY_CLUSTER_MAX_SHARE: f64 = 0.60;
+const QUALITY_CLUSTER_BONUS_SCORE: u32 = 6;
+const FAST_QUALITY_CLUSTER_SCORE_RELIEF: u32 = 4;
 
 #[derive(Debug, Clone)]
 pub struct BuySignal {
     pub token: NewToken,
     pub score: u32,
+    pub quality_score: u32,
+    pub urgency_score: u32,
+    pub execution_confidence: u32,
+    pub path: String,
     pub reason: String,
     pub sm_count: usize,
     pub sm_sol_total: f64,
@@ -76,8 +124,9 @@ struct CandidateTrace {
 struct Candidate {
     token: NewToken,
     created_at: Instant,
-    discovered_at_ms: u64,
+    detected_at_ms: u64,
     status: CandidateStatus,
+    gate1_risk: Gate1RiskProfile,
     narrative_keywords: Vec<String>,
     dynamic_narrative_keywords: Vec<String>,
     early_buys: Vec<PumpBuyEvent>,
@@ -128,6 +177,9 @@ struct ScoreDecision {
     passed: bool,
     gate: String,
     score: u32,
+    quality_score: u32,
+    urgency_score: u32,
+    execution_confidence: u32,
     reason: String,
     signal: Option<BuySignal>,
     mode: String,
@@ -169,10 +221,16 @@ struct WindowStats {
     buy_count: usize,
     eligible_buyers: usize,
     unique_funders: usize,
+    creator_funder_match_count: usize,
+    creator_funder_match_sol: f64,
     max_single_buyer_share: f64,
     max_single_buyer: Option<String>,
     creator_buy_count: usize,
     creator_buy_sol: f64,
+    largest_funder_cluster_size: usize,
+    largest_funder_cluster_share: f64,
+    hotlist_funder_hits: usize,
+    hotlist_funder_diversity: usize,
     elapsed_ms: u64,
 }
 
@@ -181,6 +239,56 @@ struct AddressSnapshot {
     oldest_tx_ms: u64,
     wallet_age_days: u32,
     first_funder: Option<String>,
+    source: String,
+}
+
+#[derive(Debug, Clone)]
+struct CachedAddressSnapshot {
+    snapshot: AddressSnapshot,
+    fetched_at_ms: u64,
+}
+
+#[derive(Debug, Clone, Default)]
+struct CreatorClusterProfile {
+    funder: Option<String>,
+    wallet_count: u32,
+    rug_exposure: u32,
+}
+
+#[derive(Debug, Clone, Default)]
+struct ClusterAdjustment {
+    creator_funder: Option<String>,
+    creator_cluster_wallet_count: u32,
+    creator_cluster_rug_exposure: u32,
+    suspicious_funder_penalty: u32,
+    same_cluster_first_buy_penalty: u32,
+    quality_cluster_bonus: u32,
+    fast_required_score_relief: u32,
+    largest_funder_cluster_size: usize,
+    largest_funder_cluster_share: f64,
+    hotlist_funder_hits: usize,
+    hotlist_funder_diversity: usize,
+    quality_cluster: bool,
+}
+
+#[derive(Debug, Clone)]
+struct ScoringContext {
+    participants_score: u32,
+    capital_score: u32,
+    momentum_score: u32,
+    curve_score: u32,
+    buyer_quality_score: u32,
+    dynamic_narrative_bonus: u32,
+    funder_diversity_penalty: u32,
+    runtime_risk: RuntimeRiskProfile,
+    cluster: ClusterAdjustment,
+    curve_progress_pct: f64,
+    buyer_quality_pct: f64,
+    quality_score: u32,
+    urgency_score: u32,
+    execution_confidence: u32,
+    total_score: u32,
+    required_score: u32,
 }
 
 #[derive(Clone)]
@@ -190,6 +298,9 @@ struct SharedState {
     http: reqwest::Client,
     db: FilterDb,
     hotlists: Arc<RwLock<HotLists>>,
+    address_snapshot_cache: Arc<RwLock<HashMap<String, CachedAddressSnapshot>>>,
+    address_snapshot_refreshes: Arc<RwLock<HashSet<String>>>,
+    address_snapshot_helius_cooldown_until_ms: Arc<RwLock<u64>>,
 }
 
 pub async fn run(
@@ -208,6 +319,9 @@ pub async fn run(
             .context("filter http client init failed")?,
         db,
         hotlists: Arc::new(RwLock::new(HotLists::default())),
+        address_snapshot_cache: Arc::new(RwLock::new(HashMap::new())),
+        address_snapshot_refreshes: Arc::new(RwLock::new(HashSet::new())),
+        address_snapshot_helius_cooldown_until_ms: Arc::new(RwLock::new(0)),
     };
     if config.dynamic_hot_keywords_enabled {
         if let Err(err) = refresh_dynamic_hot_keywords(&shared).await {
@@ -227,9 +341,8 @@ pub async fn run(
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut hot_reload = tokio::time::interval(Duration::from_secs(config.filter_hot_reload_secs));
     hot_reload.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-    let mut dynamic_hot_refresh = tokio::time::interval(Duration::from_secs(
-        config.dynamic_hot_refresh_secs.max(30),
-    ));
+    let mut dynamic_hot_refresh =
+        tokio::time::interval(Duration::from_secs(config.dynamic_hot_refresh_secs.max(30)));
     dynamic_hot_refresh.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     dynamic_hot_refresh.tick().await;
 
@@ -280,7 +393,7 @@ pub async fn run(
                             if let Err(err) = append_jsonl(
                                 &shared.config.passed_tokens_file,
                                 &json!({
-                                    "detected_at_ms": signal.token.discovered_at_ms,
+                                    "detected_at_ms": signal.token.detected_at_ms,
                                     "mint": &signal.token.mint,
                                     "symbol": &signal.token.symbol,
                                     "name": &signal.token.name,
@@ -361,6 +474,7 @@ pub async fn run(
 struct Gate1Decision {
     passed: bool,
     reason: String,
+    risk: Gate1RiskProfile,
     narrative_keywords: Vec<String>,
     dynamic_narrative_keywords: Vec<String>,
 }
@@ -379,7 +493,7 @@ async fn handle_new_token(
     if let Err(err) = append_jsonl(
         &shared.config.scanned_tokens_file,
         &json!({
-            "detected_at_ms": token.discovered_at_ms,
+            "detected_at_ms": token.detected_at_ms,
             "mint": &token.mint,
             "symbol": &token.symbol,
             "name": &token.name,
@@ -398,7 +512,14 @@ async fn handle_new_token(
     persist_raw_new_token_event(shared, &token).await;
 
     let gate1 = gate1_check(shared, creator_window, &token).await;
-    if !gate1.passed {
+    let Gate1Decision {
+        passed: gate1_passed,
+        reason: gate1_reason,
+        risk: gate1_risk,
+        narrative_keywords: gate1_narrative_keywords,
+        dynamic_narrative_keywords: gate1_dynamic_keywords,
+    } = gate1;
+    if !gate1_passed {
         let trace = CandidateTrace {
             gate1_at_ms: Some(now_ms()),
             ..Default::default()
@@ -410,11 +531,16 @@ async fn handle_new_token(
             false,
             Some("gate1".to_string()),
             None,
-            gate1.reason,
+            gate1_reason,
             "gate1".to_string(),
             "immediate".to_string(),
             0,
             0,
+            Some(risk_signal_records_from_seeds(
+                &token.mint,
+                &gate1_risk.signals,
+                now_ms(),
+            )),
         )
         .await;
         return Ok(());
@@ -426,10 +552,11 @@ async fn handle_new_token(
         Candidate {
             token: token.clone(),
             created_at: Instant::now(),
-            discovered_at_ms: token.discovered_at_ms,
+            detected_at_ms: token.detected_at_ms,
             status: CandidateStatus::CreatorPending,
-            narrative_keywords: gate1.narrative_keywords,
-            dynamic_narrative_keywords: gate1.dynamic_narrative_keywords,
+            gate1_risk: gate1_risk,
+            narrative_keywords: gate1_narrative_keywords,
+            dynamic_narrative_keywords: gate1_dynamic_keywords,
             early_buys: Vec::new(),
             buy_signatures: HashSet::new(),
             creator_profile: None,
@@ -558,9 +685,17 @@ async fn handle_buy_event(
         let Some(candidate) = candidates.get_mut(&buy.mint) else {
             return;
         };
-        if candidate.status == CandidateStatus::Finalizing
-            || candidate.buy_signatures.contains(&buy.signature)
+        if candidate.status == CandidateStatus::Finalizing {
+            return;
+        }
+        if let Some(existing_buy) = candidate
+            .early_buys
+            .iter_mut()
+            .find(|existing| existing.signature == buy.signature)
         {
+            if upgrade_existing_buy_event(existing_buy, &buy) {
+                evaluate_candidate_after_buy(shared, internal_tx, candidate, &mut reject_now).await;
+            }
             return;
         }
         if candidate.early_buys.len() >= shared.config.smart_money_max_buys {
@@ -581,26 +716,7 @@ async fn handle_buy_event(
 
         maybe_spawn_buyer_profile_fetch(shared, internal_tx, candidate, &buy);
 
-        if candidate.status == CandidateStatus::Active {
-            let stats = smart_money_stats(candidate, shared).await;
-            if let Some(reason) = gate3_reject_reason(candidate, &stats, &shared.config) {
-                if gate3_is_immediate_reject_reason(&reason) {
-                    reject_now = Some((
-                        candidate.token.mint.clone(),
-                        reason.clone(),
-                        smart_money_mode_label(stats.mode).to_string(),
-                        gate3_reject_path(&reason).to_string(),
-                        stats.buy_count,
-                        stats.unique_sm_wallets.len(),
-                    ));
-                }
-            } else if let Some(trigger) = gate3_trigger_from_stats(shared.config.as_ref(), &stats) {
-                candidate.status = CandidateStatus::Finalizing;
-                candidate.trace.gate3_trigger_at_ms = Some(now_ms());
-                candidate.trace.path = Some(gate3_path_label(trigger.path).to_string());
-                spawn_score_task(shared, internal_tx, candidate.clone());
-            }
-        }
+        evaluate_candidate_after_buy(shared, internal_tx, candidate, &mut reject_now).await;
     }
 
     if let Some((mint, reason, mode, path, buy_count, matched_buyers)) = reject_now {
@@ -619,6 +735,65 @@ async fn handle_buy_event(
             )
             .await;
         }
+    }
+}
+
+async fn evaluate_candidate_after_buy(
+    shared: &SharedState,
+    internal_tx: &mpsc::UnboundedSender<InternalMessage>,
+    candidate: &mut Candidate,
+    reject_now: &mut Option<(String, String, String, String, usize, usize)>,
+) {
+    if candidate.status != CandidateStatus::Active {
+        return;
+    }
+
+    let stats = smart_money_stats(candidate, shared).await;
+    if let Some(reason) = gate3_reject_reason(candidate, &stats, &shared.config) {
+        if gate3_is_immediate_reject_reason(&reason) {
+            *reject_now = Some((
+                candidate.token.mint.clone(),
+                reason.clone(),
+                smart_money_mode_label(stats.mode).to_string(),
+                gate3_reject_path(&reason).to_string(),
+                stats.buy_count,
+                stats.unique_sm_wallets.len(),
+            ));
+        }
+    } else if let Some(trigger) = gate3_trigger_from_stats(shared.config.as_ref(), &stats) {
+        candidate.status = CandidateStatus::Finalizing;
+        candidate.trace.gate3_trigger_at_ms = Some(now_ms());
+        candidate.trace.path = Some(gate3_path_label(trigger.path).to_string());
+        spawn_score_task(shared, internal_tx, candidate.clone());
+    }
+}
+
+fn upgrade_existing_buy_event(existing: &mut PumpBuyEvent, incoming: &PumpBuyEvent) -> bool {
+    let existing_rank = buy_feed_rank(&existing.feed_source);
+    let incoming_rank = buy_feed_rank(&incoming.feed_source);
+    let mut upgraded = false;
+
+    if incoming.sol_amount_lamports > existing.sol_amount_lamports {
+        existing.sol_amount_lamports = incoming.sol_amount_lamports;
+        upgraded = true;
+    }
+
+    if incoming_rank > existing_rank {
+        existing.feed_source = incoming.feed_source.clone();
+        existing.token_program = incoming.token_program;
+        existing.instruction_data = incoming.instruction_data.clone();
+        existing.instruction_accounts = incoming.instruction_accounts.clone();
+        upgraded = true;
+    }
+
+    upgraded
+}
+
+fn buy_feed_rank(feed_source: &str) -> u8 {
+    if feed_source.to_ascii_lowercase().contains("deshred") {
+        0
+    } else {
+        1
     }
 }
 
@@ -736,6 +911,7 @@ async fn gate1_check(
         return Gate1Decision {
             passed: false,
             reason: "gate1 reject: creator blacklist hit".to_string(),
+            risk: Gate1RiskProfile::default(),
             narrative_keywords: Vec::new(),
             dynamic_narrative_keywords: Vec::new(),
         };
@@ -758,6 +934,7 @@ async fn gate1_check(
                 "gate1 reject: factory creator pattern ({} launches in 5m)",
                 window.len()
             ),
+            risk: Gate1RiskProfile::default(),
             narrative_keywords: Vec::new(),
             dynamic_narrative_keywords: Vec::new(),
         };
@@ -767,6 +944,7 @@ async fn gate1_check(
         return Gate1Decision {
             passed: false,
             reason: "gate1 reject: empty name or symbol".to_string(),
+            risk: Gate1RiskProfile::default(),
             narrative_keywords: Vec::new(),
             dynamic_narrative_keywords: Vec::new(),
         };
@@ -778,6 +956,7 @@ async fn gate1_check(
                 "gate1 reject: symbol too long ({})",
                 token.symbol.chars().count()
             ),
+            risk: Gate1RiskProfile::default(),
             narrative_keywords: Vec::new(),
             dynamic_narrative_keywords: Vec::new(),
         };
@@ -792,6 +971,7 @@ async fn gate1_check(
         return Gate1Decision {
             passed: false,
             reason: format!("gate1 reject: blacklist keyword {}", keyword),
+            risk: Gate1RiskProfile::default(),
             narrative_keywords: Vec::new(),
             dynamic_narrative_keywords: Vec::new(),
         };
@@ -799,10 +979,52 @@ async fn gate1_check(
 
     let (narrative_keywords, dynamic_narrative_keywords) =
         collect_narrative_keywords(token, &hotlists.dynamic_hot_keywords);
+    drop(hotlists);
+
+    let (uri_host, uri_pattern, template_hash) = derive_template_identity(token);
+    let template_repeat_count = shared
+        .db
+        .record_creator_template(&token.creator, &template_hash, Some(&token.mint), now)
+        .await
+        .unwrap_or(1);
+    let risk = analyze_gate1_risk(
+        token,
+        uri_host.clone(),
+        uri_pattern.clone(),
+        template_hash,
+        template_repeat_count,
+        shared.config.as_ref(),
+    );
+    if let Some(pattern) = uri_pattern {
+        let label = uri_host.unwrap_or_else(|| "unknown".to_string());
+        if let Err(err) = shared
+            .db
+            .upsert_uri_pattern(&UriPatternRecord {
+                pattern,
+                label,
+                risk_score: risk.penalty_score as i32,
+                mint_count: 1,
+                last_seen_ms: now,
+            })
+            .await
+        {
+            warn!("upsert uri pattern failed | mint={} | {}", token.mint, err);
+        }
+    }
+    if let Some(reason) = risk.hard_reject_reason.clone() {
+        return Gate1Decision {
+            passed: false,
+            reason,
+            risk,
+            narrative_keywords,
+            dynamic_narrative_keywords,
+        };
+    }
 
     Gate1Decision {
         passed: true,
         reason: "gate1 pass".to_string(),
+        risk,
         narrative_keywords,
         dynamic_narrative_keywords,
     }
@@ -812,32 +1034,94 @@ async fn creator_gate(shared: &SharedState, token: &NewToken) -> Result<CreatorG
     let cached = shared.db.get_creator_profile(&token.creator).await?;
     if let Some(profile) = cached.as_ref() {
         if now_ms().saturating_sub(profile.fetched_at_ms) <= CREATOR_CACHE_TTL_MS {
-            return Ok(apply_creator_rules(shared.config.as_ref(), profile.clone()));
+            return apply_creator_entity_rules(
+                shared,
+                apply_creator_rules(shared.config.as_ref(), profile.clone()),
+            )
+            .await;
         }
     }
 
     let Some(api_key) = shared.config.helius_api_key.as_deref() else {
-        return Ok(CreatorGateResult {
-            passed: true,
-            reason: "gate2 pass: HELIUS_API_KEY not configured".to_string(),
-            profile: cached,
-        });
+        return apply_creator_entity_rules(
+            shared,
+            CreatorGateResult {
+                passed: true,
+                reason: "gate2 pass: HELIUS_API_KEY not configured".to_string(),
+                profile: cached,
+            },
+        )
+        .await;
     };
 
     let timeout_ms = shared.config.creator_gate_timeout_ms.max(1);
-    match tokio::time::timeout(
+    let result = match tokio::time::timeout(
         Duration::from_millis(timeout_ms),
         creator_gate_remote(shared, token, api_key, cached.clone()),
     )
     .await
     {
-        Ok(result) => result,
-        Err(_) => Ok(creator_gate_timeout_fallback(
-            shared.config.as_ref(),
-            cached,
-            timeout_ms,
-        )),
+        Ok(result) => result?,
+        Err(_) => creator_gate_timeout_fallback(shared.config.as_ref(), cached, timeout_ms),
+    };
+
+    apply_creator_entity_rules(shared, result).await
+}
+
+async fn apply_creator_entity_rules(
+    shared: &SharedState,
+    mut result: CreatorGateResult,
+) -> Result<CreatorGateResult> {
+    if !result.passed {
+        return Ok(result);
     }
+
+    let Some(profile) = result.profile.clone() else {
+        return Ok(result);
+    };
+    let Some(funder) = profile.first_funder.as_deref() else {
+        return Ok(result);
+    };
+
+    if let Some(reason) = shared.db.get_funder_blacklist_reason(funder).await? {
+        result.passed = false;
+        result.reason = format!("gate2 reject: funder blacklist hit {} ({})", funder, reason);
+        return Ok(result);
+    }
+
+    let Some(funder_profile) = shared.db.get_funder_profile(funder).await? else {
+        return Ok(result);
+    };
+
+    if funder_profile.rug_exposure >= FUNDER_RUG_EXPOSURE_LIMIT {
+        result.passed = false;
+        result.reason = format!(
+            "gate2 reject: funder cluster rug exposure {} for {}",
+            funder_profile.rug_exposure, funder
+        );
+        return Ok(result);
+    }
+
+    if funder_profile.wallet_count >= FUNDER_WALLET_CLUSTER_LIMIT
+        && profile.total_tokens >= shared.config.creator_fresh_wallet_token_limit
+    {
+        result.passed = false;
+        result.reason = format!(
+            "gate2 reject: funder {} funded {} wallets",
+            funder, funder_profile.wallet_count
+        );
+        return Ok(result);
+    }
+
+    result.reason = format!(
+        "{} | funder_cluster_wallets={} rug_exposure={} suspicious_cluster={}",
+        result.reason,
+        funder_profile.wallet_count,
+        funder_profile.rug_exposure,
+        funder_profile.wallet_count >= SUSPICIOUS_FUNDER_CLUSTER_WARNING_WALLETS
+            || funder_profile.rug_exposure >= SUSPICIOUS_FUNDER_CLUSTER_WARNING_RUG_EXPOSURE
+    );
+    Ok(result)
 }
 
 async fn creator_gate_remote(
@@ -864,7 +1148,8 @@ async fn creator_gate_remote(
         fetched_at_ms: now_ms(),
     };
 
-    if let Some(decision) = apply_creator_rules_without_graduated(shared.config.as_ref(), &profile) {
+    if let Some(decision) = apply_creator_rules_without_graduated(shared.config.as_ref(), &profile)
+    {
         shared.db.upsert_creator_profile(&profile).await?;
         return Ok(decision);
     }
@@ -884,7 +1169,10 @@ fn creator_gate_timeout_fallback(
 ) -> CreatorGateResult {
     if let Some(profile) = cached {
         let mut result = apply_creator_rules(config, profile);
-        result.reason = format!("{} | gate2 cache fallback timeout={}ms", result.reason, timeout_ms);
+        result.reason = format!(
+            "{} | gate2 cache fallback timeout={}ms",
+            result.reason, timeout_ms
+        );
         return result;
     }
 
@@ -993,7 +1281,9 @@ fn apply_creator_rules(config: &AppConfig, profile: CreatorProfile) -> CreatorGa
 fn effective_soft_threshold(config: &AppConfig, mode: SmartMoneyMode) -> usize {
     match mode {
         SmartMoneyMode::Hotlist => config.smart_money_threshold.max(1),
-        SmartMoneyMode::EarlyBuyerFallback => config.smart_money_threshold.max(FALLBACK_SM_THRESHOLD),
+        SmartMoneyMode::EarlyBuyerFallback => {
+            config.smart_money_threshold.max(FALLBACK_SM_THRESHOLD)
+        }
     }
 }
 
@@ -1067,7 +1357,7 @@ fn gate3_trigger_from_stats(config: &AppConfig, stats: &WindowStats) -> Option<G
     {
         return Some(Gate3Trigger {
             path: Gate3Path::Fast,
-            threshold: stats.fast_threshold,
+            threshold: gate3_fast_threshold(stats),
         });
     }
     if gate3_soft_ready(config, stats)
@@ -1083,9 +1373,39 @@ fn gate3_trigger_from_stats(config: &AppConfig, stats: &WindowStats) -> Option<G
     None
 }
 
+fn gate3_fast_threshold(stats: &WindowStats) -> usize {
+    if gate3_quality_cluster(stats) && stats.fast_threshold > 1 {
+        stats.fast_threshold - 1
+    } else {
+        stats.fast_threshold.max(1)
+    }
+}
+
+fn gate3_fast_min_sol(config: &AppConfig, stats: &WindowStats) -> f64 {
+    if gate3_quality_cluster(stats) {
+        (config.gate3_fast_min_sol * 0.85).max(0.05)
+    } else {
+        config.gate3_fast_min_sol
+    }
+}
+
+fn gate3_same_cluster_pressure(stats: &WindowStats) -> bool {
+    stats.buy_count >= SAME_FUNDER_CLUSTER_PENALTY_MIN_BUYS
+        && stats.largest_funder_cluster_size >= SAME_FUNDER_CLUSTER_PENALTY_MIN_BUYS
+        && stats.largest_funder_cluster_share >= SAME_FUNDER_CLUSTER_PENALTY_SHARE
+}
+
+fn gate3_quality_cluster(stats: &WindowStats) -> bool {
+    stats.unique_funders >= QUALITY_CLUSTER_MIN_UNIQUE_FUNDERS
+        && stats.hotlist_funder_diversity >= QUALITY_CLUSTER_MIN_HOT_FUNDERS
+        && stats.creator_funder_match_count == 0
+        && stats.largest_funder_cluster_share <= QUALITY_CLUSTER_MAX_SHARE
+}
+
 fn gate3_fast_ready(config: &AppConfig, stats: &WindowStats) -> bool {
-    stats.unique_sm_wallets.len() >= stats.fast_threshold
-        && stats.sm_sol_total >= config.gate3_fast_min_sol
+    !gate3_same_cluster_pressure(stats)
+        && stats.unique_sm_wallets.len() >= gate3_fast_threshold(stats)
+        && stats.sm_sol_total >= gate3_fast_min_sol(config, stats)
 }
 
 fn gate3_soft_ready(config: &AppConfig, stats: &WindowStats) -> bool {
@@ -1096,6 +1416,8 @@ fn gate3_soft_ready(config: &AppConfig, stats: &WindowStats) -> bool {
 fn gate3_reject_path(reason: &str) -> &'static str {
     if reason.contains("creator self-buy") {
         "creator_self_buy"
+    } else if reason.contains("creator-linked cluster") {
+        "creator_cluster"
     } else if reason.contains("early concentration") {
         "concentration"
     } else if reason.contains("hard window closed") {
@@ -1109,6 +1431,7 @@ fn gate3_reject_path(reason: &str) -> &'static str {
 
 fn gate3_is_immediate_reject_reason(reason: &str) -> bool {
     reason.contains("creator self-buy")
+        || reason.contains("creator-linked cluster")
         || reason.contains("early concentration")
         || reason.contains("max buys reached")
 }
@@ -1127,7 +1450,13 @@ fn gate3_reject_reason(
     } else {
         0.0
     };
-    let strong_external_support = external_buyers >= config.gate3_creator_self_buy_min_external_buyers
+    let creator_cluster_share = if external_sol > 0.0 {
+        stats.creator_funder_match_sol / external_sol
+    } else {
+        0.0
+    };
+    let strong_external_support = external_buyers
+        >= config.gate3_creator_self_buy_min_external_buyers
         && external_sol >= config.gate3_creator_self_buy_min_external_sol;
     if config.gate3_creator_self_buy_block
         && stats.creator_buy_count > 0
@@ -1154,6 +1483,26 @@ fn gate3_reject_reason(
             config.gate3_creator_self_buy_min_external_sol,
         ));
     }
+    if let Some(creator_funder) = candidate
+        .creator_profile
+        .as_ref()
+        .and_then(|profile| profile.first_funder.as_deref())
+    {
+        if stats.creator_funder_match_count >= CREATOR_FUNDER_CLUSTER_MIN_BUYERS
+            && stats.creator_funder_match_sol >= CREATOR_FUNDER_CLUSTER_MIN_SOL
+            && creator_cluster_share >= CREATOR_FUNDER_CLUSTER_MAX_SHARE
+        {
+            return Some(format!(
+                "gate3 reject: creator-linked cluster concentration | funder={} | matched_buyers={} | matched_sol={:.2}/{:.2} | share={:.2}/{:.2}",
+                creator_funder,
+                stats.creator_funder_match_count,
+                stats.creator_funder_match_sol,
+                external_sol,
+                creator_cluster_share,
+                CREATOR_FUNDER_CLUSTER_MAX_SHARE,
+            ));
+        }
+    }
     if config.gate3_early_concentration_reject
         && candidate.early_buys.len() >= config.gate3_early_concentration_min_buys
         && stats.max_single_buyer_share > config.gate3_max_single_buyer_share
@@ -1164,6 +1513,17 @@ fn gate3_reject_reason(
             stats.max_single_buyer_share,
             config.gate3_max_single_buyer_share,
             stats.total_eligible_sol,
+            stats.buy_count,
+        ));
+    }
+    if stats.buy_count >= GATE3_CLUSTER_DIVERSITY_MIN_BUYS
+        && stats.eligible_buyers >= GATE3_MIN_UNIQUE_FUNDERS
+        && stats.unique_funders < GATE3_MIN_UNIQUE_FUNDERS
+    {
+        return Some(format!(
+            "gate3 reject: low funder diversity | unique_buyers={} | unique_funders={} | first_buys={}",
+            stats.eligible_buyers,
+            stats.unique_funders,
             stats.buy_count,
         ));
     }
@@ -1179,8 +1539,7 @@ fn gate3_reject_reason(
             stats.elapsed_ms,
         ));
     }
-    if candidate.early_buys.len() >= config.smart_money_max_buys
-        && !gate3_soft_ready(config, stats)
+    if candidate.early_buys.len() >= config.smart_money_max_buys && !gate3_soft_ready(config, stats)
     {
         return Some(format!(
             "gate3 reject: max buys reached | mode={} | matched={} | threshold={} | sol={:.2}/{:.2} | first_buys={}",
@@ -1202,9 +1561,16 @@ async fn smart_money_stats(candidate: &Candidate, shared: &SharedState) -> Windo
     let soft_threshold = effective_soft_threshold(&shared.config, mode);
     let mut unique_sm_wallets = HashSet::new();
     let mut eligible_buyers = HashSet::new();
-    let mut unique_funders = HashSet::new();
+    let mut unique_funders: HashSet<String> = HashSet::new();
+    let mut funder_buy_counts: HashMap<String, usize> = HashMap::new();
+    let mut hotlist_funders: HashSet<String> = HashSet::new();
+    let mut hotlist_funder_hits = 0usize;
     let mut eligible_sol_total = 0.0f64;
     let mut sm_sol_total = 0.0f64;
+    let creator_first_funder = candidate
+        .creator_profile
+        .as_ref()
+        .and_then(|profile| profile.first_funder.as_deref());
     let mut fastest_sm_ms: Option<u64> = None;
     let mut fast_reached_at_ms: Option<u64> = None;
     let mut soft_reached_at_ms: Option<u64> = None;
@@ -1213,19 +1579,28 @@ async fn smart_money_stats(candidate: &Candidate, shared: &SharedState) -> Windo
     let mut max_single_buyer: Option<String> = None;
     let mut creator_buy_count = 0usize;
     let mut creator_buy_sol = 0.0f64;
+    let mut creator_funder_match_count = 0usize;
+    let mut creator_funder_match_sol = 0.0f64;
+    let mut eligible_buy_count = 0usize;
 
     for buy in &candidate.early_buys {
         let buyer = buy.buyer.to_string();
         if hotlists.blocked_buyers.contains(&buyer) {
             continue;
         }
+        eligible_buy_count = eligible_buy_count.saturating_add(1);
         eligible_buyers.insert(buyer.clone());
-        if let Some(funder) = candidate
+        let buyer_funder = candidate
             .buyer_profiles
             .get(&buyer)
-            .and_then(|profile| profile.first_funder.clone())
-        {
-            unique_funders.insert(funder);
+            .and_then(|profile| profile.first_funder.clone());
+        if let Some(funder) = buyer_funder.as_ref() {
+            unique_funders.insert(funder.clone());
+            *funder_buy_counts.entry(funder.clone()).or_default() += 1;
+            if hotlists.smart_money_funders.contains(funder) {
+                hotlist_funder_hits = hotlist_funder_hits.saturating_add(1);
+                hotlist_funders.insert(funder.clone());
+            }
         }
         let buy_sol = buy.sol_amount_lamports as f64 / 1e9;
         eligible_sol_total += buy_sol;
@@ -1234,6 +1609,12 @@ async fn smart_money_stats(candidate: &Candidate, shared: &SharedState) -> Windo
         if buyer == candidate.token.creator {
             creator_buy_count += 1;
             creator_buy_sol += buy_sol;
+        } else if creator_first_funder
+            .zip(buyer_funder.as_deref())
+            .is_some_and(|(creator_funder, buyer_funder)| creator_funder == buyer_funder)
+        {
+            creator_funder_match_count += 1;
+            creator_funder_match_sol += buy_sol;
         }
 
         let matched = match mode {
@@ -1248,17 +1629,40 @@ async fn smart_money_stats(candidate: &Candidate, shared: &SharedState) -> Windo
 
         unique_sm_wallets.insert(buyer);
         sm_sol_total += buy_sol;
-        let elapsed_ms = buy
-            .detected_at
-            .saturating_duration_since(candidate.created_at)
-            .as_millis() as u64;
+        let elapsed_ms = buy.detected_at_ms.saturating_sub(candidate.detected_at_ms);
+        let current_largest_funder_cluster_size =
+            funder_buy_counts.values().copied().max().unwrap_or_default();
+        let current_largest_funder_cluster_share = if eligible_buyers.is_empty() {
+            0.0
+        } else {
+            current_largest_funder_cluster_size as f64 / eligible_buyers.len() as f64
+        };
+        let current_quality_cluster = unique_funders.len() >= QUALITY_CLUSTER_MIN_UNIQUE_FUNDERS
+            && hotlist_funders.len() >= QUALITY_CLUSTER_MIN_HOT_FUNDERS
+            && creator_funder_match_count == 0
+            && current_largest_funder_cluster_share <= QUALITY_CLUSTER_MAX_SHARE;
+        let current_fast_threshold = if current_quality_cluster && fast_threshold > 1 {
+            fast_threshold - 1
+        } else {
+            fast_threshold.max(1)
+        };
+        let current_fast_min_sol = if current_quality_cluster {
+            (shared.config.gate3_fast_min_sol * 0.85).max(0.05)
+        } else {
+            shared.config.gate3_fast_min_sol
+        };
+        let current_same_cluster_pressure =
+            eligible_buy_count >= SAME_FUNDER_CLUSTER_PENALTY_MIN_BUYS
+                && current_largest_funder_cluster_size >= SAME_FUNDER_CLUSTER_PENALTY_MIN_BUYS
+                && current_largest_funder_cluster_share >= SAME_FUNDER_CLUSTER_PENALTY_SHARE;
         fastest_sm_ms = Some(match fastest_sm_ms {
             Some(current) => current.min(elapsed_ms),
             None => elapsed_ms,
         });
         if fast_reached_at_ms.is_none()
-            && unique_sm_wallets.len() >= fast_threshold
-            && sm_sol_total >= shared.config.gate3_fast_min_sol
+            && !current_same_cluster_pressure
+            && unique_sm_wallets.len() >= current_fast_threshold
+            && sm_sol_total >= current_fast_min_sol
         {
             fast_reached_at_ms = Some(elapsed_ms);
         }
@@ -1269,6 +1673,13 @@ async fn smart_money_stats(candidate: &Candidate, shared: &SharedState) -> Windo
             soft_reached_at_ms = Some(elapsed_ms);
         }
     }
+
+    let largest_funder_cluster_size = funder_buy_counts.values().copied().max().unwrap_or_default();
+    let largest_funder_cluster_share = if eligible_buyers.is_empty() {
+        0.0
+    } else {
+        largest_funder_cluster_size as f64 / eligible_buyers.len() as f64
+    };
 
     if eligible_sol_total > 0.0 {
         for (buyer, total) in &buyer_sol_totals {
@@ -1293,10 +1704,16 @@ async fn smart_money_stats(candidate: &Candidate, shared: &SharedState) -> Windo
         buy_count: candidate.early_buys.len(),
         eligible_buyers: eligible_buyers.len(),
         unique_funders: unique_funders.len(),
+        creator_funder_match_count,
+        creator_funder_match_sol,
         max_single_buyer_share,
         max_single_buyer,
         creator_buy_count,
         creator_buy_sol,
+        largest_funder_cluster_size,
+        largest_funder_cluster_share,
+        hotlist_funder_hits,
+        hotlist_funder_diversity: hotlist_funders.len(),
         elapsed_ms: candidate.created_at.elapsed().as_millis() as u64,
     }
 }
@@ -1314,46 +1731,98 @@ fn buyer_matches_hotlist(buyer: &str, profile: Option<&BuyerProfile>, hotlists: 
         .unwrap_or(false)
 }
 
-async fn score_candidate(shared: &SharedState, mut candidate: Candidate) -> ScoreDecision {
-    let stats = smart_money_stats(&candidate, shared).await;
-    let Some(trigger) = gate3_trigger_from_stats(shared.config.as_ref(), &stats) else {
-        return ScoreDecision {
-            passed: false,
-            gate: "gate3".to_string(),
-            score: 0,
-            reason: format!(
-                "gate3 reject: below threshold | mode={} | matched={} | fast_threshold={} | soft_threshold={} | sol={:.2} | fast_sol={:.2} | soft_sol={:.2} | first_buys={}",
-                smart_money_mode_label(stats.mode),
-                stats.unique_sm_wallets.len(),
-                stats.fast_threshold,
-                stats.soft_threshold,
-                stats.sm_sol_total,
-                shared.config.gate3_fast_min_sol,
-                shared.config.gate3_soft_min_sol,
-                stats.buy_count
-            ),
-            signal: None,
-            mode: smart_money_mode_label(stats.mode).to_string(),
-            path: "insufficient".to_string(),
-            matched_buyers: stats.unique_sm_wallets.len(),
-            early_buy_count: stats.buy_count,
-            gate4_at_ms: None,
-        };
+async fn load_creator_cluster_profile(
+    shared: &SharedState,
+    candidate: &Candidate,
+) -> CreatorClusterProfile {
+    let Some(funder) = candidate
+        .creator_profile
+        .as_ref()
+        .and_then(|profile| profile.first_funder.clone())
+    else {
+        return CreatorClusterProfile::default();
     };
 
-    candidate.trace.gate4_at_ms = Some(now_ms());
-    if candidate.trace.gate3_trigger_at_ms.is_none() {
-        candidate.trace.gate3_trigger_at_ms = Some(now_ms());
-    }
-    candidate.trace.path = Some(gate3_path_label(trigger.path).to_string());
+    let snapshot = shared
+        .db
+        .get_funder_profile(&funder)
+        .await
+        .ok()
+        .flatten()
+        .unwrap_or_default();
 
-    let sm_count_score = match stats.unique_sm_wallets.len() {
+    CreatorClusterProfile {
+        funder: Some(funder),
+        wallet_count: snapshot.wallet_count,
+        rug_exposure: snapshot.rug_exposure,
+    }
+}
+
+fn build_cluster_adjustment(
+    stats: &WindowStats,
+    creator_cluster: &CreatorClusterProfile,
+    path: Gate3Path,
+) -> ClusterAdjustment {
+    let suspicious_funder_penalty = if creator_cluster.wallet_count
+        >= SUSPICIOUS_FUNDER_CLUSTER_WARNING_WALLETS
+        || creator_cluster.rug_exposure >= SUSPICIOUS_FUNDER_CLUSTER_WARNING_RUG_EXPOSURE
+    {
+        SUSPICIOUS_FUNDER_CLUSTER_PENALTY_SCORE
+    } else {
+        0
+    };
+    let same_cluster_first_buy_penalty = if stats.buy_count >= SAME_FUNDER_CLUSTER_PENALTY_MIN_BUYS
+        && stats.largest_funder_cluster_size >= SAME_FUNDER_CLUSTER_PENALTY_MIN_BUYS
+        && stats.largest_funder_cluster_share >= SAME_FUNDER_CLUSTER_PENALTY_SHARE
+    {
+        SAME_FUNDER_CLUSTER_PENALTY_SCORE
+    } else {
+        0
+    };
+    let quality_cluster = stats.unique_funders >= QUALITY_CLUSTER_MIN_UNIQUE_FUNDERS
+        && stats.hotlist_funder_diversity >= QUALITY_CLUSTER_MIN_HOT_FUNDERS
+        && stats.creator_funder_match_count == 0
+        && stats.largest_funder_cluster_share <= QUALITY_CLUSTER_MAX_SHARE;
+    let quality_cluster_bonus = if quality_cluster {
+        QUALITY_CLUSTER_BONUS_SCORE
+    } else {
+        0
+    };
+    let fast_required_score_relief = if quality_cluster && path == Gate3Path::Fast {
+        FAST_QUALITY_CLUSTER_SCORE_RELIEF
+    } else {
+        0
+    };
+
+    ClusterAdjustment {
+        creator_funder: creator_cluster.funder.clone(),
+        creator_cluster_wallet_count: creator_cluster.wallet_count,
+        creator_cluster_rug_exposure: creator_cluster.rug_exposure,
+        suspicious_funder_penalty,
+        same_cluster_first_buy_penalty,
+        quality_cluster_bonus,
+        fast_required_score_relief,
+        largest_funder_cluster_size: stats.largest_funder_cluster_size,
+        largest_funder_cluster_share: stats.largest_funder_cluster_share,
+        hotlist_funder_hits: stats.hotlist_funder_hits,
+        hotlist_funder_diversity: stats.hotlist_funder_diversity,
+        quality_cluster,
+    }
+}
+
+async fn build_scoring_context(
+    shared: &SharedState,
+    candidate: &Candidate,
+    stats: &WindowStats,
+    path: Gate3Path,
+) -> ScoringContext {
+    let participants_score = match stats.unique_sm_wallets.len() {
         0 => 0,
         1 => 10,
         2 => 20,
         _ => 30,
     };
-    let sm_sol_score = if stats.sm_sol_total >= 2.0 {
+    let capital_score = if stats.sm_sol_total >= 2.0 {
         20
     } else if stats.sm_sol_total >= 0.5 {
         10
@@ -1381,45 +1850,143 @@ async fn score_candidate(shared: &SharedState, mut candidate: Candidate) -> Scor
     } else {
         0
     };
-    let buyer_quality_pct = fetch_buyer_quality_pct(shared, &candidate)
+    let buyer_quality_pct = fetch_buyer_quality_pct(shared, candidate)
         .await
         .unwrap_or(0.0);
     let buyer_quality_score = (buyer_quality_pct * 15.0).round().clamp(0.0, 15.0) as u32;
     let dynamic_narrative_bonus = ((candidate.dynamic_narrative_keywords.len() as u32)
         .saturating_mul(shared.config.dynamic_narrative_bonus_per_hit))
     .min(shared.config.dynamic_narrative_bonus_cap);
-    let total_score = sm_count_score
-        + sm_sol_score
-        + momentum_score
+    let funder_diversity_penalty = if stats.eligible_buyers >= GATE3_MIN_UNIQUE_FUNDERS
+        && stats.unique_funders < GATE3_MIN_UNIQUE_FUNDERS
+    {
+        SINGLE_FUNDER_SCORE_PENALTY
+    } else {
+        0
+    };
+    let runtime_risk = analyze_runtime_risk(
+        &candidate.gate1_risk,
+        RuntimeRiskInput {
+            eligible_buyers: stats.eligible_buyers,
+            unique_funders: stats.unique_funders,
+            total_eligible_sol: stats.total_eligible_sol,
+            creator_funder_match_count: stats.creator_funder_match_count,
+            creator_funder_match_sol: stats.creator_funder_match_sol,
+            max_single_buyer_share: stats.max_single_buyer_share,
+        },
+        shared.config.as_ref(),
+    );
+    let creator_cluster = load_creator_cluster_profile(shared, candidate).await;
+    let cluster = build_cluster_adjustment(stats, &creator_cluster, path);
+    let base_quality_score = participants_score
+        + capital_score
         + curve_score
         + buyer_quality_score
-        + dynamic_narrative_bonus;
-    let required_score = match trigger.path {
+        + cluster.quality_cluster_bonus;
+    let total_quality_penalty = funder_diversity_penalty
+        .saturating_add(runtime_risk.penalty_score)
+        .saturating_add(cluster.suspicious_funder_penalty)
+        .saturating_add(cluster.same_cluster_first_buy_penalty)
+        .min(base_quality_score);
+    let quality_score = base_quality_score.saturating_sub(total_quality_penalty);
+    let urgency_score = momentum_score + dynamic_narrative_bonus;
+    let total_score = quality_score + urgency_score;
+    let required_score = match path {
         Gate3Path::Fast => shared
             .config
             .filter_fast_min_score
-            .min(shared.config.filter_min_score),
+            .min(shared.config.filter_min_score)
+            .saturating_sub(cluster.fast_required_score_relief),
         Gate3Path::Soft => shared
             .config
             .filter_soft_min_score
             .min(shared.config.filter_min_score),
     };
-    let reason = format!(
-        "mode={} path={} participants={} capital={} momentum={} curve={} buyer_quality={} narrative_bonus={} total={} required={} | matched={} eligible={} sol={:.2} fastest={}ms narrative={}",
-        smart_money_mode_label(stats.mode),
-        gate3_path_label(trigger.path),
-        sm_count_score,
-        sm_sol_score,
+    let execution_confidence = quality_score.saturating_add(urgency_score).min(100);
+
+    ScoringContext {
+        participants_score,
+        capital_score,
         momentum_score,
         curve_score,
         buyer_quality_score,
         dynamic_narrative_bonus,
+        funder_diversity_penalty,
+        runtime_risk,
+        cluster,
+        curve_progress_pct,
+        buyer_quality_pct,
+        quality_score,
+        urgency_score,
+        execution_confidence,
         total_score,
         required_score,
+    }
+}
+
+async fn score_candidate(shared: &SharedState, mut candidate: Candidate) -> ScoreDecision {
+    let stats = smart_money_stats(&candidate, shared).await;
+    let Some(trigger) = gate3_trigger_from_stats(shared.config.as_ref(), &stats) else {
+        return ScoreDecision {
+            passed: false,
+            gate: "gate3".to_string(),
+            score: 0,
+            quality_score: 0,
+            urgency_score: 0,
+            execution_confidence: 0,
+            reason: format!(
+                "gate3 reject: below threshold | mode={} | matched={} | fast_threshold={} | soft_threshold={} | sol={:.2} | fast_sol={:.2} | soft_sol={:.2} | first_buys={}",
+                smart_money_mode_label(stats.mode),
+                stats.unique_sm_wallets.len(),
+                stats.fast_threshold,
+                stats.soft_threshold,
+                stats.sm_sol_total,
+                shared.config.gate3_fast_min_sol,
+                shared.config.gate3_soft_min_sol,
+                stats.buy_count
+            ),
+            signal: None,
+            mode: smart_money_mode_label(stats.mode).to_string(),
+            path: "insufficient".to_string(),
+            matched_buyers: stats.unique_sm_wallets.len(),
+            early_buy_count: stats.buy_count,
+            gate4_at_ms: None,
+        };
+    };
+
+    candidate.trace.gate4_at_ms = Some(now_ms());
+    if candidate.trace.gate3_trigger_at_ms.is_none() {
+        candidate.trace.gate3_trigger_at_ms = Some(now_ms());
+    }
+    candidate.trace.path = Some(gate3_path_label(trigger.path).to_string());
+
+    let scoring = build_scoring_context(shared, &candidate, &stats, trigger.path).await;
+    let reason = format!(
+        "mode={} path={} participants={} capital={} momentum={} curve={} buyer_quality={} narrative_bonus={} risk_penalty={} suspicious_cluster_penalty={} same_cluster_penalty={} cluster_bonus={} fast_relief={} total={} required={} | matched={} eligible={} unique_funders={} sol={:.2} fastest={}ms largest_cluster={}/{}({:.2}) hot_funders={} narrative={}",
+        smart_money_mode_label(stats.mode),
+        gate3_path_label(trigger.path),
+        scoring.participants_score,
+        scoring.capital_score,
+        scoring.momentum_score,
+        scoring.curve_score,
+        scoring.buyer_quality_score,
+        scoring.dynamic_narrative_bonus,
+        scoring.runtime_risk.penalty_score,
+        scoring.cluster.suspicious_funder_penalty,
+        scoring.cluster.same_cluster_first_buy_penalty,
+        scoring.cluster.quality_cluster_bonus,
+        scoring.cluster.fast_required_score_relief,
+        scoring.total_score,
+        scoring.required_score,
         stats.unique_sm_wallets.len(),
         stats.eligible_buyers,
+        stats.unique_funders,
         stats.sm_sol_total,
         stats.fastest_sm_ms.unwrap_or_default(),
+        scoring.cluster.largest_funder_cluster_size,
+        stats.eligible_buyers.max(1),
+        scoring.cluster.largest_funder_cluster_share,
+        scoring.cluster.hotlist_funder_diversity,
         if candidate.narrative_keywords.is_empty() {
             "-".to_string()
         } else {
@@ -1427,11 +1994,14 @@ async fn score_candidate(shared: &SharedState, mut candidate: Candidate) -> Scor
         }
     );
 
-    if total_score < required_score {
+    if scoring.total_score < scoring.required_score {
         return ScoreDecision {
             passed: false,
             gate: "gate4".to_string(),
-            score: total_score,
+            score: scoring.total_score,
+            quality_score: scoring.quality_score,
+            urgency_score: scoring.urgency_score,
+            execution_confidence: scoring.execution_confidence,
             reason,
             signal: None,
             mode: smart_money_mode_label(stats.mode).to_string(),
@@ -1446,7 +2016,10 @@ async fn score_candidate(shared: &SharedState, mut candidate: Candidate) -> Scor
         return ScoreDecision {
             passed: false,
             gate: "gate4".to_string(),
-            score: total_score,
+            score: scoring.total_score,
+            quality_score: scoring.quality_score,
+            urgency_score: scoring.urgency_score,
+            execution_confidence: scoring.execution_confidence,
             reason: format!("{} | missing trigger buy context", reason),
             signal: None,
             mode: smart_money_mode_label(stats.mode).to_string(),
@@ -1457,15 +2030,22 @@ async fn score_candidate(shared: &SharedState, mut candidate: Candidate) -> Scor
         };
     };
 
-    let latency_ms = now_ms().saturating_sub(candidate.discovered_at_ms);
+    let latency_ms = now_ms().saturating_sub(candidate.detected_at_ms);
     ScoreDecision {
         passed: true,
         gate: "pass".to_string(),
-        score: total_score,
+        score: scoring.total_score,
+        quality_score: scoring.quality_score,
+        urgency_score: scoring.urgency_score,
+        execution_confidence: scoring.execution_confidence,
         reason: reason.clone(),
         signal: Some(BuySignal {
             token: candidate.token,
-            score: total_score,
+            score: scoring.total_score,
+            quality_score: scoring.quality_score,
+            urgency_score: scoring.urgency_score,
+            execution_confidence: scoring.execution_confidence,
+            path: gate3_path_label(trigger.path).to_string(),
             reason,
             sm_count: stats.unique_sm_wallets.len(),
             sm_sol_total: stats.sm_sol_total,
@@ -1482,7 +2062,8 @@ async fn score_candidate(shared: &SharedState, mut candidate: Candidate) -> Scor
 
 async fn select_trigger_trade(candidate: &Candidate, shared: &SharedState) -> Option<PumpBuyEvent> {
     let hotlists = shared.hotlists.read().await;
-    let hotlist_mode = smart_money_mode(shared.config.as_ref(), &hotlists) == SmartMoneyMode::Hotlist;
+    let hotlist_mode =
+        smart_money_mode(shared.config.as_ref(), &hotlists) == SmartMoneyMode::Hotlist;
     if !hotlist_mode {
         return candidate
             .early_buys
@@ -1752,51 +2333,343 @@ async fn fetch_address_snapshot(
     api_key: &str,
     address: &str,
 ) -> Result<AddressSnapshot> {
+    if let Some(snapshot) =
+        get_cached_address_snapshot(shared, address, ADDRESS_SNAPSHOT_CACHE_TTL_MS).await
+    {
+        return Ok(snapshot);
+    }
+
+    if let Some(snapshot) =
+        get_persisted_address_snapshot(shared, address, ADDRESS_SNAPSHOT_CACHE_TTL_MS).await
+    {
+        return Ok(snapshot);
+    }
+
+    let stale_snapshot = match get_cached_address_snapshot(shared, address, u64::MAX).await {
+        Some(snapshot) => Some(snapshot),
+        None => get_persisted_address_snapshot(shared, address, u64::MAX).await,
+    };
+
+    if let Some(mut snapshot) = stale_snapshot {
+        snapshot.source = format!("stale:{}", snapshot.source);
+        maybe_spawn_address_snapshot_refresh(shared, address.to_string(), api_key.to_string()).await;
+        warn!(
+            "address snapshot stale-while-revalidate | address={} | source={}",
+            address, snapshot.source
+        );
+        return Ok(snapshot);
+    }
+
+    fetch_address_snapshot_blocking(shared, api_key, address).await
+}
+
+async fn fetch_address_snapshot_live(
+    shared: &SharedState,
+    api_key: &str,
+    address: &str,
+) -> Result<AddressSnapshot> {
+    let helius_cooldown_remaining_ms = helius_snapshot_cooldown_remaining_ms(shared).await;
+    if !api_key.trim().is_empty() && helius_cooldown_remaining_ms == 0 {
+        match fetch_address_snapshot_helius(shared, api_key, address).await {
+            Ok(snapshot) => return Ok(snapshot),
+            Err(helius_err) => {
+                warn!(
+                    "address snapshot helius fallback | address={} | {}",
+                    address, helius_err
+                );
+            }
+        }
+    } else if !api_key.trim().is_empty() && helius_cooldown_remaining_ms > 0 {
+        warn!(
+            "address snapshot helius cooldown active | address={} | cooldown_remaining_ms={}",
+            address, helius_cooldown_remaining_ms
+        );
+    }
+
+    let mut snapshot = fetch_address_snapshot_rpc(shared, address).await?;
+    if !api_key.trim().is_empty() && helius_cooldown_remaining_ms > 0 {
+        snapshot.source = format!("rpc:helius_cooldown:{}ms", helius_cooldown_remaining_ms);
+    } else if !api_key.trim().is_empty() {
+        snapshot.source = "rpc:helius_fallback".to_string();
+    }
+    warn!(
+        "address snapshot rpc fallback | address={} | source={}",
+        address, snapshot.source
+    );
+    Ok(snapshot)
+}
+
+async fn maybe_spawn_address_snapshot_refresh(
+    shared: &SharedState,
+    address: String,
+    api_key: String,
+) {
+    {
+        let mut inflight = shared.address_snapshot_refreshes.write().await;
+        if !inflight.insert(address.clone()) {
+            return;
+        }
+    }
+
+    let shared = shared.clone();
+    tokio::spawn(async move {
+        let refresh_result = fetch_address_snapshot_live(&shared, &api_key, &address).await;
+        match refresh_result {
+            Ok(snapshot) => {
+                let source = snapshot.source.clone();
+                cache_address_snapshot(&shared, &address, snapshot, &source).await;
+                info!(
+                    "address snapshot refresh complete | address={} | source={}",
+                    address, source
+                );
+            }
+            Err(err) => {
+                warn!("address snapshot refresh failed | address={} | {}", address, err);
+            }
+        }
+
+        let mut inflight = shared.address_snapshot_refreshes.write().await;
+        inflight.remove(&address);
+    });
+}
+
+async fn fetch_address_snapshot_blocking(
+    shared: &SharedState,
+    api_key: &str,
+    address: &str,
+) -> Result<AddressSnapshot> {
+    let snapshot = fetch_address_snapshot_live(shared, api_key, address).await?;
+    let source = snapshot.source.clone();
+    cache_address_snapshot(shared, address, snapshot.clone(), &source).await;
+    Ok(snapshot)
+}
+
+async fn fetch_address_snapshot_helius(
+    shared: &SharedState,
+    api_key: &str,
+    address: &str,
+) -> Result<AddressSnapshot> {
     let url = format!(
         "https://api-mainnet.helius-rpc.com/v0/addresses/{}/transactions",
         address
     );
-    let items: Vec<Value> = shared
-        .http
-        .get(url)
-        .query(&[
-            ("api-key", api_key),
-            ("commitment", "confirmed"),
-            ("limit", "1"),
-            ("sort-order", "asc"),
-        ])
-        .send()
-        .await
-        .with_context(|| format!("Helius oldest tx query failed: {}", address))?
-        .error_for_status()
-        .with_context(|| format!("Helius oldest tx response invalid: {}", address))?
-        .json()
-        .await
-        .context("Helius oldest tx json decode failed")?;
+    let retry_limit = shared.config.address_snapshot_helius_retry_limit.max(1);
+    let retry_delay_ms = shared.config.address_snapshot_helius_retry_delay_ms.max(50);
+    let mut last_error = None;
 
-    let oldest_tx_ms = items
-        .first()
-        .and_then(|item| item.get("timestamp"))
-        .and_then(Value::as_u64)
-        .map(|ts| ts * 1000)
-        .unwrap_or_default();
-    let wallet_age_days = if oldest_tx_ms == 0 {
-        0
-    } else {
-        now_ms()
-            .saturating_sub(oldest_tx_ms)
-            .checked_div(DAY_MS)
-            .unwrap_or_default() as u32
-    };
-    let first_funder = items
-        .first()
-        .and_then(|item| extract_first_funder(item, address));
+    for attempt in 0..retry_limit {
+        let response = shared
+            .http
+            .get(url.clone())
+            .query(&[
+                ("api-key", api_key),
+                ("commitment", "confirmed"),
+                ("limit", "1"),
+                ("sort-order", "asc"),
+            ])
+            .send()
+            .await
+            .with_context(|| format!("Helius oldest tx query failed: {}", address))?;
+        let status = response.status();
+        if status == StatusCode::TOO_MANY_REQUESTS {
+            let cooldown_ms = retry_after_to_ms(response.headers())
+                .unwrap_or(shared.config.address_snapshot_provider_cooldown_ms.max(1_000));
+            set_helius_snapshot_cooldown(shared, cooldown_ms).await;
+            anyhow::bail!(
+                "Helius oldest tx rate limited: {} | cooldown_ms={}",
+                address,
+                cooldown_ms
+            );
+        }
+        if status.is_server_error() && attempt + 1 < retry_limit {
+            last_error = Some(anyhow::anyhow!(
+                "Helius oldest tx server error: {} | status={}",
+                address,
+                status
+            ));
+            tokio::time::sleep(Duration::from_millis(retry_delay_ms)).await;
+            continue;
+        }
+        let items: Vec<Value> = response
+            .error_for_status()
+            .with_context(|| format!("Helius oldest tx response invalid: {}", address))?
+            .json()
+            .await
+            .context("Helius oldest tx json decode failed")?;
 
-    Ok(AddressSnapshot {
-        oldest_tx_ms,
-        wallet_age_days,
-        first_funder,
+        clear_helius_snapshot_cooldown(shared).await;
+
+        let oldest_tx_ms = items
+            .first()
+            .and_then(|item| item.get("timestamp"))
+            .and_then(Value::as_u64)
+            .map(|ts| ts * 1000)
+            .unwrap_or_default();
+        let wallet_age_days = if oldest_tx_ms == 0 {
+            0
+        } else {
+            now_ms()
+                .saturating_sub(oldest_tx_ms)
+                .checked_div(DAY_MS)
+                .unwrap_or_default() as u32
+        };
+        let first_funder = items
+            .first()
+            .and_then(|item| extract_first_funder(item, address));
+
+        return Ok(AddressSnapshot {
+            oldest_tx_ms,
+            wallet_age_days,
+            first_funder,
+            source: "helius".to_string(),
+        });
+    }
+
+    Err(last_error.unwrap_or_else(|| {
+        anyhow::anyhow!("Helius oldest tx failed without detailed error: {}", address)
+    }))
+}
+
+async fn fetch_address_snapshot_rpc(
+    shared: &SharedState,
+    address: &str,
+) -> Result<AddressSnapshot> {
+    let address = Pubkey::from_str(address).context("invalid snapshot address")?;
+    let rpc = shared.rpc_client.clone();
+    tokio::task::spawn_blocking(move || {
+        let signatures = rpc.get_signatures_for_address_with_config(
+            &address,
+            GetConfirmedSignaturesForAddress2Config {
+                before: None,
+                until: None,
+                limit: Some(1_000),
+                commitment: Some(CommitmentConfig::confirmed()),
+            },
+        )?;
+        let oldest_tx_ms = signatures
+            .last()
+            .and_then(|entry| entry.block_time)
+            .map(|ts| (ts as u64).saturating_mul(1000))
+            .unwrap_or_default();
+        let wallet_age_days = if oldest_tx_ms == 0 {
+            0
+        } else {
+            now_ms()
+                .saturating_sub(oldest_tx_ms)
+                .checked_div(DAY_MS)
+                .unwrap_or_default() as u32
+        };
+        Ok::<AddressSnapshot, anyhow::Error>(AddressSnapshot {
+            oldest_tx_ms,
+            wallet_age_days,
+            first_funder: None,
+            source: "rpc".to_string(),
+        })
     })
+    .await
+    .context("address snapshot rpc task failed")?
+}
+
+async fn get_cached_address_snapshot(
+    shared: &SharedState,
+    address: &str,
+    max_age_ms: u64,
+) -> Option<AddressSnapshot> {
+    let cache = shared.address_snapshot_cache.read().await;
+    let entry = cache.get(address)?;
+    if now_ms().saturating_sub(entry.fetched_at_ms) > max_age_ms {
+        return None;
+    }
+    Some(entry.snapshot.clone())
+}
+
+async fn get_persisted_address_snapshot(
+    shared: &SharedState,
+    address: &str,
+    max_age_ms: u64,
+) -> Option<AddressSnapshot> {
+    let record = shared
+        .db
+        .get_address_snapshot(address)
+        .await
+        .ok()
+        .flatten()?;
+    if now_ms().saturating_sub(record.fetched_at_ms) > max_age_ms {
+        return None;
+    }
+
+    let snapshot = AddressSnapshot {
+        oldest_tx_ms: record.oldest_tx_ms,
+        wallet_age_days: record.wallet_age_days,
+        first_funder: record.first_funder,
+        source: format!("sqlite:{}", record.source),
+    };
+    cache_address_snapshot_memory(shared, address, snapshot.clone(), record.fetched_at_ms).await;
+    Some(snapshot)
+}
+
+async fn cache_address_snapshot(
+    shared: &SharedState,
+    address: &str,
+    snapshot: AddressSnapshot,
+    source: &str,
+) {
+    let fetched_at_ms = now_ms();
+    cache_address_snapshot_memory(shared, address, snapshot.clone(), fetched_at_ms).await;
+    if let Err(err) = shared
+        .db
+        .upsert_address_snapshot(&AddressSnapshotRecord {
+            address: address.to_string(),
+            oldest_tx_ms: snapshot.oldest_tx_ms,
+            wallet_age_days: snapshot.wallet_age_days,
+            first_funder: snapshot.first_funder.clone(),
+            source: source.to_string(),
+            fetched_at_ms,
+        })
+        .await
+    {
+        warn!(
+            "address snapshot persist failed | address={} | {}",
+            address, err
+        );
+    }
+}
+
+async fn cache_address_snapshot_memory(
+    shared: &SharedState,
+    address: &str,
+    snapshot: AddressSnapshot,
+    fetched_at_ms: u64,
+) {
+    let mut cache = shared.address_snapshot_cache.write().await;
+    cache.insert(
+        address.to_string(),
+        CachedAddressSnapshot {
+            snapshot,
+            fetched_at_ms,
+        },
+    );
+}
+
+async fn helius_snapshot_cooldown_remaining_ms(shared: &SharedState) -> u64 {
+    let guard = shared.address_snapshot_helius_cooldown_until_ms.read().await;
+    guard.saturating_sub(now_ms())
+}
+
+async fn set_helius_snapshot_cooldown(shared: &SharedState, cooldown_ms: u64) {
+    let until_ms = now_ms().saturating_add(cooldown_ms);
+    let mut guard = shared.address_snapshot_helius_cooldown_until_ms.write().await;
+    *guard = (*guard).max(until_ms);
+}
+
+async fn clear_helius_snapshot_cooldown(shared: &SharedState) {
+    let mut guard = shared.address_snapshot_helius_cooldown_until_ms.write().await;
+    *guard = 0;
+}
+
+fn retry_after_to_ms(headers: &reqwest::header::HeaderMap) -> Option<u64> {
+    let value = headers.get(reqwest::header::RETRY_AFTER)?.to_str().ok()?.trim();
+    value.parse::<u64>().ok().map(|seconds| seconds.saturating_mul(1000))
 }
 
 fn extract_first_funder(item: &Value, address: &str) -> Option<String> {
@@ -1843,8 +2716,14 @@ async fn refresh_dynamic_hot_keywords(shared: &SharedState) -> Result<()> {
     }
 
     write_plaintext_lines(&shared.config.dynamic_hot_keywords_file, &keywords).await?;
-    let expiry_ms = now_ms()
-        .saturating_add(shared.config.dynamic_hot_refresh_secs.max(30).saturating_mul(2) * 1000);
+    let expiry_ms = now_ms().saturating_add(
+        shared
+            .config
+            .dynamic_hot_refresh_secs
+            .max(30)
+            .saturating_mul(2)
+            * 1000,
+    );
     let keyword_records: Vec<DynamicKeywordRecord> = keywords
         .iter()
         .enumerate()
@@ -1888,7 +2767,10 @@ async fn fetch_dynamic_hot_keywords(shared: &SharedState) -> Result<Vec<String>>
             score_dynamic_keywords(&mut keyword_scores, keywords, 4);
             source_count += 1;
         }
-        Err(err) => warn!("dynamic keywords: coingecko search trending failed: {}", err),
+        Err(err) => warn!(
+            "dynamic keywords: coingecko search trending failed: {}",
+            err
+        ),
     }
 
     if let Some(api_key) = shared.config.coingecko_api_key.as_deref() {
@@ -1897,7 +2779,10 @@ async fn fetch_dynamic_hot_keywords(shared: &SharedState) -> Result<Vec<String>>
                 score_dynamic_keywords(&mut keyword_scores, keywords, 5);
                 source_count += 1;
             }
-            Err(err) => warn!("dynamic keywords: coingecko solana trending pools failed: {}", err),
+            Err(err) => warn!(
+                "dynamic keywords: coingecko solana trending pools failed: {}",
+                err
+            ),
         }
     }
 
@@ -1906,7 +2791,10 @@ async fn fetch_dynamic_hot_keywords(shared: &SharedState) -> Result<Vec<String>>
             score_dynamic_keywords(&mut keyword_scores, keywords, 3);
             source_count += 1;
         }
-        Err(err) => warn!("dynamic keywords: dexscreener boosted tokens failed: {}", err),
+        Err(err) => warn!(
+            "dynamic keywords: dexscreener boosted tokens failed: {}",
+            err
+        ),
     }
 
     if source_count == 0 {
@@ -2098,11 +2986,7 @@ fn should_keep_dynamic_keyword(token: &str) -> bool {
     !DYNAMIC_KEYWORD_STOPWORDS.contains(&token)
 }
 
-fn score_dynamic_keywords(
-    scores: &mut HashMap<String, u32>,
-    keywords: Vec<String>,
-    weight: u32,
-) {
+fn score_dynamic_keywords(scores: &mut HashMap<String, u32>, keywords: Vec<String>, weight: u32) {
     let mut seen = HashSet::new();
     for keyword in keywords {
         if seen.insert(keyword.clone()) {
@@ -2235,6 +3119,7 @@ async fn record_candidate_outcome(
         path,
         early_buy_count,
         matched_buyers,
+        None,
     )
     .await;
     persist_candidate_analytics(
@@ -2248,6 +3133,15 @@ async fn record_candidate_outcome(
         &path_ref,
     )
     .await;
+
+    if passed {
+        spawn_post_trade_outcome_tracking(
+            shared,
+            candidate.token.clone(),
+            path_ref,
+            score_ref.unwrap_or_default(),
+        );
+    }
 }
 
 async fn record_token_outcome(
@@ -2262,9 +3156,10 @@ async fn record_token_outcome(
     path: String,
     early_buy_count: usize,
     matched_buyers: usize,
+    risk_signals: Option<Vec<RiskSignalRecord>>,
 ) {
     let final_at_ms = now_ms();
-    let latency_ms = final_at_ms.saturating_sub(token.discovered_at_ms);
+    let latency_ms = final_at_ms.saturating_sub(token.detected_at_ms);
 
     let record = FilterResultRecord {
         mint: token.mint.clone(),
@@ -2289,7 +3184,7 @@ async fn record_token_outcome(
         },
         mode: mode.clone(),
         path: path.clone(),
-        detected_at_ms: token.discovered_at_ms,
+        detected_at_ms: token.detected_at_ms,
         gate1_at_ms: trace.gate1_at_ms,
         gate2_at_ms: trace.gate2_at_ms,
         gate3_open_at_ms: trace.gate3_open_at_ms,
@@ -2329,6 +3224,21 @@ async fn record_token_outcome(
         warn!("filter latency append failed: {}", err);
     }
 
+    if let Some(risk_signals) = risk_signals {
+        if !risk_signals.is_empty() {
+            if let Err(err) = shared
+                .db
+                .replace_risk_signals(&token.mint, &risk_signals)
+                .await
+            {
+                warn!(
+                    "replace risk signals failed | mint={} | {}",
+                    token.mint, err
+                );
+            }
+        }
+    }
+
     if passed {
         info!(
             "filter: pass | mint={} | score={:?} | mode={} | path={} | {}",
@@ -2346,10 +3256,58 @@ async fn record_token_outcome(
     }
 }
 
+fn spawn_post_trade_outcome_tracking(
+    shared: &SharedState,
+    token: NewToken,
+    path: String,
+    score: u32,
+) {
+    let shared = shared.clone();
+    tokio::spawn(async move {
+        let start = Instant::now();
+        let checkpoints = [10u64, 30u64, 60u64];
+        let mut metrics = [None, None, None];
+
+        for (idx, seconds) in checkpoints.into_iter().enumerate() {
+            let elapsed_secs = start.elapsed().as_secs();
+            if seconds > elapsed_secs {
+                tokio::time::sleep(Duration::from_secs(seconds - elapsed_secs)).await;
+            }
+            metrics[idx] = fetch_curve_progress_pct(&shared, &token).await.ok();
+        }
+
+        let observed: Vec<f64> = metrics.iter().flatten().copied().collect();
+        let peak_metric = observed.iter().copied().reduce(f64::max);
+        let trough_metric = observed.iter().copied().reduce(f64::min);
+        let drawdown_metric = peak_metric
+            .zip(trough_metric)
+            .map(|(peak, trough)| (peak - trough).max(0.0));
+        let record = PostTradeOutcomeRecord {
+            mint: token.mint.clone(),
+            path,
+            score,
+            metric_type: "curve_progress_pct".to_string(),
+            metric_10s: metrics[0],
+            metric_30s: metrics[1],
+            metric_60s: metrics[2],
+            peak_metric,
+            drawdown_metric,
+            recorded_at_ms: now_ms(),
+        };
+        if let Err(err) = shared.db.upsert_post_trade_outcome(&record).await {
+            warn!(
+                "post-trade outcome persist failed | mint={} | {}",
+                token.mint, err
+            );
+        }
+    });
+}
+
 async fn persist_raw_new_token_event(shared: &SharedState, token: &NewToken) {
     if !shared.config.persist_raw_scanner_events {
         return;
     }
+    let meta = token.meta();
     let payload = json!({
         "mint": token.mint,
         "creator": token.creator,
@@ -2361,6 +3319,10 @@ async fn persist_raw_new_token_event(shared: &SharedState, token: &NewToken) {
         "slot": token.slot,
         "feed_source": token.feed_source,
         "is_v2": token.is_v2,
+        "detected_at_ms": token.detected_at_ms,
+        "instruction_data_b58": meta.raw_meta.instruction_data_b58,
+        "instruction_accounts": meta.raw_meta.instruction_accounts,
+        "raw_meta": meta.raw_meta,
     });
     let record = RawEventRecord {
         feed_source: token.feed_source.clone(),
@@ -2369,7 +3331,7 @@ async fn persist_raw_new_token_event(shared: &SharedState, token: &NewToken) {
         signature: token.signature.clone(),
         mint: token.mint.clone(),
         actor: Some(token.creator.clone()),
-        recorded_at_ms: token.discovered_at_ms,
+        recorded_at_ms: token.detected_at_ms,
         payload_json: payload.to_string(),
     };
     if let Err(err) = shared.db.insert_raw_event(&record).await {
@@ -2381,6 +3343,7 @@ async fn persist_raw_buy_event(shared: &SharedState, buy: &PumpBuyEvent) {
     if !shared.config.persist_raw_scanner_events {
         return;
     }
+    let meta = buy.meta();
     let payload = json!({
         "mint": buy.mint,
         "buyer": buy.buyer.to_string(),
@@ -2388,6 +3351,11 @@ async fn persist_raw_buy_event(shared: &SharedState, buy: &PumpBuyEvent) {
         "feed_source": buy.feed_source,
         "signature": buy.signature,
         "slot": buy.slot,
+        "token_program": buy.token_program.to_string(),
+        "detected_at_ms": buy.detected_at_ms,
+        "instruction_data_b58": meta.raw_meta.instruction_data_b58,
+        "instruction_accounts": meta.raw_meta.instruction_accounts,
+        "raw_meta": meta.raw_meta,
     });
     let record = RawEventRecord {
         feed_source: buy.feed_source.clone(),
@@ -2396,7 +3364,7 @@ async fn persist_raw_buy_event(shared: &SharedState, buy: &PumpBuyEvent) {
         signature: buy.signature.clone(),
         mint: buy.mint.clone(),
         actor: Some(buy.buyer.to_string()),
-        recorded_at_ms: now_ms(),
+        recorded_at_ms: buy.detected_at_ms,
         payload_json: payload.to_string(),
     };
     if let Err(err) = shared.db.insert_raw_event(&record).await {
@@ -2442,11 +3410,7 @@ async fn persist_entity_links_for_creator(
     }
 }
 
-async fn persist_entity_links_for_buyer(
-    shared: &SharedState,
-    mint: &str,
-    profile: &BuyerProfile,
-) {
+async fn persist_entity_links_for_buyer(shared: &SharedState, mint: &str, profile: &BuyerProfile) {
     let Some(funder) = profile.first_funder.clone() else {
         return;
     };
@@ -2464,7 +3428,10 @@ async fn persist_entity_links_for_buyer(
         last_seen_ms: profile.fetched_at_ms.max(current.last_seen_ms),
     };
     if let Err(err) = shared.db.upsert_funder_profile(&funder_profile).await {
-        warn!("upsert buyer funder profile failed | funder={} | {}", funder, err);
+        warn!(
+            "upsert buyer funder profile failed | funder={} | {}",
+            funder, err
+        );
     }
     let cluster_id = cluster_id_for_funder(&funder);
     let member = ClusterMemberRecord {
@@ -2487,8 +3454,103 @@ async fn persist_entity_links_for_buyer(
     }
 }
 
+fn ordered_edge_endpoints(left: &str, right: &str) -> (String, String) {
+    if left <= right {
+        (left.to_string(), right.to_string())
+    } else {
+        (right.to_string(), left.to_string())
+    }
+}
+
 fn cluster_id_for_funder(funder: &str) -> String {
     format!("funder:{}", funder)
+}
+
+async fn persist_launch_participation_edges(shared: &SharedState, candidate: &Candidate) {
+    let creator_funder = candidate
+        .creator_profile
+        .as_ref()
+        .and_then(|profile| profile.first_funder.clone());
+    let mut participants = Vec::new();
+    let mut seen_buyers = HashSet::new();
+
+    for (idx, buy) in candidate.early_buys.iter().enumerate() {
+        let buyer = buy.buyer.to_string();
+        if !seen_buyers.insert(buyer.clone()) {
+            continue;
+        }
+        let funder = candidate
+            .buyer_profiles
+            .get(&buyer)
+            .and_then(|profile| profile.first_funder.clone());
+        participants.push((idx, buyer, funder));
+        if participants.len() >= shared.config.smart_money_max_buys {
+            break;
+        }
+    }
+
+    for (idx, buyer, funder) in &participants {
+        let launch_edge = ClusterEdgeRecord {
+            src: candidate.token.creator.clone(),
+            dst: buyer.clone(),
+            edge_type: format!("launch_participation:{}", candidate.token.mint),
+            weight: (shared.config.smart_money_max_buys.saturating_sub(*idx)).max(1) as i32,
+        };
+        if let Err(err) = shared.db.upsert_cluster_edge(&launch_edge).await {
+            warn!("upsert launch participation edge failed | {}", err);
+        }
+
+        if creator_funder
+            .as_deref()
+            .zip(funder.as_deref())
+            .is_some_and(|(creator_funder, buyer_funder)| creator_funder == buyer_funder)
+        {
+            let member = ClusterMemberRecord {
+                cluster_id: cluster_id_for_funder(creator_funder.as_deref().unwrap_or_default()),
+                address: buyer.clone(),
+                cluster_type: "creator_launch_peer".to_string(),
+                score: 70,
+            };
+            if let Err(err) = shared.db.upsert_cluster_member(&member).await {
+                warn!("upsert creator launch cluster member failed | {}", err);
+            }
+        }
+    }
+
+    for (left_idx, (_, left_buyer, left_funder)) in participants.iter().enumerate() {
+        for (_, right_buyer, right_funder) in participants.iter().skip(left_idx + 1) {
+            let (src, dst) = ordered_edge_endpoints(left_buyer, right_buyer);
+            let peer_edge = ClusterEdgeRecord {
+                src,
+                dst,
+                edge_type: format!("launch_peer:{}", candidate.token.mint),
+                weight: 1,
+            };
+            if let Err(err) = shared.db.upsert_cluster_edge(&peer_edge).await {
+                warn!("upsert launch peer edge failed | {}", err);
+            }
+
+            if let (Some(left_funder), Some(right_funder)) =
+                (left_funder.as_deref(), right_funder.as_deref())
+            {
+                if left_funder != right_funder {
+                    let (src, dst) = ordered_edge_endpoints(
+                        &cluster_id_for_funder(left_funder),
+                        &cluster_id_for_funder(right_funder),
+                    );
+                    let peer_edge = ClusterEdgeRecord {
+                        src,
+                        dst,
+                        edge_type: format!("launch_funder_peer:{}", candidate.token.mint),
+                        weight: 1,
+                    };
+                    if let Err(err) = shared.db.upsert_cluster_edge(&peer_edge).await {
+                        warn!("upsert launch funder peer edge failed | {}", err);
+                    }
+                }
+            }
+        }
+    }
 }
 
 async fn persist_candidate_analytics(
@@ -2502,10 +3564,11 @@ async fn persist_candidate_analytics(
     path: &str,
 ) {
     let stats = smart_money_stats(candidate, shared).await;
+    persist_launch_participation_edges(shared, candidate).await;
     let first_buy_ms = candidate
         .early_buys
         .iter()
-        .map(|buy| buy.detected_at.saturating_duration_since(candidate.created_at).as_millis() as u64)
+        .map(|buy| buy.detected_at_ms.saturating_sub(candidate.detected_at_ms))
         .min();
     let threshold_hit_ms = match path {
         "fast" => stats.fast_reached_at_ms,
@@ -2530,7 +3593,10 @@ async fn persist_candidate_analytics(
         recorded_at_ms: now_ms(),
     };
     if let Err(err) = shared.db.insert_gate3_snapshot(&snapshot).await {
-        warn!("insert gate3 snapshot failed | mint={} | {}", candidate.token.mint, err);
+        warn!(
+            "insert gate3 snapshot failed | mint={} | {}",
+            candidate.token.mint, err
+        );
     }
 
     if shared.config.persist_gate3_sequences {
@@ -2551,11 +3617,7 @@ async fn persist_candidate_analytics(
                     funder: funder.clone(),
                     cluster_id: funder.as_deref().map(cluster_id_for_funder),
                     sol_amount: buy.sol_amount_lamports as f64 / 1e9,
-                    detected_at_ms: candidate.token.discovered_at_ms.saturating_add(
-                        buy.detected_at
-                            .saturating_duration_since(candidate.created_at)
-                            .as_millis() as u64,
-                    ),
+                    detected_at_ms: buy.detected_at_ms,
                     is_creator: buyer == candidate.token.creator,
                     feed_source: buy.feed_source.clone(),
                 }
@@ -2566,107 +3628,103 @@ async fn persist_candidate_analytics(
             .replace_gate3_sequences(&candidate.token.mint, &sequences)
             .await
         {
-            warn!("replace gate3 sequences failed | mint={} | {}", candidate.token.mint, err);
+            warn!(
+                "replace gate3 sequences failed | mint={} | {}",
+                candidate.token.mint, err
+            );
         }
     }
 
     if shared.config.persist_scoring_breakdowns {
-        let participants_score = match stats.unique_sm_wallets.len() {
-            0 => 0,
-            1 => 10,
-            2 => 20,
-            _ => 30,
-        };
-        let capital_score = if stats.sm_sol_total >= 2.0 {
-            20
-        } else if stats.sm_sol_total >= 0.5 {
-            10
-        } else {
-            0
-        };
-        let momentum_score = if stats.buy_count >= 15 {
-            20
-        } else if stats.buy_count >= 8 {
-            13
-        } else if stats.buy_count >= 4 {
-            6
-        } else {
-            0
-        };
-        let curve_progress_pct = fetch_curve_progress_pct(shared, &candidate.token)
-            .await
-            .unwrap_or(0.0);
-        let curve_score = if curve_progress_pct > 5.0 {
-            15
-        } else if curve_progress_pct > 2.0 {
-            10
-        } else if curve_progress_pct > 0.5 {
-            5
-        } else {
-            0
-        };
-        let buyer_quality_pct = fetch_buyer_quality_pct(shared, candidate)
-            .await
-            .unwrap_or(0.0);
-        let buyer_quality_score =
-            (buyer_quality_pct * 15.0).round().clamp(0.0, 15.0) as u32;
-        let dynamic_bonus = ((candidate.dynamic_narrative_keywords.len() as u32)
-            .saturating_mul(shared.config.dynamic_narrative_bonus_per_hit))
-        .min(shared.config.dynamic_narrative_bonus_cap);
-        let quality_score =
-            participants_score + capital_score + curve_score + buyer_quality_score;
-        let urgency_score = momentum_score + dynamic_bonus;
-        let total_score = quality_score + urgency_score;
-        let required_score = match path {
-            "soft" => shared
-                .config
-                .filter_soft_min_score
-                .min(shared.config.filter_min_score),
-            _ => shared
-                .config
-                .filter_fast_min_score
-                .min(shared.config.filter_min_score),
-        };
-        let execution_confidence = if passed {
-            total_score.min(100)
-        } else {
-            quality_score.min(100)
-        };
+        let scoring = build_scoring_context(
+            shared,
+            candidate,
+            &stats,
+            if path == "soft" {
+                Gate3Path::Soft
+            } else {
+                Gate3Path::Fast
+            },
+        )
+        .await;
         let details = json!({
-            "participants_score": participants_score,
-            "capital_score": capital_score,
-            "momentum_score": momentum_score,
-            "curve_score": curve_score,
-            "buyer_quality_score": buyer_quality_score,
-            "dynamic_narrative_bonus": dynamic_bonus,
-            "curve_progress_pct": curve_progress_pct,
-            "buyer_quality_pct": buyer_quality_pct,
+            "participants_score": scoring.participants_score,
+            "capital_score": scoring.capital_score,
+            "momentum_score": scoring.momentum_score,
+            "curve_score": scoring.curve_score,
+            "buyer_quality_score": scoring.buyer_quality_score,
+            "funder_diversity_penalty": scoring.funder_diversity_penalty,
+            "risk_penalty": scoring.runtime_risk.penalty_score,
+            "risk_signals": scoring.runtime_risk
+                .signals
+                .iter()
+                .map(|signal| json!({
+                    "type": signal.signal_type,
+                    "value": signal.signal_value,
+                    "score": signal.score,
+                    "severity": format!("{:?}", signal.severity),
+                }))
+                .collect::<Vec<_>>(),
+            "creator_funder_match_count": stats.creator_funder_match_count,
+            "creator_funder_match_sol": stats.creator_funder_match_sol,
+            "largest_funder_cluster_size": scoring.cluster.largest_funder_cluster_size,
+            "largest_funder_cluster_share": scoring.cluster.largest_funder_cluster_share,
+            "hotlist_funder_hits": scoring.cluster.hotlist_funder_hits,
+            "hotlist_funder_diversity": scoring.cluster.hotlist_funder_diversity,
+            "quality_cluster": scoring.cluster.quality_cluster,
+            "quality_cluster_bonus": scoring.cluster.quality_cluster_bonus,
+            "fast_required_score_relief": scoring.cluster.fast_required_score_relief,
+            "suspicious_funder_penalty": scoring.cluster.suspicious_funder_penalty,
+            "same_cluster_first_buy_penalty": scoring.cluster.same_cluster_first_buy_penalty,
+            "creator_cluster_funder": scoring.cluster.creator_funder,
+            "creator_cluster_wallet_count": scoring.cluster.creator_cluster_wallet_count,
+            "creator_cluster_rug_exposure": scoring.cluster.creator_cluster_rug_exposure,
+            "dynamic_narrative_bonus": scoring.dynamic_narrative_bonus,
+            "dynamic_narrative_keywords": &candidate.dynamic_narrative_keywords,
+            "curve_progress_pct": scoring.curve_progress_pct,
+            "buyer_quality_pct": scoring.buyer_quality_pct,
             "reason": reason,
         });
         let breakdown = ScoringBreakdownRecord {
             mint: candidate.token.mint.clone(),
             path: path.to_string(),
-            quality_score,
-            urgency_score,
-            execution_confidence,
-            total_score,
-            required_score,
+            quality_score: scoring.quality_score,
+            urgency_score: scoring.urgency_score,
+            execution_confidence: if passed {
+                scoring.execution_confidence
+            } else {
+                scoring.quality_score.min(100)
+            },
+            total_score: scoring.total_score,
+            required_score: scoring.required_score,
             details_json: details.to_string(),
             recorded_at_ms: now_ms(),
         };
         if let Err(err) = shared.db.insert_scoring_breakdown(&breakdown).await {
-            warn!("insert scoring breakdown failed | mint={} | {}", candidate.token.mint, err);
+            warn!(
+                "insert scoring breakdown failed | mint={} | {}",
+                candidate.token.mint, err
+            );
         }
     }
 
-    let risk_signals = build_risk_signals(candidate, reject_gate, reason);
+    let risk_signals = build_risk_signals(
+        candidate,
+        &stats,
+        reject_gate,
+        reason,
+        shared.config.as_ref(),
+    );
     if !risk_signals.is_empty() {
         if let Err(err) = shared
             .db
             .replace_risk_signals(&candidate.token.mint, &risk_signals)
             .await
         {
-            warn!("replace risk signals failed | mint={} | {}", candidate.token.mint, err);
+            warn!(
+                "replace risk signals failed | mint={} | {}",
+                candidate.token.mint, err
+            );
         }
     }
 
@@ -2684,11 +3742,34 @@ async fn persist_candidate_analytics(
 
 fn build_risk_signals(
     candidate: &Candidate,
+    stats: &WindowStats,
     reject_gate: Option<&str>,
     reason: &str,
+    config: &AppConfig,
 ) -> Vec<RiskSignalRecord> {
-    let mut signals = Vec::new();
     let detected_at_ms = now_ms();
+    let runtime_risk = analyze_runtime_risk(
+        &candidate.gate1_risk,
+        RuntimeRiskInput {
+            eligible_buyers: stats.eligible_buyers,
+            unique_funders: stats.unique_funders,
+            total_eligible_sol: stats.total_eligible_sol,
+            creator_funder_match_count: stats.creator_funder_match_count,
+            creator_funder_match_sol: stats.creator_funder_match_sol,
+            max_single_buyer_share: stats.max_single_buyer_share,
+        },
+        config,
+    );
+    let mut signals = risk_signal_records_from_seeds(
+        &candidate.token.mint,
+        &candidate.gate1_risk.signals,
+        detected_at_ms,
+    );
+    signals.extend(risk_signal_records_from_seeds(
+        &candidate.token.mint,
+        &runtime_risk.signals,
+        detected_at_ms,
+    ));
     let mut push = |signal_type: &str, signal_value: &str, score: i32| {
         signals.push(RiskSignalRecord {
             mint: candidate.token.mint.clone(),
@@ -2716,7 +3797,49 @@ fn build_risk_signals(
     if reason.contains("early concentration") {
         push("buy_concentration", reason, 60);
     }
+    if stats.largest_funder_cluster_size >= SAME_FUNDER_CLUSTER_PENALTY_MIN_BUYS
+        && stats.largest_funder_cluster_share >= SAME_FUNDER_CLUSTER_PENALTY_SHARE
+    {
+        push(
+            "same_funder_cluster_pressure",
+            &format!(
+                "size={} share={:.4}",
+                stats.largest_funder_cluster_size, stats.largest_funder_cluster_share
+            ),
+            SAME_FUNDER_CLUSTER_PENALTY_SCORE as i32,
+        );
+    }
+    if let Some(funder) = candidate
+        .creator_profile
+        .as_ref()
+        .and_then(|profile| profile.first_funder.as_deref())
+    {
+        push("creator_funder_cluster", funder, 15);
+    }
+    if let Some(host) = candidate.gate1_risk.uri_host.as_deref() {
+        push("uri_host", host, 10);
+    }
+    if let Some(pattern) = candidate.gate1_risk.uri_pattern.as_deref() {
+        push("uri_pattern", pattern, 10);
+    }
     signals
+}
+
+fn risk_signal_records_from_seeds(
+    mint: &str,
+    seeds: &[RiskSignalSeed],
+    detected_at_ms: u64,
+) -> Vec<RiskSignalRecord> {
+    seeds
+        .iter()
+        .map(|seed| RiskSignalRecord {
+            mint: mint.to_string(),
+            signal_type: seed.signal_type.clone(),
+            signal_value: seed.signal_value.clone(),
+            score: seed.score,
+            detected_at_ms,
+        })
+        .collect()
 }
 
 fn build_label_suggestions(
@@ -2756,6 +3879,21 @@ fn build_label_suggestions(
             mint: Some(candidate.token.mint.clone()),
             created_at_ms: now,
         });
+    } else if reject_gate == Some("gate2") && reason.contains("funder") {
+        if let Some(funder) = candidate
+            .creator_profile
+            .as_ref()
+            .and_then(|profile| profile.first_funder.clone())
+        {
+            out.push(LabelSuggestionRecord {
+                label_type: "funder_blacklist_candidate".to_string(),
+                subject: funder,
+                reason: reason.to_string(),
+                score: 80,
+                mint: Some(candidate.token.mint.clone()),
+                created_at_ms: now,
+            });
+        }
     }
     out
 }
@@ -2770,6 +3908,7 @@ fn now_ms() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::scanner::feed::ScannerMode;
     use solana_sdk::signature::{Keypair, Signer};
 
     fn base_config() -> AppConfig {
@@ -2785,12 +3924,23 @@ mod tests {
             scanner_grpc_token: None,
             scanner_secondary_grpc_url: None,
             scanner_secondary_grpc_token: None,
+            scanner_deshred_grpc_url: None,
+            scanner_deshred_grpc_token: None,
+            scanner_mode: ScannerMode::ProcessedOnly,
             scanner_primary_feed_label: "primary_processed".to_string(),
             scanner_secondary_feed_label: "secondary_processed".to_string(),
+            scanner_deshred_feed_label: "deshred_pre_exec".to_string(),
             helius_api_key: None,
             coingecko_api_key: None,
             filter_db_path: String::new(),
             replay_db_path: String::new(),
+            replay_mode_enabled: false,
+            replay_pipeline_enabled: false,
+            replay_from_ms: None,
+            replay_to_ms: None,
+            replay_window_minutes: 60,
+            replay_speedup: 50.0,
+            replay_report_file: String::new(),
             smart_money_file: String::new(),
             smart_money_funder_file: String::new(),
             blocked_buyers_file: String::new(),
@@ -2831,7 +3981,20 @@ mod tests {
             filter_soft_min_score: 58,
             dynamic_narrative_bonus_per_hit: 3,
             dynamic_narrative_bonus_cap: 6,
+            risk_template_repeat_threshold: 3,
+            risk_template_hard_reject_threshold: 6,
+            risk_template_penalty_score: 8,
+            risk_uri_penalty_score: 8,
+            risk_concentration_penalty_score: 8,
+            risk_liquidity_penalty_score: 6,
+            risk_creator_funder_penalty_score: 7,
+            risk_penalty_cap: 18,
             scanner_idle_timeout_secs: 0,
+            scanner_catchup_window_ms: 120_000,
+            scanner_catchup_max_events: 1024,
+            scanner_failover_stale_ms: 15_000,
+            execution_feedback_window_secs: 300,
+            execution_feedback_refresh_secs: 15,
             creator_gate_timeout_ms: 1_500,
             creator_min_wallet_age_days: 1,
             creator_fresh_wallet_token_limit: 2,
@@ -2885,10 +4048,16 @@ mod tests {
             buy_count: 2,
             eligible_buyers: 2,
             unique_funders: 0,
+            creator_funder_match_count: 0,
+            creator_funder_match_sol: 0.0,
             max_single_buyer_share: 0.55,
             max_single_buyer: Some("a".to_string()),
             creator_buy_count: 0,
             creator_buy_sol: 0.0,
+            largest_funder_cluster_size: 0,
+            largest_funder_cluster_share: 0.0,
+            hotlist_funder_hits: 0,
+            hotlist_funder_diversity: 0,
             elapsed_ms: 900,
         };
         let trigger = gate3_trigger_from_stats(&cfg, &stats).expect("fast trigger");
@@ -2919,10 +4088,16 @@ mod tests {
             buy_count: 4,
             eligible_buyers: 4,
             unique_funders: 0,
+            creator_funder_match_count: 0,
+            creator_funder_match_sol: 0.0,
             max_single_buyer_share: 0.35,
             max_single_buyer: Some("a".to_string()),
             creator_buy_count: 0,
             creator_buy_sol: 0.0,
+            largest_funder_cluster_size: 0,
+            largest_funder_cluster_share: 0.0,
+            hotlist_funder_hits: 0,
+            hotlist_funder_diversity: 0,
             elapsed_ms: 2_000,
         };
         let trigger = gate3_trigger_from_stats(&cfg, &stats).expect("soft trigger");
@@ -2946,14 +4121,88 @@ mod tests {
             buy_count: 2,
             eligible_buyers: 2,
             unique_funders: 0,
+            creator_funder_match_count: 0,
+            creator_funder_match_sol: 0.0,
             max_single_buyer_share: 0.55,
             max_single_buyer: Some("a".to_string()),
             creator_buy_count: 0,
             creator_buy_sol: 0.0,
+            largest_funder_cluster_size: 0,
+            largest_funder_cluster_share: 0.0,
+            hotlist_funder_hits: 0,
+            hotlist_funder_diversity: 0,
             elapsed_ms: 700,
         };
         assert!(!gate3_fast_ready(&cfg, &stats));
         assert!(gate3_trigger_from_stats(&cfg, &stats).is_none());
+    }
+
+    #[test]
+    fn gate3_quality_cluster_relaxes_fast_threshold() {
+        let cfg = base_config();
+        let stats = WindowStats {
+            mode: SmartMoneyMode::Hotlist,
+            fast_threshold: 3,
+            soft_threshold: 3,
+            unique_sm_wallets: ["a".to_string(), "b".to_string()].into_iter().collect(),
+            sm_sol_total: 0.40,
+            total_eligible_sol: 0.40,
+            fastest_sm_ms: Some(80),
+            fast_reached_at_ms: Some(320),
+            soft_reached_at_ms: None,
+            buy_count: 2,
+            eligible_buyers: 2,
+            unique_funders: 3,
+            creator_funder_match_count: 0,
+            creator_funder_match_sol: 0.0,
+            max_single_buyer_share: 0.52,
+            max_single_buyer: Some("a".to_string()),
+            creator_buy_count: 0,
+            creator_buy_sol: 0.0,
+            largest_funder_cluster_size: 1,
+            largest_funder_cluster_share: 0.50,
+            hotlist_funder_hits: 2,
+            hotlist_funder_diversity: 2,
+            elapsed_ms: 320,
+        };
+        let trigger = gate3_trigger_from_stats(&cfg, &stats).expect("quality cluster fast trigger");
+        assert_eq!(trigger.path, Gate3Path::Fast);
+        assert_eq!(trigger.threshold, 2);
+    }
+
+    #[test]
+    fn gate3_same_cluster_pressure_blocks_fast_path() {
+        let cfg = base_config();
+        let stats = WindowStats {
+            mode: SmartMoneyMode::EarlyBuyerFallback,
+            fast_threshold: 2,
+            soft_threshold: 3,
+            unique_sm_wallets: ["a".to_string(), "b".to_string(), "c".to_string()]
+                .into_iter()
+                .collect(),
+            sm_sol_total: 1.40,
+            total_eligible_sol: 1.40,
+            fastest_sm_ms: Some(50),
+            fast_reached_at_ms: Some(120),
+            soft_reached_at_ms: Some(220),
+            buy_count: 3,
+            eligible_buyers: 3,
+            unique_funders: 1,
+            creator_funder_match_count: 0,
+            creator_funder_match_sol: 0.0,
+            max_single_buyer_share: 0.45,
+            max_single_buyer: Some("a".to_string()),
+            creator_buy_count: 0,
+            creator_buy_sol: 0.0,
+            largest_funder_cluster_size: 3,
+            largest_funder_cluster_share: 1.0,
+            hotlist_funder_hits: 0,
+            hotlist_funder_diversity: 0,
+            elapsed_ms: 220,
+        };
+        let trigger = gate3_trigger_from_stats(&cfg, &stats).expect("soft trigger");
+        assert_eq!(trigger.path, Gate3Path::Soft);
+        assert_eq!(trigger.threshold, 3);
     }
 
     #[test]
@@ -2969,13 +4218,16 @@ mod tests {
                 bonding_curve: String::new(),
                 signature: String::new(),
                 slot: 0,
-                discovered_at_ms: 0,
+                detected_at_ms: 0,
+                instruction_data: Vec::new(),
+                instruction_accounts: Vec::new(),
                 feed_source: "test".to_string(),
                 is_v2: true,
             },
             created_at: Instant::now(),
-            discovered_at_ms: 0,
+            detected_at_ms: 0,
             status: CandidateStatus::Active,
+            gate1_risk: Gate1RiskProfile::default(),
             narrative_keywords: Vec::new(),
             dynamic_narrative_keywords: Vec::new(),
             early_buys: Vec::new(),
@@ -2998,13 +4250,20 @@ mod tests {
             buy_count: 1,
             eligible_buyers: 1,
             unique_funders: 0,
+            creator_funder_match_count: 0,
+            creator_funder_match_sol: 0.0,
             max_single_buyer_share: 1.0,
             max_single_buyer: Some("creator".to_string()),
             creator_buy_count: 1,
             creator_buy_sol: 3.00,
+            largest_funder_cluster_size: 0,
+            largest_funder_cluster_share: 0.0,
+            hotlist_funder_hits: 0,
+            hotlist_funder_diversity: 0,
             elapsed_ms: 100,
         };
-        let reason = gate3_reject_reason(&candidate, &stats, &cfg).expect("creator self-buy reject");
+        let reason =
+            gate3_reject_reason(&candidate, &stats, &cfg).expect("creator self-buy reject");
         assert!(reason.contains("creator self-buy"));
     }
 
@@ -3021,13 +4280,16 @@ mod tests {
                 bonding_curve: String::new(),
                 signature: String::new(),
                 slot: 0,
-                discovered_at_ms: 0,
+                detected_at_ms: 0,
+                instruction_data: Vec::new(),
+                instruction_accounts: Vec::new(),
                 feed_source: "test".to_string(),
                 is_v2: true,
             },
             created_at: Instant::now(),
-            discovered_at_ms: 0,
+            detected_at_ms: 0,
             status: CandidateStatus::Active,
+            gate1_risk: Gate1RiskProfile::default(),
             narrative_keywords: Vec::new(),
             dynamic_narrative_keywords: Vec::new(),
             early_buys: Vec::new(),
@@ -3052,10 +4314,16 @@ mod tests {
             buy_count: 2,
             eligible_buyers: 2,
             unique_funders: 0,
+            creator_funder_match_count: 0,
+            creator_funder_match_sol: 0.0,
             max_single_buyer_share: 0.66,
             max_single_buyer: Some("other".to_string()),
             creator_buy_count: 1,
             creator_buy_sol: 0.10,
+            largest_funder_cluster_size: 0,
+            largest_funder_cluster_share: 0.0,
+            hotlist_funder_hits: 0,
+            hotlist_funder_diversity: 0,
             elapsed_ms: 300,
         };
         assert!(gate3_reject_reason(&candidate, &stats, &cfg).is_none());
@@ -3074,13 +4342,16 @@ mod tests {
                 bonding_curve: String::new(),
                 signature: String::new(),
                 slot: 0,
-                discovered_at_ms: 0,
+                detected_at_ms: 0,
+                instruction_data: Vec::new(),
+                instruction_accounts: Vec::new(),
                 feed_source: "test".to_string(),
                 is_v2: true,
             },
             created_at: Instant::now(),
-            discovered_at_ms: 0,
+            detected_at_ms: 0,
             status: CandidateStatus::Active,
+            gate1_risk: Gate1RiskProfile::default(),
             narrative_keywords: Vec::new(),
             dynamic_narrative_keywords: Vec::new(),
             early_buys: Vec::new(),
@@ -3110,10 +4381,16 @@ mod tests {
             buy_count: 4,
             eligible_buyers: 4,
             unique_funders: 0,
+            creator_funder_match_count: 0,
+            creator_funder_match_sol: 0.0,
             max_single_buyer_share: 0.36,
             max_single_buyer: Some("creator".to_string()),
             creator_buy_count: 1,
             creator_buy_sol: 1.10,
+            largest_funder_cluster_size: 0,
+            largest_funder_cluster_share: 0.0,
+            hotlist_funder_hits: 0,
+            hotlist_funder_diversity: 0,
             elapsed_ms: 100,
         };
         assert!(gate3_reject_reason(&candidate, &stats, &cfg).is_none());
@@ -3128,6 +4405,79 @@ mod tests {
     }
 
     #[test]
+    fn gate3_rejects_creator_linked_cluster_concentration() {
+        let cfg = base_config();
+        let candidate = Candidate {
+            token: NewToken {
+                mint: "mint".to_string(),
+                name: "name".to_string(),
+                symbol: "sym".to_string(),
+                uri: String::new(),
+                creator: "creator".to_string(),
+                bonding_curve: String::new(),
+                signature: String::new(),
+                slot: 0,
+                detected_at_ms: 0,
+                instruction_data: Vec::new(),
+                instruction_accounts: Vec::new(),
+                feed_source: "test".to_string(),
+                is_v2: true,
+            },
+            created_at: Instant::now(),
+            detected_at_ms: 0,
+            status: CandidateStatus::Active,
+            gate1_risk: Gate1RiskProfile::default(),
+            narrative_keywords: Vec::new(),
+            dynamic_narrative_keywords: Vec::new(),
+            early_buys: Vec::new(),
+            buy_signatures: HashSet::new(),
+            creator_profile: Some(CreatorProfile {
+                address: "creator".to_string(),
+                total_tokens: 1,
+                graduated: 0,
+                rug_count: 0,
+                oldest_tx_ms: 0,
+                wallet_age_days: 0,
+                first_funder: Some("funder-a".to_string()),
+                fetched_at_ms: 0,
+            }),
+            buyer_profiles: HashMap::new(),
+            pending_buyer_profiles: HashSet::new(),
+            trace: CandidateTrace::default(),
+        };
+        let stats = WindowStats {
+            mode: SmartMoneyMode::EarlyBuyerFallback,
+            fast_threshold: 2,
+            soft_threshold: 2,
+            unique_sm_wallets: ["buyer-1".to_string(), "buyer-2".to_string()]
+                .into_iter()
+                .collect(),
+            sm_sol_total: 1.40,
+            total_eligible_sol: 1.50,
+            fastest_sm_ms: Some(20),
+            fast_reached_at_ms: Some(120),
+            soft_reached_at_ms: Some(120),
+            buy_count: 2,
+            eligible_buyers: 2,
+            unique_funders: 1,
+            creator_funder_match_count: 2,
+            creator_funder_match_sol: 1.35,
+            max_single_buyer_share: 0.51,
+            max_single_buyer: Some("buyer-1".to_string()),
+            creator_buy_count: 0,
+            creator_buy_sol: 0.0,
+            largest_funder_cluster_size: 2,
+            largest_funder_cluster_share: 0.9,
+            hotlist_funder_hits: 0,
+            hotlist_funder_diversity: 0,
+            elapsed_ms: 120,
+        };
+        let reason =
+            gate3_reject_reason(&candidate, &stats, &cfg).expect("creator-linked cluster reject");
+        assert!(reason.contains("creator-linked cluster"));
+    }
+
+    #[test]
     fn narrative_keywords_use_token_boundaries() {
         let token = NewToken {
             mint: "mint".to_string(),
@@ -3138,7 +4488,9 @@ mod tests {
             bonding_curve: String::new(),
             signature: String::new(),
             slot: 0,
-            discovered_at_ms: 0,
+            detected_at_ms: 0,
+            instruction_data: Vec::new(),
+            instruction_accounts: Vec::new(),
             feed_source: "test".to_string(),
             is_v2: true,
         };
@@ -3181,5 +4533,42 @@ mod tests {
             &hotlists,
         ));
         assert!(!buyer_matches_hotlist("other", None, &hotlists));
+    }
+
+    #[test]
+    fn upgrade_existing_buy_prefers_processed_signal_strength() {
+        let buyer = Pubkey::new_unique();
+        let token_program = Pubkey::new_unique();
+        let mut existing = PumpBuyEvent {
+            mint: "mint".to_string(),
+            buyer,
+            feed_source: "deshred_pre_exec".to_string(),
+            token_program,
+            sol_amount_lamports: 100_000_000,
+            instruction_data: vec![1],
+            instruction_accounts: vec![buyer],
+            signature: "sig".to_string(),
+            slot: 1,
+            detected_at_ms: 1,
+            detected_at: Instant::now(),
+        };
+        let incoming = PumpBuyEvent {
+            mint: "mint".to_string(),
+            buyer,
+            feed_source: "primary_processed".to_string(),
+            token_program,
+            sol_amount_lamports: 350_000_000,
+            instruction_data: vec![2],
+            instruction_accounts: vec![buyer, token_program],
+            signature: "sig".to_string(),
+            slot: 1,
+            detected_at_ms: 2,
+            detected_at: Instant::now(),
+        };
+
+        assert!(upgrade_existing_buy_event(&mut existing, &incoming));
+        assert_eq!(existing.feed_source, "primary_processed");
+        assert_eq!(existing.sol_amount_lamports, 350_000_000);
+        assert_eq!(existing.instruction_accounts.len(), 2);
     }
 }

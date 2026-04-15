@@ -1,8 +1,9 @@
+use crate::filter::{ExecutionReceiptRecord, FilterDb};
 use solana_client::rpc_client::RpcClient;
 use solana_sdk::pubkey::Pubkey;
 use solana_sdk::signature::Signature;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tracing::{debug, info, warn};
 
 use crate::autosell::{AutoSellManager, PositionKey};
@@ -11,6 +12,18 @@ use crate::telegram::{TgEvent, TgNotifier};
 use crate::utils::sol_price::SolUsdPrice;
 
 pub struct BuyConfirmer;
+
+#[derive(Debug, Clone)]
+pub struct BuyExecutionReceiptContext {
+    pub route_label: String,
+    pub path: String,
+    pub quality_score: u32,
+    pub urgency_score: u32,
+    pub execution_confidence: u32,
+    pub priority_fee_micro_lamport: u64,
+    pub jito_tip_lamports: u64,
+    pub zero_slot_tip_lamports: u64,
+}
 
 const BUY_CONFIRM_FAST_POLL_MS: u64 = 25;
 const BUY_CONFIRM_SLOW_POLL_MS: u64 = 80;
@@ -62,6 +75,8 @@ impl BuyConfirmer {
     #[allow(clippy::too_many_arguments)]
     pub fn spawn_confirm_task(
         rpc_client: Arc<RpcClient>,
+        execution_db: Arc<FilterDb>,
+        receipt_context: BuyExecutionReceiptContext,
         auto_sell: Arc<AutoSellManager>,
         bc_cache: BondingCurveCache,
         ata_cache: AtaBalanceCache,
@@ -80,6 +95,8 @@ impl BuyConfirmer {
         tokio::spawn(async move {
             let start = Instant::now();
             let mint_short = &mint.to_string()[..12];
+            let mint_string = mint.to_string();
+            let signature_string = signature.to_string();
             let buy_sol = entry_sol_amount as f64 / 1e9;
 
             info!(
@@ -142,6 +159,15 @@ impl BuyConfirmer {
                                         start.elapsed().as_millis(),
                                     );
                                     auto_sell.confirm_failed(&position_key, "tx failed on-chain");
+                                    persist_execution_receipt(
+                                        &execution_db,
+                                        &mint_string,
+                                        Some(signature_string.as_str()),
+                                        &receipt_context,
+                                        "dropped",
+                                        &format!("tx failed on-chain: {:?}", err),
+                                    )
+                                    .await;
                                     tg.send(TgEvent::BuyFailed {
                                         group_name: group_name.clone(),
                                         mint,
@@ -162,17 +188,13 @@ impl BuyConfirmer {
                         Ok(Err(err)) => {
                             debug!(
                                 "Buy confirm signature RPC error: [{}] {} | {}",
-                                group_name,
-                                mint_short,
-                                err,
+                                group_name, mint_short, err,
                             );
                         }
                         Err(err) => {
                             debug!(
                                 "Buy confirm signature task error: [{}] {} | {}",
-                                group_name,
-                                mint_short,
-                                err,
+                                group_name, mint_short, err,
                             );
                         }
                     }
@@ -212,17 +234,13 @@ impl BuyConfirmer {
                             Ok(Err(err)) => {
                                 debug!(
                                     "Buy confirm ATA RPC error: [{}] {} | {}",
-                                    group_name,
-                                    mint_short,
-                                    err,
+                                    group_name, mint_short, err,
                                 );
                             }
                             Err(err) => {
                                 debug!(
                                     "Buy confirm ATA task error: [{}] {} | {}",
-                                    group_name,
-                                    mint_short,
-                                    err,
+                                    group_name, mint_short, err,
                                 );
                             }
                         }
@@ -271,8 +289,7 @@ impl BuyConfirmer {
                                     };
 
                                     if owner_match {
-                                        if let Ok(amount) =
-                                            tb.ui_token_amount.amount.parse::<u64>()
+                                        if let Ok(amount) = tb.ui_token_amount.amount.parse::<u64>()
                                         {
                                             if amount > pre_buy_ata_balance {
                                                 token_balance = amount;
@@ -294,17 +311,13 @@ impl BuyConfirmer {
                     Ok(Err(err)) => {
                         warn!(
                             "Buy confirm getTransaction failed: [{}] {} | {}",
-                            group_name,
-                            mint_short,
-                            err,
+                            group_name, mint_short, err,
                         );
                     }
                     Err(err) => {
                         warn!(
                             "Buy confirm getTransaction task failed: [{}] {} | {}",
-                            group_name,
-                            mint_short,
-                            err,
+                            group_name, mint_short, err,
                         );
                     }
                 }
@@ -382,11 +395,7 @@ impl BuyConfirmer {
                     } else {
                         token_info.name.clone()
                     };
-                    auto_sell_info.update_token_info(
-                        &info_position_key,
-                        name,
-                        entry_mcap_sol_val,
-                    );
+                    auto_sell_info.update_token_info(&info_position_key, name, entry_mcap_sol_val);
                 });
 
                 let token_name_short = short_pubkey(&mint);
@@ -404,6 +413,20 @@ impl BuyConfirmer {
                     value_usd,
                     start.elapsed().as_millis(),
                 );
+                persist_execution_receipt(
+                    &execution_db,
+                    &mint_string,
+                    Some(signature_string.as_str()),
+                    &receipt_context,
+                    "landed",
+                    &format!(
+                        "ata_balance={} token_delta={} confirm_ms={}",
+                        token_balance,
+                        actual_delta,
+                        start.elapsed().as_millis()
+                    ),
+                )
+                .await;
 
                 tg.send(TgEvent::BuyConfirmed {
                     group_name: group_name.clone(),
@@ -445,6 +468,15 @@ impl BuyConfirmer {
                     start.elapsed().as_millis(),
                 );
                 auto_sell.confirm_failed(&position_key, "confirmed but zero balance");
+                persist_execution_receipt(
+                    &execution_db,
+                    &mint_string,
+                    Some(signature_string.as_str()),
+                    &receipt_context,
+                    "replaced",
+                    "transaction confirmed but ATA balance did not increase",
+                )
+                .await;
                 tg.send(TgEvent::BuyFailed {
                     group_name: group_name.clone(),
                     mint,
@@ -458,6 +490,15 @@ impl BuyConfirmer {
                     start.elapsed().as_millis(),
                 );
                 auto_sell.confirm_failed(&position_key, "timeout with zero balance");
+                persist_execution_receipt(
+                    &execution_db,
+                    &mint_string,
+                    Some(signature_string.as_str()),
+                    &receipt_context,
+                    "dropped",
+                    "buy confirmation timed out and ATA balance stayed unchanged",
+                )
+                .await;
                 tg.send(TgEvent::BuyFailed {
                     group_name,
                     mint,
@@ -477,7 +518,10 @@ impl BuyConfirmer {
         let user = *user_pubkey;
 
         let result = tokio::task::spawn_blocking(move || {
-            rpc.get_transaction(&signature, solana_transaction_status::UiTransactionEncoding::Json)
+            rpc.get_transaction(
+                &signature,
+                solana_transaction_status::UiTransactionEncoding::Json,
+            )
         })
         .await;
 
@@ -490,9 +534,11 @@ impl BuyConfirmer {
                             solana_transaction_status::UiMessage::Raw(msg) => {
                                 msg.account_keys.clone()
                             }
-                            solana_transaction_status::UiMessage::Parsed(msg) => {
-                                msg.account_keys.iter().map(|entry| entry.pubkey.clone()).collect()
-                            }
+                            solana_transaction_status::UiMessage::Parsed(msg) => msg
+                                .account_keys
+                                .iter()
+                                .map(|entry| entry.pubkey.clone())
+                                .collect(),
                         }
                     }
                     _ => return None,
@@ -557,6 +603,43 @@ impl BuyConfirmer {
             }
         }
     }
+}
+
+async fn persist_execution_receipt(
+    execution_db: &FilterDb,
+    mint: &str,
+    signature: Option<&str>,
+    context: &BuyExecutionReceiptContext,
+    status: &str,
+    detail: &str,
+) {
+    if let Err(err) = execution_db
+        .insert_execution_receipt(&ExecutionReceiptRecord {
+            mint: mint.to_string(),
+            signature: signature.map(str::to_string),
+            route_label: context.route_label.clone(),
+            status: status.to_string(),
+            detail: detail.to_string(),
+            path: context.path.clone(),
+            quality_score: context.quality_score,
+            urgency_score: context.urgency_score,
+            execution_confidence: context.execution_confidence,
+            priority_fee_micro_lamport: context.priority_fee_micro_lamport,
+            jito_tip_lamports: context.jito_tip_lamports,
+            zero_slot_tip_lamports: context.zero_slot_tip_lamports,
+            recorded_at_ms: now_ms(),
+        })
+        .await
+    {
+        warn!("execution {} receipt failed | {}", status, err);
+    }
+}
+
+fn now_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_millis() as u64)
+        .unwrap_or_default()
 }
 
 fn short_pubkey(pubkey: &Pubkey) -> String {
