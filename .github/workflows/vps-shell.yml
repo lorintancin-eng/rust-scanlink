@@ -38,6 +38,7 @@ jobs:
           port: ${{ secrets.VPS_PORT }}
           script_stop: true
           script: |
+            bash <<'EOF'
             set -euo pipefail
             cd /home/ubuntu/rust-scanlink
 
@@ -131,7 +132,7 @@ jobs:
 
                 TS="$(date +%Y%m%d-%H%M%S)"
                 LOG_FILE="scanner-$TS.log"
-                nohup sh -c 'cd /home/ubuntu/rust-scanlink && if [ -f ./.env ]; then set -a; . ./.env; set +a; fi; exec ./rust-scanlink-trader' \
+                nohup bash -lc 'cd /home/ubuntu/rust-scanlink && if [ -f ./.env ]; then set -a; . ./.env; set +a; fi; exec ./rust-scanlink-trader' \
                   >> "/home/ubuntu/rust-scanlink/$LOG_FILE" 2>&1 < /dev/null &
                 sleep 5
 
@@ -198,3 +199,4 @@ jobs:
                 exit 1
                 ;;
             esac
+            EOF
