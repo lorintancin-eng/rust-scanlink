@@ -172,6 +172,24 @@ pub struct DynamicKeywordRecord {
 }
 
 #[derive(Debug, Clone)]
+pub struct UriPatternRecord {
+    pub pattern: String,
+    pub label: String,
+    pub risk_score: i32,
+    pub mint_count: u32,
+    pub last_seen_ms: u64,
+}
+
+#[derive(Debug, Clone)]
+pub struct CreatorTemplateRecord {
+    pub creator: String,
+    pub template_hash: String,
+    pub repeat_count: u32,
+    pub last_mint: Option<String>,
+    pub updated_at_ms: u64,
+}
+
+#[derive(Debug, Clone)]
 pub struct LabelSuggestionRecord {
     pub label_type: String,
     pub subject: String,
@@ -741,6 +759,103 @@ impl FilterDb {
                 )?;
             }
             tx.commit()?;
+            Ok(())
+        })
+        .await
+    }
+
+    pub async fn upsert_uri_pattern(&self, record: &UriPatternRecord) -> Result<()> {
+        let record = record.clone();
+        self.with_conn(move |conn| {
+            conn.execute(
+                "INSERT INTO uri_patterns(pattern, label, risk_score, mint_count, last_seen_ms)
+                 VALUES(?1, ?2, ?3, ?4, ?5)
+                 ON CONFLICT(pattern) DO UPDATE SET
+                    label = excluded.label,
+                    risk_score = CASE
+                        WHEN excluded.risk_score > uri_patterns.risk_score THEN excluded.risk_score
+                        ELSE uri_patterns.risk_score
+                    END,
+                    mint_count = uri_patterns.mint_count + excluded.mint_count,
+                    last_seen_ms = excluded.last_seen_ms",
+                params![
+                    record.pattern,
+                    record.label,
+                    record.risk_score,
+                    record.mint_count,
+                    record.last_seen_ms,
+                ],
+            )?;
+            Ok(())
+        })
+        .await
+    }
+
+    pub async fn record_creator_template(
+        &self,
+        creator: &str,
+        template_hash: &str,
+        last_mint: Option<&str>,
+        updated_at_ms: u64,
+    ) -> Result<u32> {
+        let creator = creator.to_string();
+        let template_hash = template_hash.to_string();
+        let last_mint = last_mint.map(str::to_string);
+        self.with_conn(move |conn| {
+            let existing: Option<u32> = conn
+                .query_row(
+                    "SELECT repeat_count
+                     FROM creator_templates
+                     WHERE creator = ?1 AND template_hash = ?2",
+                    params![&creator, &template_hash],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            let next_count = existing.unwrap_or(0).saturating_add(1);
+            conn.execute(
+                "INSERT INTO creator_templates(creator, template_hash, repeat_count, last_mint, updated_at_ms)
+                 VALUES(?1, ?2, ?3, ?4, ?5)
+                 ON CONFLICT(creator, template_hash) DO UPDATE SET
+                    repeat_count = excluded.repeat_count,
+                    last_mint = excluded.last_mint,
+                    updated_at_ms = excluded.updated_at_ms",
+                params![&creator, &template_hash, next_count, last_mint, updated_at_ms],
+            )?;
+            Ok(next_count)
+        })
+        .await
+    }
+
+    pub async fn get_funder_blacklist_reason(&self, address: &str) -> Result<Option<String>> {
+        let address = address.to_string();
+        self.with_conn(move |conn| {
+            conn.query_row(
+                "SELECT reason FROM funder_blacklist WHERE address = ?1",
+                params![address],
+                |row| row.get(0),
+            )
+            .optional()
+        })
+        .await
+    }
+
+    pub async fn upsert_funder_blacklist(
+        &self,
+        address: &str,
+        reason: &str,
+        updated_at_ms: u64,
+    ) -> Result<()> {
+        let address = address.to_string();
+        let reason = reason.to_string();
+        self.with_conn(move |conn| {
+            conn.execute(
+                "INSERT INTO funder_blacklist(address, reason, updated_at_ms)
+                 VALUES(?1, ?2, ?3)
+                 ON CONFLICT(address) DO UPDATE SET
+                    reason = excluded.reason,
+                    updated_at_ms = excluded.updated_at_ms",
+                params![address, reason, updated_at_ms],
+            )?;
             Ok(())
         })
         .await
@@ -1449,6 +1564,26 @@ fn init_db(path: &Path) -> Result<()> {
             score INTEGER NOT NULL,
             mint TEXT,
             created_at_ms INTEGER NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS uri_patterns (
+            pattern TEXT PRIMARY KEY,
+            label TEXT NOT NULL,
+            risk_score INTEGER NOT NULL DEFAULT 0,
+            mint_count INTEGER NOT NULL DEFAULT 0,
+            last_seen_ms INTEGER NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS creator_templates (
+            creator TEXT NOT NULL,
+            template_hash TEXT NOT NULL,
+            repeat_count INTEGER NOT NULL DEFAULT 0,
+            last_mint TEXT,
+            updated_at_ms INTEGER NOT NULL,
+            PRIMARY KEY(creator, template_hash)
+        );
+        CREATE TABLE IF NOT EXISTS funder_blacklist (
+            address TEXT PRIMARY KEY,
+            reason TEXT NOT NULL,
+            updated_at_ms INTEGER NOT NULL
         );
         CREATE TABLE IF NOT EXISTS address_clusters (
             cluster_id TEXT NOT NULL,

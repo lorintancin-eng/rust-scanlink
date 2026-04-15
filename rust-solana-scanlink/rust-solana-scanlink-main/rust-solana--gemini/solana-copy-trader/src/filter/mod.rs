@@ -1,5 +1,6 @@
 mod db;
 mod engine;
+mod risk;
 
 pub use db::{
     CreatorProfile, ExecutionReceiptRecord, FeedFirstHitRecord, FeedHealthRecord, FilterDb,

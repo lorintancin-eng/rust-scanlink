@@ -4,6 +4,11 @@ use crate::filter::db::{
     DynamicKeywordRecord, FeedHealthRecord, FilterDb, FilterResultRecord, FilterTimingRecord,
     FunderProfile, Gate3SequenceRecord, Gate3SnapshotRecord, LabelSuggestionRecord,
     PostTradeOutcomeRecord, RawEventRecord, RiskSignalRecord, ScoringBreakdownRecord,
+    UriPatternRecord,
+};
+use crate::filter::risk::{
+    analyze_gate1_risk, analyze_runtime_risk, derive_template_identity, Gate1RiskProfile,
+    RiskSignalSeed, RuntimeRiskInput,
 };
 use crate::processor::pumpfun::BondingCurveState;
 use crate::scanner::{
@@ -109,6 +114,7 @@ struct Candidate {
     created_at: Instant,
     discovered_at_ms: u64,
     status: CandidateStatus,
+    gate1_risk: Gate1RiskProfile,
     narrative_keywords: Vec<String>,
     dynamic_narrative_keywords: Vec<String>,
     early_buys: Vec<PumpBuyEvent>,
@@ -405,6 +411,7 @@ pub async fn run(
 struct Gate1Decision {
     passed: bool,
     reason: String,
+    risk: Gate1RiskProfile,
     narrative_keywords: Vec<String>,
     dynamic_narrative_keywords: Vec<String>,
 }
@@ -442,7 +449,14 @@ async fn handle_new_token(
     persist_raw_new_token_event(shared, &token).await;
 
     let gate1 = gate1_check(shared, creator_window, &token).await;
-    if !gate1.passed {
+    let Gate1Decision {
+        passed: gate1_passed,
+        reason: gate1_reason,
+        risk: gate1_risk,
+        narrative_keywords: gate1_narrative_keywords,
+        dynamic_narrative_keywords: gate1_dynamic_keywords,
+    } = gate1;
+    if !gate1_passed {
         let trace = CandidateTrace {
             gate1_at_ms: Some(now_ms()),
             ..Default::default()
@@ -454,11 +468,16 @@ async fn handle_new_token(
             false,
             Some("gate1".to_string()),
             None,
-            gate1.reason,
+            gate1_reason,
             "gate1".to_string(),
             "immediate".to_string(),
             0,
             0,
+            Some(risk_signal_records_from_seeds(
+                &token.mint,
+                &gate1_risk.signals,
+                now_ms(),
+            )),
         )
         .await;
         return Ok(());
@@ -472,8 +491,9 @@ async fn handle_new_token(
             created_at: Instant::now(),
             discovered_at_ms: token.discovered_at_ms,
             status: CandidateStatus::CreatorPending,
-            narrative_keywords: gate1.narrative_keywords,
-            dynamic_narrative_keywords: gate1.dynamic_narrative_keywords,
+            gate1_risk: gate1_risk,
+            narrative_keywords: gate1_narrative_keywords,
+            dynamic_narrative_keywords: gate1_dynamic_keywords,
             early_buys: Vec::new(),
             buy_signatures: HashSet::new(),
             creator_profile: None,
@@ -828,6 +848,7 @@ async fn gate1_check(
         return Gate1Decision {
             passed: false,
             reason: "gate1 reject: creator blacklist hit".to_string(),
+            risk: Gate1RiskProfile::default(),
             narrative_keywords: Vec::new(),
             dynamic_narrative_keywords: Vec::new(),
         };
@@ -850,6 +871,7 @@ async fn gate1_check(
                 "gate1 reject: factory creator pattern ({} launches in 5m)",
                 window.len()
             ),
+            risk: Gate1RiskProfile::default(),
             narrative_keywords: Vec::new(),
             dynamic_narrative_keywords: Vec::new(),
         };
@@ -859,6 +881,7 @@ async fn gate1_check(
         return Gate1Decision {
             passed: false,
             reason: "gate1 reject: empty name or symbol".to_string(),
+            risk: Gate1RiskProfile::default(),
             narrative_keywords: Vec::new(),
             dynamic_narrative_keywords: Vec::new(),
         };
@@ -870,6 +893,7 @@ async fn gate1_check(
                 "gate1 reject: symbol too long ({})",
                 token.symbol.chars().count()
             ),
+            risk: Gate1RiskProfile::default(),
             narrative_keywords: Vec::new(),
             dynamic_narrative_keywords: Vec::new(),
         };
@@ -884,6 +908,7 @@ async fn gate1_check(
         return Gate1Decision {
             passed: false,
             reason: format!("gate1 reject: blacklist keyword {}", keyword),
+            risk: Gate1RiskProfile::default(),
             narrative_keywords: Vec::new(),
             dynamic_narrative_keywords: Vec::new(),
         };
@@ -891,10 +916,52 @@ async fn gate1_check(
 
     let (narrative_keywords, dynamic_narrative_keywords) =
         collect_narrative_keywords(token, &hotlists.dynamic_hot_keywords);
+    drop(hotlists);
+
+    let (uri_host, uri_pattern, template_hash) = derive_template_identity(token);
+    let template_repeat_count = shared
+        .db
+        .record_creator_template(&token.creator, &template_hash, Some(&token.mint), now)
+        .await
+        .unwrap_or(1);
+    let risk = analyze_gate1_risk(
+        token,
+        uri_host.clone(),
+        uri_pattern.clone(),
+        template_hash,
+        template_repeat_count,
+        shared.config.as_ref(),
+    );
+    if let Some(pattern) = uri_pattern {
+        let label = uri_host.unwrap_or_else(|| "unknown".to_string());
+        if let Err(err) = shared
+            .db
+            .upsert_uri_pattern(&UriPatternRecord {
+                pattern,
+                label,
+                risk_score: risk.penalty_score as i32,
+                mint_count: 1,
+                last_seen_ms: now,
+            })
+            .await
+        {
+            warn!("upsert uri pattern failed | mint={} | {}", token.mint, err);
+        }
+    }
+    if let Some(reason) = risk.hard_reject_reason.clone() {
+        return Gate1Decision {
+            passed: false,
+            reason,
+            risk,
+            narrative_keywords,
+            dynamic_narrative_keywords,
+        };
+    }
 
     Gate1Decision {
         passed: true,
         reason: "gate1 pass".to_string(),
+        risk,
         narrative_keywords,
         dynamic_narrative_keywords,
     }
@@ -952,6 +1019,12 @@ async fn apply_creator_entity_rules(
     let Some(funder) = profile.first_funder.as_deref() else {
         return Ok(result);
     };
+
+    if let Some(reason) = shared.db.get_funder_blacklist_reason(funder).await? {
+        result.passed = false;
+        result.reason = format!("gate2 reject: funder blacklist hit {} ({})", funder, reason);
+        return Ok(result);
+    }
 
     let Some(funder_profile) = shared.db.get_funder_profile(funder).await? else {
         return Ok(result);
@@ -1601,9 +1674,24 @@ async fn score_candidate(shared: &SharedState, mut candidate: Candidate) -> Scor
     } else {
         0
     };
-    let quality_score = sm_count_score + sm_sol_score + curve_score + buyer_quality_score
-        - funder_diversity_penalty
-            .min(sm_count_score + sm_sol_score + curve_score + buyer_quality_score);
+    let runtime_risk = analyze_runtime_risk(
+        &candidate.gate1_risk,
+        RuntimeRiskInput {
+            eligible_buyers: stats.eligible_buyers,
+            unique_funders: stats.unique_funders,
+            total_eligible_sol: stats.total_eligible_sol,
+            creator_funder_match_count: stats.creator_funder_match_count,
+            creator_funder_match_sol: stats.creator_funder_match_sol,
+            max_single_buyer_share: stats.max_single_buyer_share,
+        },
+        shared.config.as_ref(),
+    );
+    let base_quality_score = sm_count_score + sm_sol_score + curve_score + buyer_quality_score;
+    let quality_score = base_quality_score.saturating_sub(
+        funder_diversity_penalty
+            .saturating_add(runtime_risk.penalty_score)
+            .min(base_quality_score),
+    );
     let urgency_score = momentum_score + dynamic_narrative_bonus;
     let execution_confidence = quality_score.saturating_add(urgency_score).min(100);
     let total_score = quality_score + urgency_score;
@@ -1618,7 +1706,7 @@ async fn score_candidate(shared: &SharedState, mut candidate: Candidate) -> Scor
             .min(shared.config.filter_min_score),
     };
     let reason = format!(
-        "mode={} path={} participants={} capital={} momentum={} curve={} buyer_quality={} narrative_bonus={} total={} required={} | matched={} eligible={} sol={:.2} fastest={}ms narrative={}",
+        "mode={} path={} participants={} capital={} momentum={} curve={} buyer_quality={} narrative_bonus={} risk_penalty={} total={} required={} | matched={} eligible={} sol={:.2} fastest={}ms narrative={}",
         smart_money_mode_label(stats.mode),
         gate3_path_label(trigger.path),
         sm_count_score,
@@ -1627,6 +1715,7 @@ async fn score_candidate(shared: &SharedState, mut candidate: Candidate) -> Scor
         curve_score,
         buyer_quality_score,
         dynamic_narrative_bonus,
+        runtime_risk.penalty_score,
         total_score,
         required_score,
         stats.unique_sm_wallets.len(),
@@ -2645,6 +2734,7 @@ async fn record_candidate_outcome(
         path,
         early_buy_count,
         matched_buyers,
+        None,
     )
     .await;
     persist_candidate_analytics(
@@ -2681,6 +2771,7 @@ async fn record_token_outcome(
     path: String,
     early_buy_count: usize,
     matched_buyers: usize,
+    risk_signals: Option<Vec<RiskSignalRecord>>,
 ) {
     let final_at_ms = now_ms();
     let latency_ms = final_at_ms.saturating_sub(token.discovered_at_ms);
@@ -2746,6 +2837,21 @@ async fn record_token_outcome(
     .await
     {
         warn!("filter latency append failed: {}", err);
+    }
+
+    if let Some(risk_signals) = risk_signals {
+        if !risk_signals.is_empty() {
+            if let Err(err) = shared
+                .db
+                .replace_risk_signals(&token.mint, &risk_signals)
+                .await
+            {
+                warn!(
+                    "replace risk signals failed | mint={} | {}",
+                    token.mint, err
+                );
+            }
+        }
     }
 
     if passed {
@@ -3190,9 +3296,25 @@ async fn persist_candidate_analytics(
         } else {
             0
         };
-        let quality_score = participants_score + capital_score + curve_score + buyer_quality_score
-            - funder_diversity_penalty
-                .min(participants_score + capital_score + curve_score + buyer_quality_score);
+        let runtime_risk = analyze_runtime_risk(
+            &candidate.gate1_risk,
+            RuntimeRiskInput {
+                eligible_buyers: stats.eligible_buyers,
+                unique_funders: stats.unique_funders,
+                total_eligible_sol: stats.total_eligible_sol,
+                creator_funder_match_count: stats.creator_funder_match_count,
+                creator_funder_match_sol: stats.creator_funder_match_sol,
+                max_single_buyer_share: stats.max_single_buyer_share,
+            },
+            shared.config.as_ref(),
+        );
+        let base_quality_score =
+            participants_score + capital_score + curve_score + buyer_quality_score;
+        let quality_score = base_quality_score.saturating_sub(
+            funder_diversity_penalty
+                .saturating_add(runtime_risk.penalty_score)
+                .min(base_quality_score),
+        );
         let urgency_score = momentum_score + dynamic_bonus;
         let total_score = quality_score + urgency_score;
         let required_score = match path {
@@ -3217,6 +3339,17 @@ async fn persist_candidate_analytics(
             "curve_score": curve_score,
             "buyer_quality_score": buyer_quality_score,
             "funder_diversity_penalty": funder_diversity_penalty,
+            "risk_penalty": runtime_risk.penalty_score,
+            "risk_signals": runtime_risk
+                .signals
+                .iter()
+                .map(|signal| json!({
+                    "type": signal.signal_type,
+                    "value": signal.signal_value,
+                    "score": signal.score,
+                    "severity": format!("{:?}", signal.severity),
+                }))
+                .collect::<Vec<_>>(),
             "creator_funder_match_count": stats.creator_funder_match_count,
             "creator_funder_match_sol": stats.creator_funder_match_sol,
             "dynamic_narrative_bonus": dynamic_bonus,
@@ -3243,7 +3376,13 @@ async fn persist_candidate_analytics(
         }
     }
 
-    let risk_signals = build_risk_signals(candidate, reject_gate, reason);
+    let risk_signals = build_risk_signals(
+        candidate,
+        &stats,
+        reject_gate,
+        reason,
+        shared.config.as_ref(),
+    );
     if !risk_signals.is_empty() {
         if let Err(err) = shared
             .db
@@ -3271,11 +3410,34 @@ async fn persist_candidate_analytics(
 
 fn build_risk_signals(
     candidate: &Candidate,
+    stats: &WindowStats,
     reject_gate: Option<&str>,
     reason: &str,
+    config: &AppConfig,
 ) -> Vec<RiskSignalRecord> {
-    let mut signals = Vec::new();
     let detected_at_ms = now_ms();
+    let runtime_risk = analyze_runtime_risk(
+        &candidate.gate1_risk,
+        RuntimeRiskInput {
+            eligible_buyers: stats.eligible_buyers,
+            unique_funders: stats.unique_funders,
+            total_eligible_sol: stats.total_eligible_sol,
+            creator_funder_match_count: stats.creator_funder_match_count,
+            creator_funder_match_sol: stats.creator_funder_match_sol,
+            max_single_buyer_share: stats.max_single_buyer_share,
+        },
+        config,
+    );
+    let mut signals = risk_signal_records_from_seeds(
+        &candidate.token.mint,
+        &candidate.gate1_risk.signals,
+        detected_at_ms,
+    );
+    signals.extend(risk_signal_records_from_seeds(
+        &candidate.token.mint,
+        &runtime_risk.signals,
+        detected_at_ms,
+    ));
     let mut push = |signal_type: &str, signal_value: &str, score: i32| {
         signals.push(RiskSignalRecord {
             mint: candidate.token.mint.clone(),
@@ -3303,7 +3465,30 @@ fn build_risk_signals(
     if reason.contains("early concentration") {
         push("buy_concentration", reason, 60);
     }
+    if let Some(host) = candidate.gate1_risk.uri_host.as_deref() {
+        push("uri_host", host, 10);
+    }
+    if let Some(pattern) = candidate.gate1_risk.uri_pattern.as_deref() {
+        push("uri_pattern", pattern, 10);
+    }
     signals
+}
+
+fn risk_signal_records_from_seeds(
+    mint: &str,
+    seeds: &[RiskSignalSeed],
+    detected_at_ms: u64,
+) -> Vec<RiskSignalRecord> {
+    seeds
+        .iter()
+        .map(|seed| RiskSignalRecord {
+            mint: mint.to_string(),
+            signal_type: seed.signal_type.clone(),
+            signal_value: seed.signal_value.clone(),
+            score: seed.score,
+            detected_at_ms,
+        })
+        .collect()
 }
 
 fn build_label_suggestions(
@@ -3343,6 +3528,21 @@ fn build_label_suggestions(
             mint: Some(candidate.token.mint.clone()),
             created_at_ms: now,
         });
+    } else if reject_gate == Some("gate2") && reason.contains("funder") {
+        if let Some(funder) = candidate
+            .creator_profile
+            .as_ref()
+            .and_then(|profile| profile.first_funder.clone())
+        {
+            out.push(LabelSuggestionRecord {
+                label_type: "funder_blacklist_candidate".to_string(),
+                subject: funder,
+                reason: reason.to_string(),
+                score: 80,
+                mint: Some(candidate.token.mint.clone()),
+                created_at_ms: now,
+            });
+        }
     }
     out
 }
@@ -3428,6 +3628,14 @@ mod tests {
             filter_soft_min_score: 58,
             dynamic_narrative_bonus_per_hit: 3,
             dynamic_narrative_bonus_cap: 6,
+            risk_template_repeat_threshold: 3,
+            risk_template_hard_reject_threshold: 6,
+            risk_template_penalty_score: 8,
+            risk_uri_penalty_score: 8,
+            risk_concentration_penalty_score: 8,
+            risk_liquidity_penalty_score: 6,
+            risk_creator_funder_penalty_score: 7,
+            risk_penalty_cap: 18,
             scanner_idle_timeout_secs: 0,
             creator_gate_timeout_ms: 1_500,
             creator_min_wallet_age_days: 1,
@@ -3579,6 +3787,7 @@ mod tests {
             created_at: Instant::now(),
             discovered_at_ms: 0,
             status: CandidateStatus::Active,
+            gate1_risk: Gate1RiskProfile::default(),
             narrative_keywords: Vec::new(),
             dynamic_narrative_keywords: Vec::new(),
             early_buys: Vec::new(),
@@ -3634,6 +3843,7 @@ mod tests {
             created_at: Instant::now(),
             discovered_at_ms: 0,
             status: CandidateStatus::Active,
+            gate1_risk: Gate1RiskProfile::default(),
             narrative_keywords: Vec::new(),
             dynamic_narrative_keywords: Vec::new(),
             early_buys: Vec::new(),
@@ -3689,6 +3899,7 @@ mod tests {
             created_at: Instant::now(),
             discovered_at_ms: 0,
             status: CandidateStatus::Active,
+            gate1_risk: Gate1RiskProfile::default(),
             narrative_keywords: Vec::new(),
             dynamic_narrative_keywords: Vec::new(),
             early_buys: Vec::new(),
@@ -3757,6 +3968,7 @@ mod tests {
             created_at: Instant::now(),
             discovered_at_ms: 0,
             status: CandidateStatus::Active,
+            gate1_risk: Gate1RiskProfile::default(),
             narrative_keywords: Vec::new(),
             dynamic_narrative_keywords: Vec::new(),
             early_buys: Vec::new(),
