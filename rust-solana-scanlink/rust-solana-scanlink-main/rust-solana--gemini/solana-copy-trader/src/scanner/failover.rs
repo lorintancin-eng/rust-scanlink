@@ -121,6 +121,25 @@ impl FeedRuntimeState {
             + self.first_hit_count.min(100) as i32
             + self.stale_penalty(now_ms, stale_after_ms)
     }
+
+    fn stale_ms(&self, now_ms: u64) -> u64 {
+        now_ms.saturating_sub(self.last_status_ms.max(self.last_first_hit_ms))
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct FeedRuntimeSnapshot {
+    pub feed_label: String,
+    pub feed_url: String,
+    pub kind: FeedKind,
+    pub status: FeedRuntimeStatus,
+    pub detail: String,
+    pub last_status_ms: u64,
+    pub last_first_hit_ms: u64,
+    pub first_hit_count: u64,
+    pub score: i32,
+    pub stale_ms: u64,
+    pub is_preferred: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -191,6 +210,48 @@ impl FailoverController {
     pub fn snapshot(&self) -> Vec<FeedRuntimeState> {
         let mut rows: Vec<_> = self.feeds.values().cloned().collect();
         rows.sort_by(|left, right| left.feed_label.cmp(&right.feed_label));
+        rows
+    }
+
+    pub fn preferred_label(&self, kind: FeedKind) -> Option<&str> {
+        match kind {
+            FeedKind::Processed => self.preferred_processed.as_deref(),
+            FeedKind::Deshred => self.preferred_deshred.as_deref(),
+        }
+    }
+
+    pub fn runtime_snapshots(&self, now_ms: u64) -> Vec<FeedRuntimeSnapshot> {
+        let mut rows: Vec<_> = self
+            .feeds
+            .values()
+            .map(|state| FeedRuntimeSnapshot {
+                feed_label: state.feed_label.clone(),
+                feed_url: state.feed_url.clone(),
+                kind: state.kind,
+                status: state.status,
+                detail: state.detail.clone(),
+                last_status_ms: state.last_status_ms,
+                last_first_hit_ms: state.last_first_hit_ms,
+                first_hit_count: state.first_hit_count,
+                score: state.priority_score(now_ms, self.stale_after_ms),
+                stale_ms: state.stale_ms(now_ms),
+                is_preferred: match state.kind {
+                    FeedKind::Processed => {
+                        self.preferred_processed.as_deref() == Some(state.feed_label.as_str())
+                    }
+                    FeedKind::Deshred => {
+                        self.preferred_deshred.as_deref() == Some(state.feed_label.as_str())
+                    }
+                },
+            })
+            .collect();
+        rows.sort_by(|left, right| {
+            right
+                .is_preferred
+                .cmp(&left.is_preferred)
+                .then_with(|| right.score.cmp(&left.score))
+                .then_with(|| left.feed_label.cmp(&right.feed_label))
+        });
         rows
     }
 
