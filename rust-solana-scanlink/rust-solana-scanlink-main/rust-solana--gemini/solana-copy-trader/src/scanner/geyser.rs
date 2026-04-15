@@ -1,6 +1,8 @@
 use crate::config::AppConfig;
 use crate::filter::{FeedFirstHitRecord, FeedHealthRecord, FilterDb};
-use crate::scanner::failover::{FailoverController, FeedFirstHitEvent, FeedHealthEvent};
+use crate::scanner::failover::{
+    FailoverController, FeedFirstHitEvent, FeedHealthEvent, FeedRuntimeSnapshot,
+};
 use crate::scanner::feed::{FeedEndpoint, FeedKind};
 use crate::scanner::raw_event::raw_event_to_scanner_event;
 use crate::scanner::{decoder, deshred, ScannerEvent, PUMP_PROGRAM_ID};
@@ -79,6 +81,15 @@ pub async fn start(cfg: Arc<AppConfig>, tx: mpsc::Sender<ScannerEvent>) -> Resul
 
     if let Some(db) = db.as_ref() {
         replay_pending_raw_events(cfg.as_ref(), db, &raw_tx).await?;
+    }
+
+    if cfg.scanner_health_snapshot_secs > 0 {
+        let snapshot_cfg = cfg.clone();
+        let snapshot_db = db.clone();
+        let snapshot_failover = failover.clone();
+        tokio::spawn(async move {
+            feed_runtime_snapshot_loop(snapshot_cfg, snapshot_db, snapshot_failover).await;
+        });
     }
 
     for endpoint in processed_endpoints {
@@ -647,4 +658,79 @@ async fn replay_pending_raw_events(
     }
 
     Ok(())
+}
+
+async fn feed_runtime_snapshot_loop(
+    cfg: Arc<AppConfig>,
+    db: Option<FilterDb>,
+    failover: Arc<Mutex<FailoverController>>,
+) {
+    if cfg.scanner_health_snapshot_secs == 0 {
+        return;
+    }
+
+    let mut tick = tokio::time::interval(Duration::from_secs(
+        cfg.scanner_health_snapshot_secs.max(5),
+    ));
+    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    tick.tick().await;
+
+    loop {
+        tick.tick().await;
+        let snapshots = {
+            let guard = failover.lock().await;
+            guard.runtime_snapshots(now_ms())
+        };
+        if snapshots.is_empty() {
+            continue;
+        }
+        persist_feed_runtime_snapshots(db.as_ref(), cfg.as_ref(), &snapshots).await;
+    }
+}
+
+async fn persist_feed_runtime_snapshots(
+    db: Option<&FilterDb>,
+    cfg: &AppConfig,
+    snapshots: &[FeedRuntimeSnapshot],
+) {
+    for snapshot in snapshots {
+        let detail = format!(
+            "kind={:?} preferred={} score={} first_hits={} stale_ms={} last_status_ms={} last_first_hit_ms={} detail={}",
+            snapshot.kind,
+            snapshot.is_preferred,
+            snapshot.score,
+            snapshot.first_hit_count,
+            snapshot.stale_ms,
+            snapshot.last_status_ms,
+            snapshot.last_first_hit_ms,
+            snapshot.detail,
+        );
+        info!(
+            "scanner: feed runtime snapshot | label={} | status={:?} | preferred={} | score={} | first_hits={} | stale_ms={}",
+            snapshot.feed_label,
+            snapshot.status,
+            snapshot.is_preferred,
+            snapshot.score,
+            snapshot.first_hit_count,
+            snapshot.stale_ms,
+        );
+        if !cfg.persist_feed_health {
+            continue;
+        }
+        let Some(db) = db else {
+            continue;
+        };
+        if let Err(err) = db
+            .insert_feed_health(&FeedHealthRecord {
+                feed_label: snapshot.feed_label.clone(),
+                feed_url: snapshot.feed_url.clone(),
+                status: "runtime_snapshot".to_string(),
+                detail,
+                ts_ms: now_ms(),
+            })
+            .await
+        {
+            warn!("scanner: insert runtime feed snapshot failed | {}", err);
+        }
+    }
 }
