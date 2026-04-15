@@ -1,6 +1,6 @@
 use crate::filter::{
-    FeedHealthRecord, FilterDb, FilterResultRecord, FilterTimingRecord, Gate3SnapshotRecord,
-    PostTradeOutcomeRecord, ScoringBreakdownRecord,
+    FeedFirstHitRecord, FeedHealthRecord, FilterDb, FilterResultRecord, FilterTimingRecord,
+    Gate3SnapshotRecord, PostTradeOutcomeRecord, ScoringBreakdownRecord,
 };
 use anyhow::Result;
 use serde::Serialize;
@@ -18,6 +18,7 @@ pub struct ReplayReport {
     pub pass_latency_ms: PercentileSummary,
     pub feed_breakdown: Vec<NamedCount>,
     pub first_hit_breakdown: Vec<NamedCount>,
+    pub first_hit_event_breakdown: Vec<NamedCount>,
     pub feed_health_breakdown: Vec<NamedCount>,
     pub gate_breakdown: Vec<NamedCount>,
     pub path_breakdown: Vec<NamedCount>,
@@ -25,6 +26,7 @@ pub struct ReplayReport {
     pub execution_status_breakdown: Vec<NamedCount>,
     pub execution_route_breakdown: Vec<NamedCount>,
     pub first_hit_lag_ms: PercentileSummary,
+    pub first_hit_lag_by_source: Vec<NamedPercentileSummary>,
     pub top_passes: Vec<PassSummary>,
     pub outcome_summary: OutcomeSummary,
 }
@@ -44,6 +46,12 @@ pub struct PercentileSummary {
 pub struct NamedCount {
     pub name: String,
     pub count: usize,
+}
+
+#[derive(Debug, Serialize)]
+pub struct NamedPercentileSummary {
+    pub name: String,
+    pub stats: PercentileSummary,
 }
 
 #[derive(Debug, Serialize)]
@@ -81,6 +89,9 @@ pub async fn build_replay_report(db: &FilterDb, from_ms: u64, to_ms: u64) -> Res
 
     let feed_breakdown = count_by(raw_events.iter(), |row| row.feed_source.clone());
     let first_hit_breakdown = count_by(feed_first_hits.iter(), |row| row.first_feed_source.clone());
+    let first_hit_event_breakdown = count_by(feed_first_hits.iter(), |row| {
+        format!("{}:{}", row.event_type, row.first_feed_source)
+    });
     let feed_health_breakdown = count_by(feed_health.iter(), feed_health_key);
     let gate_breakdown = count_by(filter_results.iter(), |row| {
         if row.passed {
@@ -108,6 +119,10 @@ pub async fn build_replay_report(db: &FilterDb, from_ms: u64, to_ms: u64) -> Res
     );
     let first_hit_lag_ms =
         summarize_latency(feed_first_hits.iter().map(|row| row.lag_to_latest_ms));
+    let first_hit_lag_by_source = summarize_grouped_first_hit_latency(
+        &feed_first_hits,
+        |row| row.first_feed_source.clone(),
+    );
     let top_passes = build_top_passes(&filter_results, &filter_timings, &scoring_breakdowns);
     let outcome_summary = summarize_outcomes(&outcomes);
 
@@ -122,6 +137,7 @@ pub async fn build_replay_report(db: &FilterDb, from_ms: u64, to_ms: u64) -> Res
         pass_latency_ms,
         feed_breakdown,
         first_hit_breakdown,
+        first_hit_event_breakdown,
         feed_health_breakdown,
         gate_breakdown,
         path_breakdown,
@@ -129,6 +145,7 @@ pub async fn build_replay_report(db: &FilterDb, from_ms: u64, to_ms: u64) -> Res
         execution_status_breakdown,
         execution_route_breakdown,
         first_hit_lag_ms,
+        first_hit_lag_by_source,
         top_passes,
         outcome_summary,
     })
@@ -251,6 +268,36 @@ fn summarize_latency(iter: impl Iterator<Item = u64>) -> PercentileSummary {
         max: *values.last().unwrap_or(&values[0]),
         avg: sum / count as f64,
     }
+}
+
+fn summarize_grouped_first_hit_latency<F>(
+    items: &[FeedFirstHitRecord],
+    mut key_fn: F,
+) -> Vec<NamedPercentileSummary>
+where
+    F: FnMut(&FeedFirstHitRecord) -> String,
+{
+    let mut buckets: HashMap<String, Vec<u64>> = HashMap::new();
+    for item in items {
+        let key = key_fn(item);
+        buckets.entry(key).or_default().push(item.lag_to_latest_ms);
+    }
+
+    let mut rows: Vec<_> = buckets
+        .into_iter()
+        .map(|(name, values)| NamedPercentileSummary {
+            name,
+            stats: summarize_latency(values.into_iter()),
+        })
+        .collect();
+    rows.sort_by(|left, right| {
+        right
+            .stats
+            .count
+            .cmp(&left.stats.count)
+            .then_with(|| left.name.cmp(&right.name))
+    });
+    rows
 }
 
 fn percentile(values: &[u64], pct: f64) -> u64 {
