@@ -53,23 +53,14 @@ jobs:
                     continue
                     ;;
                 esac
-                if [[ "$line" != *=* ]]; then
-                  continue
-                fi
-                key="${line%%=*}"
-                value="${line#*=}"
-                key="${key//[[:space:]]/}"
-                case "$value" in
-                  \"*\")
-                    value="${value#\"}"
-                    value="${value%\"}"
-                    ;;
-                  \'*\')
-                    value="${value#\'}"
-                    value="${value%\'}"
+                case "$line" in
+                  *=*)
+                    key="${line%%=*}"
+                    value="${line#*=}"
+                    key="${key//[[:space:]]/}"
+                    export "$key=$value"
                     ;;
                 esac
-                export "$key=$value"
               done < ./.env
             }
 
