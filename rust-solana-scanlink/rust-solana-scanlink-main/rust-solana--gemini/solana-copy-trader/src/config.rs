@@ -46,6 +46,11 @@ pub struct AppConfig {
     pub dynamic_hot_keywords_file: String,
     pub latency_metrics_file: String,
     pub replay_db_path: String,
+    pub replay_mode_enabled: bool,
+    pub replay_from_ms: Option<u64>,
+    pub replay_to_ms: Option<u64>,
+    pub replay_window_minutes: u64,
+    pub replay_report_file: String,
     pub filter_hot_reload_secs: u64,
     pub dynamic_hot_refresh_secs: u64,
     pub dynamic_hot_keywords_enabled: bool,
@@ -235,6 +240,15 @@ impl AppConfig {
                 .filter(|s| !s.trim().is_empty()),
             filter_db_path: env_or("FILTER_DB_PATH", "data/filter.sqlite3"),
             replay_db_path: env_or("REPLAY_DB_PATH", "data/replay.sqlite3"),
+            replay_mode_enabled: env_parse("REPLAY_MODE_ENABLED", false),
+            replay_from_ms: std::env::var("REPLAY_FROM_MS")
+                .ok()
+                .and_then(|value| value.parse().ok()),
+            replay_to_ms: std::env::var("REPLAY_TO_MS")
+                .ok()
+                .and_then(|value| value.parse().ok()),
+            replay_window_minutes: env_parse("REPLAY_WINDOW_MINUTES", 60),
+            replay_report_file: env_or("REPLAY_REPORT_FILE", "data/replay_report.json"),
             smart_money_file: env_or("SMART_MONEY_FILE", "data/smart_money.txt"),
             smart_money_funder_file: env_or(
                 "SMART_MONEY_FUNDER_FILE",

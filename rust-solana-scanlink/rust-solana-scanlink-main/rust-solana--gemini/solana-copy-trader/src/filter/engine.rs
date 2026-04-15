@@ -2,8 +2,8 @@ use crate::config::AppConfig;
 use crate::filter::db::{
     AddressSnapshotRecord, BuyerProfile, ClusterEdgeRecord, ClusterMemberRecord, CreatorProfile,
     DynamicKeywordRecord, FeedHealthRecord, FilterDb, FilterResultRecord, FilterTimingRecord,
-    FunderProfile, Gate3SequenceRecord, Gate3SnapshotRecord, LabelSuggestionRecord, RawEventRecord,
-    RiskSignalRecord, ScoringBreakdownRecord,
+    FunderProfile, Gate3SequenceRecord, Gate3SnapshotRecord, LabelSuggestionRecord,
+    PostTradeOutcomeRecord, RawEventRecord, RiskSignalRecord, ScoringBreakdownRecord,
 };
 use crate::processor::pumpfun::BondingCurveState;
 use crate::scanner::{
@@ -2628,6 +2628,15 @@ async fn record_candidate_outcome(
         &path_ref,
     )
     .await;
+
+    if passed {
+        spawn_post_trade_outcome_tracking(
+            shared,
+            candidate.token.clone(),
+            path_ref,
+            score_ref.unwrap_or_default(),
+        );
+    }
 }
 
 async fn record_token_outcome(
@@ -2724,6 +2733,53 @@ async fn record_token_outcome(
             reason
         );
     }
+}
+
+fn spawn_post_trade_outcome_tracking(
+    shared: &SharedState,
+    token: NewToken,
+    path: String,
+    score: u32,
+) {
+    let shared = shared.clone();
+    tokio::spawn(async move {
+        let start = Instant::now();
+        let checkpoints = [10u64, 30u64, 60u64];
+        let mut metrics = [None, None, None];
+
+        for (idx, seconds) in checkpoints.into_iter().enumerate() {
+            let elapsed_secs = start.elapsed().as_secs();
+            if seconds > elapsed_secs {
+                tokio::time::sleep(Duration::from_secs(seconds - elapsed_secs)).await;
+            }
+            metrics[idx] = fetch_curve_progress_pct(&shared, &token).await.ok();
+        }
+
+        let observed: Vec<f64> = metrics.iter().flatten().copied().collect();
+        let peak_metric = observed.iter().copied().reduce(f64::max);
+        let trough_metric = observed.iter().copied().reduce(f64::min);
+        let drawdown_metric = peak_metric
+            .zip(trough_metric)
+            .map(|(peak, trough)| (peak - trough).max(0.0));
+        let record = PostTradeOutcomeRecord {
+            mint: token.mint.clone(),
+            path,
+            score,
+            metric_type: "curve_progress_pct".to_string(),
+            metric_10s: metrics[0],
+            metric_30s: metrics[1],
+            metric_60s: metrics[2],
+            peak_metric,
+            drawdown_metric,
+            recorded_at_ms: now_ms(),
+        };
+        if let Err(err) = shared.db.upsert_post_trade_outcome(&record).await {
+            warn!(
+                "post-trade outcome persist failed | mint={} | {}",
+                token.mint, err
+            );
+        }
+    });
 }
 
 async fn persist_raw_new_token_event(shared: &SharedState, token: &NewToken) {
@@ -3297,6 +3353,11 @@ mod tests {
             coingecko_api_key: None,
             filter_db_path: String::new(),
             replay_db_path: String::new(),
+            replay_mode_enabled: false,
+            replay_from_ms: None,
+            replay_to_ms: None,
+            replay_window_minutes: 60,
+            replay_report_file: String::new(),
             smart_money_file: String::new(),
             smart_money_funder_file: String::new(),
             blocked_buyers_file: String::new(),

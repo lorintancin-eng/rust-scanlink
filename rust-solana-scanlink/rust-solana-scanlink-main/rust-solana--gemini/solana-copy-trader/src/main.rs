@@ -1,3 +1,4 @@
+mod analytics;
 mod autosell;
 mod config;
 mod consensus;
@@ -5,6 +6,7 @@ mod filter;
 mod groups;
 mod grpc;
 mod processor;
+mod replay;
 mod scanner;
 mod telegram;
 mod tx;
@@ -172,6 +174,17 @@ async fn main() -> Result<()> {
 
     */
     let config = Arc::new(AppConfig::from_env()?);
+    if config.replay_mode_enabled {
+        info!(
+            "Mode: replay | from_ms={:?} | to_ms={:?} | window_minutes={} | report={}",
+            config.replay_from_ms,
+            config.replay_to_ms,
+            config.replay_window_minutes,
+            config.replay_report_file,
+        );
+        replay::run(config.as_ref()).await?;
+        return Ok(());
+    }
     let _runtime_guard = RuntimeGuard::acquire(config.as_ref())?;
     let execution_plan = ExecutionPlan::from_config(config.as_ref());
     let sniper_group = CopyGroup::from_app_config(config.as_ref());
@@ -228,7 +241,7 @@ async fn main() -> Result<()> {
         config.coingecko_api_key.is_some(),
     );
     info!(
-        "Scanner feeds: mode={} | primary_label={} primary_url={} | secondary_label={} secondary_url={} | deshred_label={} deshred_url={} | persist_raw_events={} gate3_sequences={} scoring_breakdowns={} labels={} replay_db={}",
+        "Scanner feeds: mode={} | primary_label={} primary_url={} | secondary_label={} secondary_url={} | deshred_label={} deshred_url={} | persist_raw_events={} gate3_sequences={} scoring_breakdowns={} labels={} replay_db={} replay_report={}",
         config.scanner_mode,
         config.scanner_primary_feed_label,
         config.scanner_grpc_url,
@@ -247,6 +260,7 @@ async fn main() -> Result<()> {
         config.persist_scoring_breakdowns,
         config.persist_label_suggestions,
         config.replay_db_path,
+        config.replay_report_file,
     );
 
     let rpc_client = Arc::new(RpcClient::new_with_commitment(
