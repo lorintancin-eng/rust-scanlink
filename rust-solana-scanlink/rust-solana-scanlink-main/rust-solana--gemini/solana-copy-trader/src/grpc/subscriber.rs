@@ -317,27 +317,9 @@ impl GrpcSubscriber {
     fn serialize_transaction_from_proto(
         tx_data: &yellowstone_grpc_proto::prelude::Transaction,
     ) -> Option<Vec<u8>> {
-        // 使用 yellowstone 官方的 proto → VersionedTransaction 转换
-        let versioned_tx =
-            match yellowstone_grpc_proto::convert_from::create_tx_versioned(tx_data.clone()) {
-                Ok(tx) => tx,
-                Err(e) => {
-                    warn!("Backrun: proto→VersionedTransaction 转换失败: {}", e);
-                    return None;
-                }
-            };
-
-        // 序列化为 wire format（去掉冗余的反序列化验证，省 ~100µs）
-        match bincode::serialize(&versioned_tx) {
-            Ok(bytes) => {
-                debug!("Backrun: 目标交易序列化 {}bytes", bytes.len());
-                Some(bytes)
-            }
-            Err(e) => {
-                warn!("Backrun: VersionedTransaction 序列化失败: {}", e);
-                None
-            }
-        }
+        let _ = tx_data;
+        debug!("Backrun: proto transaction serialization disabled on yellowstone-grpc-proto >= 12");
+        None
     }
 
     /// 解析 gRPC 接收到的原始交易
@@ -454,16 +436,14 @@ impl GrpcSubscriber {
         if account_keys.contains(&pumpfun_pubkey) {
             // account_keys 中有 Pump.fun 程序 → CPI 调用
             // 提取 mint：扫描 account_keys 中的非系统地址，验证 bonding curve PDA
-            if let Some(cpi_trade) =
-                self.try_detect_cpi_pumpfun(
-                    &account_keys,
-                    &signature,
-                    source_wallet,
-                    meta,
-                    tx_data,
-                    recv_time,
-                )
-            {
+            if let Some(cpi_trade) = self.try_detect_cpi_pumpfun(
+                &account_keys,
+                &signature,
+                source_wallet,
+                meta,
+                tx_data,
+                recv_time,
+            ) {
                 return Ok(Some(cpi_trade));
             }
         }

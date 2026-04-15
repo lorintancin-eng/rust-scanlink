@@ -12,6 +12,7 @@ use crate::scanner::{
 use anyhow::{Context, Result};
 use futures::stream::{self, StreamExt};
 use serde_json::{json, Value};
+use solana_client::rpc_config::RpcSignaturesForAddressConfig;
 use solana_client::rpc_client::RpcClient;
 use solana_sdk::{commitment_config::CommitmentConfig, pubkey::Pubkey};
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -27,8 +28,26 @@ const GATE1_BLACK_KEYWORDS: &[&str] = &[
 ];
 const GATE1_WHITE_KEYWORDS: &[&str] = &["ai", "agent", "trump", "pepe", "maga"];
 const DYNAMIC_KEYWORD_STOPWORDS: &[&str] = &[
-    "the", "and", "for", "with", "from", "that", "this", "your", "coin", "token", "official",
-    "solana", "pump", "pumpfun", "community", "just", "latest", "launch", "new", "best",
+    "the",
+    "and",
+    "for",
+    "with",
+    "from",
+    "that",
+    "this",
+    "your",
+    "coin",
+    "token",
+    "official",
+    "solana",
+    "pump",
+    "pumpfun",
+    "community",
+    "just",
+    "latest",
+    "launch",
+    "new",
+    "best",
 ];
 const CREATOR_CACHE_TTL_MS: u64 = 24 * 60 * 60 * 1000;
 const BUYER_CACHE_TTL_MS: u64 = 6 * 60 * 60 * 1000;
@@ -43,6 +62,12 @@ const HELIUS_PAGE_LIMIT: usize = 100;
 const HELIUS_MAX_PAGES: usize = 5;
 const FALLBACK_SM_THRESHOLD: usize = 2;
 const DAY_MS: u64 = 24 * 60 * 60 * 1000;
+const ADDRESS_SNAPSHOT_CACHE_TTL_MS: u64 = 15 * 60 * 1000;
+const FUNDER_WALLET_CLUSTER_LIMIT: u32 = 24;
+const FUNDER_RUG_EXPOSURE_LIMIT: u32 = 3;
+const GATE3_CLUSTER_DIVERSITY_MIN_BUYS: usize = 4;
+const GATE3_MIN_UNIQUE_FUNDERS: usize = 2;
+const SINGLE_FUNDER_SCORE_PENALTY: u32 = 6;
 
 #[derive(Debug, Clone)]
 pub struct BuySignal {
@@ -183,6 +208,12 @@ struct AddressSnapshot {
     first_funder: Option<String>,
 }
 
+#[derive(Debug, Clone)]
+struct CachedAddressSnapshot {
+    snapshot: AddressSnapshot,
+    fetched_at_ms: u64,
+}
+
 #[derive(Clone)]
 struct SharedState {
     config: Arc<AppConfig>,
@@ -190,6 +221,7 @@ struct SharedState {
     http: reqwest::Client,
     db: FilterDb,
     hotlists: Arc<RwLock<HotLists>>,
+    address_snapshot_cache: Arc<RwLock<HashMap<String, CachedAddressSnapshot>>>,
 }
 
 pub async fn run(
@@ -208,6 +240,7 @@ pub async fn run(
             .context("filter http client init failed")?,
         db,
         hotlists: Arc::new(RwLock::new(HotLists::default())),
+        address_snapshot_cache: Arc::new(RwLock::new(HashMap::new())),
     };
     if config.dynamic_hot_keywords_enabled {
         if let Err(err) = refresh_dynamic_hot_keywords(&shared).await {
@@ -227,9 +260,8 @@ pub async fn run(
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut hot_reload = tokio::time::interval(Duration::from_secs(config.filter_hot_reload_secs));
     hot_reload.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-    let mut dynamic_hot_refresh = tokio::time::interval(Duration::from_secs(
-        config.dynamic_hot_refresh_secs.max(30),
-    ));
+    let mut dynamic_hot_refresh =
+        tokio::time::interval(Duration::from_secs(config.dynamic_hot_refresh_secs.max(30)));
     dynamic_hot_refresh.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     dynamic_hot_refresh.tick().await;
 
@@ -558,9 +590,17 @@ async fn handle_buy_event(
         let Some(candidate) = candidates.get_mut(&buy.mint) else {
             return;
         };
-        if candidate.status == CandidateStatus::Finalizing
-            || candidate.buy_signatures.contains(&buy.signature)
+        if candidate.status == CandidateStatus::Finalizing {
+            return;
+        }
+        if let Some(existing_buy) = candidate
+            .early_buys
+            .iter_mut()
+            .find(|existing| existing.signature == buy.signature)
         {
+            if upgrade_existing_buy_event(existing_buy, &buy) {
+                evaluate_candidate_after_buy(shared, internal_tx, candidate, &mut reject_now).await;
+            }
             return;
         }
         if candidate.early_buys.len() >= shared.config.smart_money_max_buys {
@@ -581,26 +621,7 @@ async fn handle_buy_event(
 
         maybe_spawn_buyer_profile_fetch(shared, internal_tx, candidate, &buy);
 
-        if candidate.status == CandidateStatus::Active {
-            let stats = smart_money_stats(candidate, shared).await;
-            if let Some(reason) = gate3_reject_reason(candidate, &stats, &shared.config) {
-                if gate3_is_immediate_reject_reason(&reason) {
-                    reject_now = Some((
-                        candidate.token.mint.clone(),
-                        reason.clone(),
-                        smart_money_mode_label(stats.mode).to_string(),
-                        gate3_reject_path(&reason).to_string(),
-                        stats.buy_count,
-                        stats.unique_sm_wallets.len(),
-                    ));
-                }
-            } else if let Some(trigger) = gate3_trigger_from_stats(shared.config.as_ref(), &stats) {
-                candidate.status = CandidateStatus::Finalizing;
-                candidate.trace.gate3_trigger_at_ms = Some(now_ms());
-                candidate.trace.path = Some(gate3_path_label(trigger.path).to_string());
-                spawn_score_task(shared, internal_tx, candidate.clone());
-            }
-        }
+        evaluate_candidate_after_buy(shared, internal_tx, candidate, &mut reject_now).await;
     }
 
     if let Some((mint, reason, mode, path, buy_count, matched_buyers)) = reject_now {
@@ -619,6 +640,65 @@ async fn handle_buy_event(
             )
             .await;
         }
+    }
+}
+
+async fn evaluate_candidate_after_buy(
+    shared: &SharedState,
+    internal_tx: &mpsc::UnboundedSender<InternalMessage>,
+    candidate: &mut Candidate,
+    reject_now: &mut Option<(String, String, String, String, usize, usize)>,
+) {
+    if candidate.status != CandidateStatus::Active {
+        return;
+    }
+
+    let stats = smart_money_stats(candidate, shared).await;
+    if let Some(reason) = gate3_reject_reason(candidate, &stats, &shared.config) {
+        if gate3_is_immediate_reject_reason(&reason) {
+            *reject_now = Some((
+                candidate.token.mint.clone(),
+                reason.clone(),
+                smart_money_mode_label(stats.mode).to_string(),
+                gate3_reject_path(&reason).to_string(),
+                stats.buy_count,
+                stats.unique_sm_wallets.len(),
+            ));
+        }
+    } else if let Some(trigger) = gate3_trigger_from_stats(shared.config.as_ref(), &stats) {
+        candidate.status = CandidateStatus::Finalizing;
+        candidate.trace.gate3_trigger_at_ms = Some(now_ms());
+        candidate.trace.path = Some(gate3_path_label(trigger.path).to_string());
+        spawn_score_task(shared, internal_tx, candidate.clone());
+    }
+}
+
+fn upgrade_existing_buy_event(existing: &mut PumpBuyEvent, incoming: &PumpBuyEvent) -> bool {
+    let existing_rank = buy_feed_rank(&existing.feed_source);
+    let incoming_rank = buy_feed_rank(&incoming.feed_source);
+    let mut upgraded = false;
+
+    if incoming.sol_amount_lamports > existing.sol_amount_lamports {
+        existing.sol_amount_lamports = incoming.sol_amount_lamports;
+        upgraded = true;
+    }
+
+    if incoming_rank > existing_rank {
+        existing.feed_source = incoming.feed_source.clone();
+        existing.token_program = incoming.token_program;
+        existing.instruction_data = incoming.instruction_data.clone();
+        existing.instruction_accounts = incoming.instruction_accounts.clone();
+        upgraded = true;
+    }
+
+    upgraded
+}
+
+fn buy_feed_rank(feed_source: &str) -> u8 {
+    if feed_source.to_ascii_lowercase().contains("deshred") {
+        0
+    } else {
+        1
     }
 }
 
@@ -812,32 +892,84 @@ async fn creator_gate(shared: &SharedState, token: &NewToken) -> Result<CreatorG
     let cached = shared.db.get_creator_profile(&token.creator).await?;
     if let Some(profile) = cached.as_ref() {
         if now_ms().saturating_sub(profile.fetched_at_ms) <= CREATOR_CACHE_TTL_MS {
-            return Ok(apply_creator_rules(shared.config.as_ref(), profile.clone()));
+            return apply_creator_entity_rules(
+                shared,
+                apply_creator_rules(shared.config.as_ref(), profile.clone()),
+            )
+            .await;
         }
     }
 
     let Some(api_key) = shared.config.helius_api_key.as_deref() else {
-        return Ok(CreatorGateResult {
-            passed: true,
-            reason: "gate2 pass: HELIUS_API_KEY not configured".to_string(),
-            profile: cached,
-        });
+        return apply_creator_entity_rules(
+            shared,
+            CreatorGateResult {
+                passed: true,
+                reason: "gate2 pass: HELIUS_API_KEY not configured".to_string(),
+                profile: cached,
+            },
+        )
+        .await;
     };
 
     let timeout_ms = shared.config.creator_gate_timeout_ms.max(1);
-    match tokio::time::timeout(
+    let result = match tokio::time::timeout(
         Duration::from_millis(timeout_ms),
         creator_gate_remote(shared, token, api_key, cached.clone()),
     )
     .await
     {
-        Ok(result) => result,
-        Err(_) => Ok(creator_gate_timeout_fallback(
-            shared.config.as_ref(),
-            cached,
-            timeout_ms,
-        )),
+        Ok(result) => result?,
+        Err(_) => creator_gate_timeout_fallback(shared.config.as_ref(), cached, timeout_ms),
+    };
+
+    apply_creator_entity_rules(shared, result).await
+}
+
+async fn apply_creator_entity_rules(
+    shared: &SharedState,
+    mut result: CreatorGateResult,
+) -> Result<CreatorGateResult> {
+    if !result.passed {
+        return Ok(result);
     }
+
+    let Some(profile) = result.profile.clone() else {
+        return Ok(result);
+    };
+    let Some(funder) = profile.first_funder.as_deref() else {
+        return Ok(result);
+    };
+
+    let Some(funder_profile) = shared.db.get_funder_profile(funder).await? else {
+        return Ok(result);
+    };
+
+    if funder_profile.rug_exposure >= FUNDER_RUG_EXPOSURE_LIMIT {
+        result.passed = false;
+        result.reason = format!(
+            "gate2 reject: funder cluster rug exposure {} for {}",
+            funder_profile.rug_exposure, funder
+        );
+        return Ok(result);
+    }
+
+    if funder_profile.wallet_count >= FUNDER_WALLET_CLUSTER_LIMIT
+        && profile.total_tokens >= shared.config.creator_fresh_wallet_token_limit
+    {
+        result.passed = false;
+        result.reason = format!(
+            "gate2 reject: funder {} funded {} wallets",
+            funder, funder_profile.wallet_count
+        );
+        return Ok(result);
+    }
+
+    result.reason = format!(
+        "{} | funder_cluster_wallets={} rug_exposure={}",
+        result.reason, funder_profile.wallet_count, funder_profile.rug_exposure
+    );
+    Ok(result)
 }
 
 async fn creator_gate_remote(
@@ -864,7 +996,8 @@ async fn creator_gate_remote(
         fetched_at_ms: now_ms(),
     };
 
-    if let Some(decision) = apply_creator_rules_without_graduated(shared.config.as_ref(), &profile) {
+    if let Some(decision) = apply_creator_rules_without_graduated(shared.config.as_ref(), &profile)
+    {
         shared.db.upsert_creator_profile(&profile).await?;
         return Ok(decision);
     }
@@ -884,7 +1017,10 @@ fn creator_gate_timeout_fallback(
 ) -> CreatorGateResult {
     if let Some(profile) = cached {
         let mut result = apply_creator_rules(config, profile);
-        result.reason = format!("{} | gate2 cache fallback timeout={}ms", result.reason, timeout_ms);
+        result.reason = format!(
+            "{} | gate2 cache fallback timeout={}ms",
+            result.reason, timeout_ms
+        );
         return result;
     }
 
@@ -993,7 +1129,9 @@ fn apply_creator_rules(config: &AppConfig, profile: CreatorProfile) -> CreatorGa
 fn effective_soft_threshold(config: &AppConfig, mode: SmartMoneyMode) -> usize {
     match mode {
         SmartMoneyMode::Hotlist => config.smart_money_threshold.max(1),
-        SmartMoneyMode::EarlyBuyerFallback => config.smart_money_threshold.max(FALLBACK_SM_THRESHOLD),
+        SmartMoneyMode::EarlyBuyerFallback => {
+            config.smart_money_threshold.max(FALLBACK_SM_THRESHOLD)
+        }
     }
 }
 
@@ -1127,7 +1265,8 @@ fn gate3_reject_reason(
     } else {
         0.0
     };
-    let strong_external_support = external_buyers >= config.gate3_creator_self_buy_min_external_buyers
+    let strong_external_support = external_buyers
+        >= config.gate3_creator_self_buy_min_external_buyers
         && external_sol >= config.gate3_creator_self_buy_min_external_sol;
     if config.gate3_creator_self_buy_block
         && stats.creator_buy_count > 0
@@ -1167,6 +1306,17 @@ fn gate3_reject_reason(
             stats.buy_count,
         ));
     }
+    if stats.buy_count >= GATE3_CLUSTER_DIVERSITY_MIN_BUYS
+        && stats.unique_buyers.len() >= GATE3_MIN_UNIQUE_FUNDERS
+        && stats.unique_funders < GATE3_MIN_UNIQUE_FUNDERS
+    {
+        return Some(format!(
+            "gate3 reject: low funder diversity | unique_buyers={} | unique_funders={} | first_buys={}",
+            stats.unique_buyers.len(),
+            stats.unique_funders,
+            stats.buy_count,
+        ));
+    }
     if stats.elapsed_ms > effective_hard_reject_ms(config) {
         return Some(format!(
             "gate3 reject: hard window closed | mode={} | matched={} | threshold={} | sol={:.2}/{:.2} | first_buys={} | elapsed_ms={}",
@@ -1179,8 +1329,7 @@ fn gate3_reject_reason(
             stats.elapsed_ms,
         ));
     }
-    if candidate.early_buys.len() >= config.smart_money_max_buys
-        && !gate3_soft_ready(config, stats)
+    if candidate.early_buys.len() >= config.smart_money_max_buys && !gate3_soft_ready(config, stats)
     {
         return Some(format!(
             "gate3 reject: max buys reached | mode={} | matched={} | threshold={} | sol={:.2}/{:.2} | first_buys={}",
@@ -1482,7 +1631,8 @@ async fn score_candidate(shared: &SharedState, mut candidate: Candidate) -> Scor
 
 async fn select_trigger_trade(candidate: &Candidate, shared: &SharedState) -> Option<PumpBuyEvent> {
     let hotlists = shared.hotlists.read().await;
-    let hotlist_mode = smart_money_mode(shared.config.as_ref(), &hotlists) == SmartMoneyMode::Hotlist;
+    let hotlist_mode =
+        smart_money_mode(shared.config.as_ref(), &hotlists) == SmartMoneyMode::Hotlist;
     if !hotlist_mode {
         return candidate
             .early_buys
@@ -1752,6 +1902,38 @@ async fn fetch_address_snapshot(
     api_key: &str,
     address: &str,
 ) -> Result<AddressSnapshot> {
+    if let Some(snapshot) = get_cached_address_snapshot(shared, address, ADDRESS_SNAPSHOT_CACHE_TTL_MS)
+        .await
+    {
+        return Ok(snapshot);
+    }
+
+    let stale_snapshot = get_cached_address_snapshot(shared, address, u64::MAX).await;
+    match fetch_address_snapshot_helius(shared, api_key, address).await {
+        Ok(snapshot) => {
+            cache_address_snapshot(shared, address, snapshot.clone()).await;
+            Ok(snapshot)
+        }
+        Err(helius_err) => {
+            warn!(
+                "address snapshot helius fallback | address={} | {}",
+                address, helius_err
+            );
+            if let Some(snapshot) = stale_snapshot {
+                return Ok(snapshot);
+            }
+            let snapshot = fetch_address_snapshot_rpc(shared, address).await?;
+            cache_address_snapshot(shared, address, snapshot.clone()).await;
+            Ok(snapshot)
+        }
+    }
+}
+
+async fn fetch_address_snapshot_helius(
+    shared: &SharedState,
+    api_key: &str,
+    address: &str,
+) -> Result<AddressSnapshot> {
     let url = format!(
         "https://api-mainnet.helius-rpc.com/v0/addresses/{}/transactions",
         address
@@ -1799,6 +1981,70 @@ async fn fetch_address_snapshot(
     })
 }
 
+async fn fetch_address_snapshot_rpc(shared: &SharedState, address: &str) -> Result<AddressSnapshot> {
+    let address = Pubkey::from_str(address).context("invalid snapshot address")?;
+    let rpc = shared.rpc_client.clone();
+    tokio::task::spawn_blocking(move || {
+        let signatures = rpc.get_signatures_for_address_with_config(
+            &address,
+            RpcSignaturesForAddressConfig {
+                before: None,
+                until: None,
+                limit: Some(1_000),
+                commitment: Some(CommitmentConfig::confirmed()),
+            },
+        )?;
+        let oldest_tx_ms = signatures
+            .last()
+            .and_then(|entry| entry.block_time)
+            .map(|ts| (ts as u64).saturating_mul(1000))
+            .unwrap_or_default();
+        let wallet_age_days = if oldest_tx_ms == 0 {
+            0
+        } else {
+            now_ms()
+                .saturating_sub(oldest_tx_ms)
+                .checked_div(DAY_MS)
+                .unwrap_or_default() as u32
+        };
+        Ok::<AddressSnapshot, anyhow::Error>(AddressSnapshot {
+            oldest_tx_ms,
+            wallet_age_days,
+            first_funder: None,
+        })
+    })
+    .await
+    .context("address snapshot rpc task failed")?
+}
+
+async fn get_cached_address_snapshot(
+    shared: &SharedState,
+    address: &str,
+    max_age_ms: u64,
+) -> Option<AddressSnapshot> {
+    let cache = shared.address_snapshot_cache.read().await;
+    let entry = cache.get(address)?;
+    if now_ms().saturating_sub(entry.fetched_at_ms) > max_age_ms {
+        return None;
+    }
+    Some(entry.snapshot.clone())
+}
+
+async fn cache_address_snapshot(
+    shared: &SharedState,
+    address: &str,
+    snapshot: AddressSnapshot,
+) {
+    let mut cache = shared.address_snapshot_cache.write().await;
+    cache.insert(
+        address.to_string(),
+        CachedAddressSnapshot {
+            snapshot,
+            fetched_at_ms: now_ms(),
+        },
+    );
+}
+
 fn extract_first_funder(item: &Value, address: &str) -> Option<String> {
     item.get("nativeTransfers")
         .and_then(Value::as_array)
@@ -1843,8 +2089,14 @@ async fn refresh_dynamic_hot_keywords(shared: &SharedState) -> Result<()> {
     }
 
     write_plaintext_lines(&shared.config.dynamic_hot_keywords_file, &keywords).await?;
-    let expiry_ms = now_ms()
-        .saturating_add(shared.config.dynamic_hot_refresh_secs.max(30).saturating_mul(2) * 1000);
+    let expiry_ms = now_ms().saturating_add(
+        shared
+            .config
+            .dynamic_hot_refresh_secs
+            .max(30)
+            .saturating_mul(2)
+            * 1000,
+    );
     let keyword_records: Vec<DynamicKeywordRecord> = keywords
         .iter()
         .enumerate()
@@ -1888,7 +2140,10 @@ async fn fetch_dynamic_hot_keywords(shared: &SharedState) -> Result<Vec<String>>
             score_dynamic_keywords(&mut keyword_scores, keywords, 4);
             source_count += 1;
         }
-        Err(err) => warn!("dynamic keywords: coingecko search trending failed: {}", err),
+        Err(err) => warn!(
+            "dynamic keywords: coingecko search trending failed: {}",
+            err
+        ),
     }
 
     if let Some(api_key) = shared.config.coingecko_api_key.as_deref() {
@@ -1897,7 +2152,10 @@ async fn fetch_dynamic_hot_keywords(shared: &SharedState) -> Result<Vec<String>>
                 score_dynamic_keywords(&mut keyword_scores, keywords, 5);
                 source_count += 1;
             }
-            Err(err) => warn!("dynamic keywords: coingecko solana trending pools failed: {}", err),
+            Err(err) => warn!(
+                "dynamic keywords: coingecko solana trending pools failed: {}",
+                err
+            ),
         }
     }
 
@@ -1906,7 +2164,10 @@ async fn fetch_dynamic_hot_keywords(shared: &SharedState) -> Result<Vec<String>>
             score_dynamic_keywords(&mut keyword_scores, keywords, 3);
             source_count += 1;
         }
-        Err(err) => warn!("dynamic keywords: dexscreener boosted tokens failed: {}", err),
+        Err(err) => warn!(
+            "dynamic keywords: dexscreener boosted tokens failed: {}",
+            err
+        ),
     }
 
     if source_count == 0 {
@@ -2098,11 +2359,7 @@ fn should_keep_dynamic_keyword(token: &str) -> bool {
     !DYNAMIC_KEYWORD_STOPWORDS.contains(&token)
 }
 
-fn score_dynamic_keywords(
-    scores: &mut HashMap<String, u32>,
-    keywords: Vec<String>,
-    weight: u32,
-) {
+fn score_dynamic_keywords(scores: &mut HashMap<String, u32>, keywords: Vec<String>, weight: u32) {
     let mut seen = HashSet::new();
     for keyword in keywords {
         if seen.insert(keyword.clone()) {
@@ -2442,11 +2699,7 @@ async fn persist_entity_links_for_creator(
     }
 }
 
-async fn persist_entity_links_for_buyer(
-    shared: &SharedState,
-    mint: &str,
-    profile: &BuyerProfile,
-) {
+async fn persist_entity_links_for_buyer(shared: &SharedState, mint: &str, profile: &BuyerProfile) {
     let Some(funder) = profile.first_funder.clone() else {
         return;
     };
@@ -2464,7 +2717,10 @@ async fn persist_entity_links_for_buyer(
         last_seen_ms: profile.fetched_at_ms.max(current.last_seen_ms),
     };
     if let Err(err) = shared.db.upsert_funder_profile(&funder_profile).await {
-        warn!("upsert buyer funder profile failed | funder={} | {}", funder, err);
+        warn!(
+            "upsert buyer funder profile failed | funder={} | {}",
+            funder, err
+        );
     }
     let cluster_id = cluster_id_for_funder(&funder);
     let member = ClusterMemberRecord {
@@ -2505,7 +2761,11 @@ async fn persist_candidate_analytics(
     let first_buy_ms = candidate
         .early_buys
         .iter()
-        .map(|buy| buy.detected_at.saturating_duration_since(candidate.created_at).as_millis() as u64)
+        .map(|buy| {
+            buy.detected_at
+                .saturating_duration_since(candidate.created_at)
+                .as_millis() as u64
+        })
         .min();
     let threshold_hit_ms = match path {
         "fast" => stats.fast_reached_at_ms,
@@ -2530,7 +2790,10 @@ async fn persist_candidate_analytics(
         recorded_at_ms: now_ms(),
     };
     if let Err(err) = shared.db.insert_gate3_snapshot(&snapshot).await {
-        warn!("insert gate3 snapshot failed | mint={} | {}", candidate.token.mint, err);
+        warn!(
+            "insert gate3 snapshot failed | mint={} | {}",
+            candidate.token.mint, err
+        );
     }
 
     if shared.config.persist_gate3_sequences {
@@ -2566,7 +2829,10 @@ async fn persist_candidate_analytics(
             .replace_gate3_sequences(&candidate.token.mint, &sequences)
             .await
         {
-            warn!("replace gate3 sequences failed | mint={} | {}", candidate.token.mint, err);
+            warn!(
+                "replace gate3 sequences failed | mint={} | {}",
+                candidate.token.mint, err
+            );
         }
     }
 
@@ -2608,13 +2874,24 @@ async fn persist_candidate_analytics(
         let buyer_quality_pct = fetch_buyer_quality_pct(shared, candidate)
             .await
             .unwrap_or(0.0);
-        let buyer_quality_score =
-            (buyer_quality_pct * 15.0).round().clamp(0.0, 15.0) as u32;
+        let buyer_quality_score = (buyer_quality_pct * 15.0).round().clamp(0.0, 15.0) as u32;
         let dynamic_bonus = ((candidate.dynamic_narrative_keywords.len() as u32)
             .saturating_mul(shared.config.dynamic_narrative_bonus_per_hit))
         .min(shared.config.dynamic_narrative_bonus_cap);
-        let quality_score =
-            participants_score + capital_score + curve_score + buyer_quality_score;
+        let funder_diversity_penalty = if stats.unique_buyers.len() >= GATE3_MIN_UNIQUE_FUNDERS
+            && stats.unique_funders < GATE3_MIN_UNIQUE_FUNDERS
+        {
+            SINGLE_FUNDER_SCORE_PENALTY
+        } else {
+            0
+        };
+        let quality_score = participants_score
+            + capital_score
+            + curve_score
+            + buyer_quality_score
+            - funder_diversity_penalty.min(
+                participants_score + capital_score + curve_score + buyer_quality_score,
+            );
         let urgency_score = momentum_score + dynamic_bonus;
         let total_score = quality_score + urgency_score;
         let required_score = match path {
@@ -2638,6 +2915,7 @@ async fn persist_candidate_analytics(
             "momentum_score": momentum_score,
             "curve_score": curve_score,
             "buyer_quality_score": buyer_quality_score,
+            "funder_diversity_penalty": funder_diversity_penalty,
             "dynamic_narrative_bonus": dynamic_bonus,
             "curve_progress_pct": curve_progress_pct,
             "buyer_quality_pct": buyer_quality_pct,
@@ -2655,7 +2933,10 @@ async fn persist_candidate_analytics(
             recorded_at_ms: now_ms(),
         };
         if let Err(err) = shared.db.insert_scoring_breakdown(&breakdown).await {
-            warn!("insert scoring breakdown failed | mint={} | {}", candidate.token.mint, err);
+            warn!(
+                "insert scoring breakdown failed | mint={} | {}",
+                candidate.token.mint, err
+            );
         }
     }
 
@@ -2666,7 +2947,10 @@ async fn persist_candidate_analytics(
             .replace_risk_signals(&candidate.token.mint, &risk_signals)
             .await
         {
-            warn!("replace risk signals failed | mint={} | {}", candidate.token.mint, err);
+            warn!(
+                "replace risk signals failed | mint={} | {}",
+                candidate.token.mint, err
+            );
         }
     }
 
@@ -2770,6 +3054,7 @@ fn now_ms() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::scanner::feed::ScannerMode;
     use solana_sdk::signature::{Keypair, Signer};
 
     fn base_config() -> AppConfig {
@@ -2785,8 +3070,12 @@ mod tests {
             scanner_grpc_token: None,
             scanner_secondary_grpc_url: None,
             scanner_secondary_grpc_token: None,
+            scanner_deshred_grpc_url: None,
+            scanner_deshred_grpc_token: None,
+            scanner_mode: ScannerMode::ProcessedOnly,
             scanner_primary_feed_label: "primary_processed".to_string(),
             scanner_secondary_feed_label: "secondary_processed".to_string(),
+            scanner_deshred_feed_label: "deshred_pre_exec".to_string(),
             helius_api_key: None,
             coingecko_api_key: None,
             filter_db_path: String::new(),
@@ -3004,7 +3293,8 @@ mod tests {
             creator_buy_sol: 3.00,
             elapsed_ms: 100,
         };
-        let reason = gate3_reject_reason(&candidate, &stats, &cfg).expect("creator self-buy reject");
+        let reason =
+            gate3_reject_reason(&candidate, &stats, &cfg).expect("creator self-buy reject");
         assert!(reason.contains("creator self-buy"));
     }
 
@@ -3181,5 +3471,40 @@ mod tests {
             &hotlists,
         ));
         assert!(!buyer_matches_hotlist("other", None, &hotlists));
+    }
+
+    #[test]
+    fn upgrade_existing_buy_prefers_processed_signal_strength() {
+        let buyer = Pubkey::new_unique();
+        let token_program = Pubkey::new_unique();
+        let mut existing = PumpBuyEvent {
+            mint: "mint".to_string(),
+            buyer,
+            feed_source: "deshred_pre_exec".to_string(),
+            token_program,
+            sol_amount_lamports: 100_000_000,
+            instruction_data: vec![1],
+            instruction_accounts: vec![buyer],
+            signature: "sig".to_string(),
+            slot: 1,
+            detected_at: Instant::now(),
+        };
+        let incoming = PumpBuyEvent {
+            mint: "mint".to_string(),
+            buyer,
+            feed_source: "primary_processed".to_string(),
+            token_program,
+            sol_amount_lamports: 350_000_000,
+            instruction_data: vec![2],
+            instruction_accounts: vec![buyer, token_program],
+            signature: "sig".to_string(),
+            slot: 1,
+            detected_at: Instant::now(),
+        };
+
+        assert!(upgrade_existing_buy_event(&mut existing, &incoming));
+        assert_eq!(existing.feed_source, "primary_processed");
+        assert_eq!(existing.sol_amount_lamports, 350_000_000);
+        assert_eq!(existing.instruction_accounts.len(), 2);
     }
 }

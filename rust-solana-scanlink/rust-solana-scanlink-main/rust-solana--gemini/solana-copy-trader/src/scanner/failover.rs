@@ -24,3 +24,36 @@ impl FeedHealthEvent {
         }
     }
 }
+
+#[derive(Debug, Clone)]
+pub struct FeedFirstHitEvent {
+    pub event_key: String,
+    pub event_type: String,
+    pub mint: String,
+    pub signature: String,
+    pub slot: u64,
+    pub feed_source: String,
+    pub detected_at_ms: u64,
+}
+
+impl FeedFirstHitEvent {
+    pub fn new(
+        event_key: impl Into<String>,
+        event_type: impl Into<String>,
+        mint: impl Into<String>,
+        signature: impl Into<String>,
+        slot: u64,
+        feed_source: impl Into<String>,
+        detected_at_ms: u64,
+    ) -> Self {
+        Self {
+            event_key: event_key.into(),
+            event_type: event_type.into(),
+            mint: mint.into(),
+            signature: signature.into(),
+            slot,
+            feed_source: feed_source.into(),
+            detected_at_ms,
+        }
+    }
+}

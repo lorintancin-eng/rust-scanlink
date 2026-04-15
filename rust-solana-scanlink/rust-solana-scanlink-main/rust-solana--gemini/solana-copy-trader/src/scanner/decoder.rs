@@ -4,7 +4,8 @@ use solana_sdk::pubkey::Pubkey;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use tracing::{debug, info, warn};
 use yellowstone_grpc_proto::prelude::{
-    SubscribeUpdateTransactionInfo, TransactionStatusMeta,
+    Message, SubscribeUpdateDeshredTransactionInfo, SubscribeUpdateTransactionInfo,
+    TransactionStatusMeta,
 };
 
 const MAX_FALLBACK_BUY_LAMPORTS: u64 = 50_000_000_000;
@@ -56,15 +57,65 @@ pub fn decode_transaction(
         return Vec::new();
     };
 
-    let signature = if tx_info.signature.is_empty() {
-        "unknown".to_string()
-    } else {
-        bs58::encode(&tx_info.signature).into_string()
+    decode_message(
+        feed_source,
+        slot,
+        &transaction_signature(&tx_info.signature),
+        message,
+        tx_info.meta.as_ref(),
+        tx_info
+            .meta
+            .as_ref()
+            .map(|meta| meta.loaded_writable_addresses.as_slice())
+            .unwrap_or(&[]),
+        tx_info
+            .meta
+            .as_ref()
+            .map(|meta| meta.loaded_readonly_addresses.as_slice())
+            .unwrap_or(&[]),
+    )
+}
+
+pub fn decode_deshred_transaction(
+    feed_source: &str,
+    slot: u64,
+    tx_info: &SubscribeUpdateDeshredTransactionInfo,
+) -> Vec<ScannerEvent> {
+    let Some(tx) = tx_info.transaction.as_ref() else {
+        return Vec::new();
     };
+    let Some(message) = tx.message.as_ref() else {
+        return Vec::new();
+    };
+
+    decode_message(
+        feed_source,
+        slot,
+        &transaction_signature(&tx_info.signature),
+        message,
+        None,
+        tx_info.loaded_writable_addresses.as_slice(),
+        tx_info.loaded_readonly_addresses.as_slice(),
+    )
+}
+
+fn decode_message(
+    feed_source: &str,
+    slot: u64,
+    signature: &str,
+    message: &Message,
+    meta: Option<&TransactionStatusMeta>,
+    loaded_writable_addresses: &[Vec<u8>],
+    loaded_readonly_addresses: &[Vec<u8>],
+) -> Vec<ScannerEvent> {
     let discovered_at_ms = now_ms();
     let detected_at = Instant::now();
 
-    let account_keys = build_account_keys(message.account_keys.as_slice(), tx_info.meta.as_ref());
+    let account_keys = build_account_keys(
+        message.account_keys.as_slice(),
+        loaded_writable_addresses,
+        loaded_readonly_addresses,
+    );
     if account_keys.is_empty() {
         return Vec::new();
     }
@@ -74,11 +125,11 @@ pub fn decode_transaction(
     for ix in &message.instructions {
         decode_instruction(
             slot,
-            &signature,
+            signature,
             feed_source,
             discovered_at_ms,
             detected_at,
-            tx_info.meta.as_ref(),
+            meta,
             &ix.data,
             &ix.accounts,
             ix.program_id_index as usize,
@@ -87,16 +138,16 @@ pub fn decode_transaction(
         );
     }
 
-    if let Some(meta) = tx_info.meta.as_ref() {
+    if let Some(meta) = meta {
         for inner in &meta.inner_instructions {
             for ix in &inner.instructions {
                 decode_instruction(
                     slot,
-                    &signature,
+                    signature,
                     feed_source,
                     discovered_at_ms,
                     detected_at,
-                    tx_info.meta.as_ref(),
+                    Some(meta),
                     &ix.data,
                     &ix.accounts,
                     ix.program_id_index as usize,
@@ -108,6 +159,14 @@ pub fn decode_transaction(
     }
 
     events
+}
+
+fn transaction_signature(signature: &[u8]) -> String {
+    if signature.is_empty() {
+        "unknown".to_string()
+    } else {
+        bs58::encode(signature).into_string()
+    }
 }
 
 fn decode_instruction(
@@ -126,10 +185,7 @@ fn decode_instruction(
     let Some(program_id) = account_keys.get(program_idx) else {
         return;
     };
-    if program_id.to_string() != PUMP_PROGRAM_ID {
-        return;
-    }
-    if data.len() < 8 {
+    if program_id.to_string() != PUMP_PROGRAM_ID || data.len() < 8 {
         return;
     }
 
@@ -149,12 +205,8 @@ fn decode_instruction(
             account_keys,
         ) {
             info!(
-                "扫链：发现新币 {} ({}) | mint={} | creator={} | v2={}",
-                token.name,
-                token.symbol,
-                token.mint,
-                token.creator,
-                token.is_v2
+                "扫链：发现新币 {} ({}) | mint={} | creator={} | v2={} | feed={}",
+                token.name, token.symbol, token.mint, token.creator, token.is_v2, token.feed_source
             );
             events.push(ScannerEvent::NewToken(token));
         }
@@ -173,11 +225,12 @@ fn decode_instruction(
             account_keys,
         ) {
             debug!(
-                "扫链：捕获买入 | mint={} | buyer={} | sol={:.4} | sig={}",
+                "扫链：捕获买入 | mint={} | buyer={} | sol={:.4} | sig={} | feed={}",
                 buy.mint,
                 buy.buyer,
                 buy.sol_amount_lamports as f64 / 1e9,
-                buy.signature
+                buy.signature,
+                buy.feed_source
             );
             events.push(ScannerEvent::Buy(buy));
         }
@@ -185,8 +238,8 @@ fn decode_instruction(
     }
 
     debug!(
-        "扫链：发现未识别 Pump 指令 | sig={} | disc={:?}",
-        signature, disc
+        "扫链：发现未识别 Pump 指令 | sig={} | disc={:?} | feed={}",
+        signature, disc, feed_source
     );
 }
 
@@ -254,11 +307,8 @@ fn decode_buy(
     }
 
     let fallback_max_sol_cost_lamports = u64::from_le_bytes(data[16..24].try_into().ok()?);
-    let sol_amount_lamports = estimate_buy_sol_amount_lamports(
-        meta,
-        buyer_account_idx,
-        fallback_max_sol_cost_lamports,
-    );
+    let sol_amount_lamports =
+        estimate_buy_sol_amount_lamports(meta, buyer_account_idx, fallback_max_sol_cost_lamports);
 
     Some(PumpBuyEvent {
         mint: mint.to_string(),
@@ -274,14 +324,19 @@ fn decode_buy(
     })
 }
 
-fn indexed_account(account_indices: &[u8], account_keys: &[Pubkey], index: usize) -> Option<Pubkey> {
+fn indexed_account(
+    account_indices: &[u8],
+    account_keys: &[Pubkey],
+    index: usize,
+) -> Option<Pubkey> {
     let account_idx = *account_indices.get(index)? as usize;
     account_keys.get(account_idx).copied()
 }
 
 fn build_account_keys(
     static_keys: &[Vec<u8>],
-    meta: Option<&TransactionStatusMeta>,
+    loaded_writable_addresses: &[Vec<u8>],
+    loaded_readonly_addresses: &[Vec<u8>],
 ) -> Vec<Pubkey> {
     let mut account_keys: Vec<Pubkey> = static_keys
         .iter()
@@ -296,16 +351,13 @@ fn build_account_keys(
         })
         .collect();
 
-    if let Some(meta) = meta {
-        for address in meta
-            .loaded_writable_addresses
-            .iter()
-            .chain(meta.loaded_readonly_addresses.iter())
-        {
-            if address.len() == 32 {
-                if let Ok(bytes) = <[u8; 32]>::try_from(address.as_slice()) {
-                    account_keys.push(Pubkey::new_from_array(bytes));
-                }
+    for address in loaded_writable_addresses
+        .iter()
+        .chain(loaded_readonly_addresses.iter())
+    {
+        if address.len() == 32 {
+            if let Ok(bytes) = <[u8; 32]>::try_from(address.as_slice()) {
+                account_keys.push(Pubkey::new_from_array(bytes));
             }
         }
     }
@@ -372,7 +424,6 @@ fn sanitize_fallback_buy_lamports(lamports: u64) -> u64 {
     }
 }
 
-
 fn now_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -418,6 +469,19 @@ mod tests {
     }
 
     #[test]
+    fn build_account_keys_appends_loaded_alt_addresses() {
+        let static_key = Pubkey::new_unique();
+        let writable = Pubkey::new_unique();
+        let readonly = Pubkey::new_unique();
+        let keys = build_account_keys(
+            &[static_key.to_bytes().to_vec()],
+            &[writable.to_bytes().to_vec()],
+            &[readonly.to_bytes().to_vec()],
+        );
+        assert_eq!(keys, vec![static_key, writable, readonly]);
+    }
+
+    #[test]
     fn buy_sol_amount_prefers_balance_delta_over_max_cost() {
         let meta = TransactionStatusMeta {
             pre_balances: vec![2_000_000_000],
@@ -440,4 +504,3 @@ mod tests {
         );
     }
 }
-

@@ -1,3 +1,4 @@
+use crate::scanner::feed::ScannerMode;
 use anyhow::{Context, Result};
 use solana_sdk::pubkey::Pubkey;
 use solana_sdk::signature::{Keypair, Signer};
@@ -26,8 +27,12 @@ pub struct AppConfig {
     pub scanner_grpc_token: Option<String>,
     pub scanner_secondary_grpc_url: Option<String>,
     pub scanner_secondary_grpc_token: Option<String>,
+    pub scanner_deshred_grpc_url: Option<String>,
+    pub scanner_deshred_grpc_token: Option<String>,
+    pub scanner_mode: ScannerMode,
     pub scanner_primary_feed_label: String,
     pub scanner_secondary_feed_label: String,
+    pub scanner_deshred_feed_label: String,
     /// 过滤层 Creator/地址画像查询
     pub helius_api_key: Option<String>,
     /// 可选 CoinGecko Pro Key，用于更实时的 GeckoTerminal 热点池
@@ -162,6 +167,25 @@ impl AppConfig {
             .context("Invalid TARGET_WALLETS")?
             .unwrap_or_default();
 
+        let scanner_deshred_grpc_url = first_env(&["SCANNER_DESHRED_GRPC_URL", "DESHRED_GRPC_URL"])
+            .filter(|value| !value.trim().is_empty())
+            .or_else(|| {
+                first_env(&["SCANNER_GRPC_URL"]).filter(|value| supports_deshred_endpoint(value))
+            });
+        let scanner_mode = std::env::var("SCANNER_MODE")
+            .ok()
+            .filter(|s| !s.trim().is_empty())
+            .map(|value| ScannerMode::from_str(&value))
+            .transpose()
+            .map_err(anyhow::Error::msg)?
+            .unwrap_or_else(|| {
+                if scanner_deshred_grpc_url.is_some() {
+                    ScannerMode::Hybrid
+                } else {
+                    ScannerMode::ProcessedOnly
+                }
+            });
+
         Ok(Self {
             rpc_url: env_or("RPC_URL", "https://api.mainnet-beta.solana.com"),
             secondary_rpc_url: std::env::var("SECONDARY_RPC_URL").ok(),
@@ -191,11 +215,18 @@ impl AppConfig {
             scanner_secondary_grpc_url: first_env(&["SCANNER_SECONDARY_GRPC_URL"])
                 .filter(|value| !value.trim().is_empty()),
             scanner_secondary_grpc_token: first_env(&["SCANNER_SECONDARY_GRPC_TOKEN"]),
+            scanner_deshred_grpc_url,
+            scanner_deshred_grpc_token: first_env(&[
+                "SCANNER_DESHRED_GRPC_TOKEN",
+                "DESHRED_GRPC_TOKEN",
+            ]),
+            scanner_mode,
             scanner_primary_feed_label: env_or("SCANNER_PRIMARY_FEED_LABEL", "primary_processed"),
             scanner_secondary_feed_label: env_or(
                 "SCANNER_SECONDARY_FEED_LABEL",
                 "secondary_processed",
             ),
+            scanner_deshred_feed_label: env_or("SCANNER_DESHRED_FEED_LABEL", "deshred_pre_exec"),
             helius_api_key: std::env::var("HELIUS_API_KEY")
                 .ok()
                 .filter(|s| !s.trim().is_empty()),
@@ -239,10 +270,7 @@ impl AppConfig {
             gate3_creator_self_buy_max_sol: env_parse("GATE3_CREATOR_SELF_BUY_MAX_SOL", 0.75),
             gate3_creator_self_buy_max_share: env_parse("GATE3_CREATOR_SELF_BUY_MAX_SHARE", 0.40),
             gate3_creator_self_buy_hard_sol: env_parse("GATE3_CREATOR_SELF_BUY_HARD_SOL", 4.00),
-            gate3_creator_self_buy_hard_share: env_parse(
-                "GATE3_CREATOR_SELF_BUY_HARD_SHARE",
-                0.55,
-            ),
+            gate3_creator_self_buy_hard_share: env_parse("GATE3_CREATOR_SELF_BUY_HARD_SHARE", 0.55),
             gate3_creator_self_buy_min_external_buyers: env_parse(
                 "GATE3_CREATOR_SELF_BUY_MIN_EXTERNAL_BUYERS",
                 3,
@@ -353,6 +381,11 @@ fn first_env(keys: &[&str]) -> Option<String> {
 
 fn is_rabbitstream_url(url: &str) -> bool {
     url.to_ascii_lowercase().contains("rabbitstream")
+}
+
+fn supports_deshred_endpoint(url: &str) -> bool {
+    let lower = url.to_ascii_lowercase();
+    lower.contains("triton.one") || lower.contains("rpcpool.com")
 }
 
 fn env_parse<T: FromStr>(key: &str, default: T) -> T {

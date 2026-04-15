@@ -1,6 +1,6 @@
 [package]
 name = "solana-copy-trader"
-version = "1.7.1"
+version = "1.7.2"
 edition = "2021"
 description = "High-performance Solana copy-trading bot in Rust"
 
@@ -21,9 +21,9 @@ tokio = { version = "1", features = ["full"] }
 futures = "0.3"
 
 # gRPC (YellowStone)
-yellowstone-grpc-client = "6"
-yellowstone-grpc-proto = "6"
-tonic = "0.12"
+yellowstone-grpc-client = "13"
+yellowstone-grpc-proto = "12.1"
+tonic = { version = "0.14", features = ["tls-native-roots"] }
 
 # HTTP client (Jupiter API, Jito)
 reqwest = { version = "0.12", features = ["json", "rustls-tls"] }
@@ -60,6 +60,3 @@ opt-level = 3
 lto = true
 codegen-units = 1
 strip = true
-
-[patch.crates-io]
-protobuf-src = { path = "vendor/protobuf-src" }

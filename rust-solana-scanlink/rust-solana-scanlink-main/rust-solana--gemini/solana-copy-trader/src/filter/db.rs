@@ -86,6 +86,21 @@ pub struct FeedHealthRecord {
 }
 
 #[derive(Debug, Clone)]
+pub struct FeedFirstHitRecord {
+    pub event_key: String,
+    pub event_type: String,
+    pub mint: String,
+    pub signature: String,
+    pub slot: u64,
+    pub first_feed_source: String,
+    pub first_seen_ms: u64,
+    pub last_feed_source: String,
+    pub last_seen_ms: u64,
+    pub distinct_source_count: usize,
+    pub lag_to_latest_ms: u64,
+}
+
+#[derive(Debug, Clone)]
 pub struct Gate3SnapshotRecord {
     pub mint: String,
     pub mode: String,
@@ -449,6 +464,38 @@ impl FilterDb {
         .await
     }
 
+    pub async fn upsert_feed_first_hit(&self, record: &FeedFirstHitRecord) -> Result<()> {
+        let record = record.clone();
+        self.with_conn(move |conn| {
+            conn.execute(
+                "INSERT INTO feed_first_hits(
+                    event_key, event_type, mint, signature, slot, first_feed_source, first_seen_ms,
+                    last_feed_source, last_seen_ms, distinct_source_count, lag_to_latest_ms
+                 ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
+                 ON CONFLICT(event_key) DO UPDATE SET
+                    last_feed_source = excluded.last_feed_source,
+                    last_seen_ms = excluded.last_seen_ms,
+                    distinct_source_count = excluded.distinct_source_count,
+                    lag_to_latest_ms = excluded.lag_to_latest_ms",
+                params![
+                    record.event_key,
+                    record.event_type,
+                    record.mint,
+                    record.signature,
+                    record.slot,
+                    record.first_feed_source,
+                    record.first_seen_ms,
+                    record.last_feed_source,
+                    record.last_seen_ms,
+                    record.distinct_source_count as u64,
+                    record.lag_to_latest_ms,
+                ],
+            )?;
+            Ok(())
+        })
+        .await
+    }
+
     pub async fn insert_gate3_snapshot(&self, record: &Gate3SnapshotRecord) -> Result<()> {
         let record = record.clone();
         self.with_conn(move |conn| {
@@ -538,7 +585,11 @@ impl FilterDb {
         .await
     }
 
-    pub async fn replace_risk_signals(&self, mint: &str, signals: &[RiskSignalRecord]) -> Result<()> {
+    pub async fn replace_risk_signals(
+        &self,
+        mint: &str,
+        signals: &[RiskSignalRecord],
+    ) -> Result<()> {
         let mint = mint.to_string();
         let signals = signals.to_vec();
         self.with_conn(move |conn| {
@@ -572,7 +623,10 @@ impl FilterDb {
         let keywords = keywords.to_vec();
         self.with_conn(move |conn| {
             let tx = conn.unchecked_transaction()?;
-            tx.execute("DELETE FROM dynamic_keywords WHERE source = ?1", params![source])?;
+            tx.execute(
+                "DELETE FROM dynamic_keywords WHERE source = ?1",
+                params![source],
+            )?;
             for keyword in keywords {
                 tx.execute(
                     "INSERT INTO dynamic_keywords(keyword, source, score, expires_at_ms)
@@ -858,6 +912,19 @@ fn init_db(path: &Path) -> Result<()> {
             status TEXT NOT NULL,
             detail TEXT NOT NULL,
             ts_ms INTEGER NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS feed_first_hits (
+            event_key TEXT PRIMARY KEY,
+            event_type TEXT NOT NULL,
+            mint TEXT NOT NULL,
+            signature TEXT NOT NULL,
+            slot INTEGER NOT NULL,
+            first_feed_source TEXT NOT NULL,
+            first_seen_ms INTEGER NOT NULL,
+            last_feed_source TEXT NOT NULL,
+            last_seen_ms INTEGER NOT NULL,
+            distinct_source_count INTEGER NOT NULL DEFAULT 1,
+            lag_to_latest_ms INTEGER NOT NULL DEFAULT 0
         );
         CREATE TABLE IF NOT EXISTS gate3_snapshots (
             mint TEXT PRIMARY KEY,

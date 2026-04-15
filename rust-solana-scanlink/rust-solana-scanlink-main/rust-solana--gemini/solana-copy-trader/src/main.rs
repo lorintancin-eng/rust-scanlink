@@ -228,12 +228,18 @@ async fn main() -> Result<()> {
         config.coingecko_api_key.is_some(),
     );
     info!(
-        "Scanner feeds: primary_label={} primary_url={} | secondary_label={} secondary_url={} | persist_raw_events={} gate3_sequences={} scoring_breakdowns={} labels={} replay_db={}",
+        "Scanner feeds: mode={} | primary_label={} primary_url={} | secondary_label={} secondary_url={} | deshred_label={} deshred_url={} | persist_raw_events={} gate3_sequences={} scoring_breakdowns={} labels={} replay_db={}",
+        config.scanner_mode,
         config.scanner_primary_feed_label,
         config.scanner_grpc_url,
         config.scanner_secondary_feed_label,
         config
             .scanner_secondary_grpc_url
+            .as_deref()
+            .unwrap_or("-"),
+        config.scanner_deshred_feed_label,
+        config
+            .scanner_deshred_grpc_url
             .as_deref()
             .unwrap_or("-"),
         config.persist_raw_scanner_events,
