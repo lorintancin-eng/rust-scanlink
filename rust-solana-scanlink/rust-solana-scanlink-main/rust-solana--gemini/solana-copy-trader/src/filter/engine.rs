@@ -67,6 +67,9 @@ const FUNDER_RUG_EXPOSURE_LIMIT: u32 = 3;
 const GATE3_CLUSTER_DIVERSITY_MIN_BUYS: usize = 4;
 const GATE3_MIN_UNIQUE_FUNDERS: usize = 2;
 const SINGLE_FUNDER_SCORE_PENALTY: u32 = 6;
+const CREATOR_FUNDER_CLUSTER_MIN_BUYERS: usize = 2;
+const CREATOR_FUNDER_CLUSTER_MIN_SOL: f64 = 0.5;
+const CREATOR_FUNDER_CLUSTER_MAX_SHARE: f64 = 0.85;
 
 #[derive(Debug, Clone)]
 pub struct BuySignal {
@@ -193,6 +196,8 @@ struct WindowStats {
     buy_count: usize,
     eligible_buyers: usize,
     unique_funders: usize,
+    creator_funder_match_count: usize,
+    creator_funder_match_sol: f64,
     max_single_buyer_share: f64,
     max_single_buyer: Option<String>,
     creator_buy_count: usize,
@@ -205,6 +210,7 @@ struct AddressSnapshot {
     oldest_tx_ms: u64,
     wallet_age_days: u32,
     first_funder: Option<String>,
+    source: String,
 }
 
 #[derive(Debug, Clone)]
@@ -1233,6 +1239,8 @@ fn gate3_soft_ready(config: &AppConfig, stats: &WindowStats) -> bool {
 fn gate3_reject_path(reason: &str) -> &'static str {
     if reason.contains("creator self-buy") {
         "creator_self_buy"
+    } else if reason.contains("creator-linked cluster") {
+        "creator_cluster"
     } else if reason.contains("early concentration") {
         "concentration"
     } else if reason.contains("hard window closed") {
@@ -1246,6 +1254,7 @@ fn gate3_reject_path(reason: &str) -> &'static str {
 
 fn gate3_is_immediate_reject_reason(reason: &str) -> bool {
     reason.contains("creator self-buy")
+        || reason.contains("creator-linked cluster")
         || reason.contains("early concentration")
         || reason.contains("max buys reached")
 }
@@ -1261,6 +1270,11 @@ fn gate3_reject_reason(
     let external_sol = (stats.total_eligible_sol - stats.creator_buy_sol).max(0.0);
     let creator_buy_share = if stats.total_eligible_sol > 0.0 {
         stats.creator_buy_sol / stats.total_eligible_sol
+    } else {
+        0.0
+    };
+    let creator_cluster_share = if external_sol > 0.0 {
+        stats.creator_funder_match_sol / external_sol
     } else {
         0.0
     };
@@ -1291,6 +1305,26 @@ fn gate3_reject_reason(
             external_sol,
             config.gate3_creator_self_buy_min_external_sol,
         ));
+    }
+    if let Some(creator_funder) = candidate
+        .creator_profile
+        .as_ref()
+        .and_then(|profile| profile.first_funder.as_deref())
+    {
+        if stats.creator_funder_match_count >= CREATOR_FUNDER_CLUSTER_MIN_BUYERS
+            && stats.creator_funder_match_sol >= CREATOR_FUNDER_CLUSTER_MIN_SOL
+            && creator_cluster_share >= CREATOR_FUNDER_CLUSTER_MAX_SHARE
+        {
+            return Some(format!(
+                "gate3 reject: creator-linked cluster concentration | funder={} | matched_buyers={} | matched_sol={:.2}/{:.2} | share={:.2}/{:.2}",
+                creator_funder,
+                stats.creator_funder_match_count,
+                stats.creator_funder_match_sol,
+                external_sol,
+                creator_cluster_share,
+                CREATOR_FUNDER_CLUSTER_MAX_SHARE,
+            ));
+        }
     }
     if config.gate3_early_concentration_reject
         && candidate.early_buys.len() >= config.gate3_early_concentration_min_buys
@@ -1353,6 +1387,10 @@ async fn smart_money_stats(candidate: &Candidate, shared: &SharedState) -> Windo
     let mut unique_funders = HashSet::new();
     let mut eligible_sol_total = 0.0f64;
     let mut sm_sol_total = 0.0f64;
+    let creator_first_funder = candidate
+        .creator_profile
+        .as_ref()
+        .and_then(|profile| profile.first_funder.as_deref());
     let mut fastest_sm_ms: Option<u64> = None;
     let mut fast_reached_at_ms: Option<u64> = None;
     let mut soft_reached_at_ms: Option<u64> = None;
@@ -1361,6 +1399,8 @@ async fn smart_money_stats(candidate: &Candidate, shared: &SharedState) -> Windo
     let mut max_single_buyer: Option<String> = None;
     let mut creator_buy_count = 0usize;
     let mut creator_buy_sol = 0.0f64;
+    let mut creator_funder_match_count = 0usize;
+    let mut creator_funder_match_sol = 0.0f64;
 
     for buy in &candidate.early_buys {
         let buyer = buy.buyer.to_string();
@@ -1368,11 +1408,11 @@ async fn smart_money_stats(candidate: &Candidate, shared: &SharedState) -> Windo
             continue;
         }
         eligible_buyers.insert(buyer.clone());
-        if let Some(funder) = candidate
+        let buyer_funder = candidate
             .buyer_profiles
             .get(&buyer)
-            .and_then(|profile| profile.first_funder.clone())
-        {
+            .and_then(|profile| profile.first_funder.clone());
+        if let Some(funder) = buyer_funder.as_ref() {
             unique_funders.insert(funder);
         }
         let buy_sol = buy.sol_amount_lamports as f64 / 1e9;
@@ -1382,6 +1422,12 @@ async fn smart_money_stats(candidate: &Candidate, shared: &SharedState) -> Windo
         if buyer == candidate.token.creator {
             creator_buy_count += 1;
             creator_buy_sol += buy_sol;
+        } else if creator_first_funder
+            .zip(buyer_funder.as_deref())
+            .is_some_and(|(creator_funder, buyer_funder)| creator_funder == buyer_funder)
+        {
+            creator_funder_match_count += 1;
+            creator_funder_match_sol += buy_sol;
         }
 
         let matched = match mode {
@@ -1441,6 +1487,8 @@ async fn smart_money_stats(candidate: &Candidate, shared: &SharedState) -> Windo
         buy_count: candidate.early_buys.len(),
         eligible_buyers: eligible_buyers.len(),
         unique_funders: unique_funders.len(),
+        creator_funder_match_count,
+        creator_funder_match_sol,
         max_single_buyer_share,
         max_single_buyer,
         creator_buy_count,
@@ -1927,10 +1975,19 @@ async fn fetch_address_snapshot(
                 "address snapshot helius fallback | address={} | {}",
                 address, helius_err
             );
-            if let Some(snapshot) = stale_snapshot {
+            if let Some(mut snapshot) = stale_snapshot {
+                snapshot.source = format!("stale:{}", snapshot.source);
+                warn!(
+                    "address snapshot stale fallback | address={} | source={}",
+                    address, snapshot.source
+                );
                 return Ok(snapshot);
             }
             let snapshot = fetch_address_snapshot_rpc(shared, address).await?;
+            warn!(
+                "address snapshot rpc fallback | address={} | source={}",
+                address, snapshot.source
+            );
             cache_address_snapshot(shared, address, snapshot.clone(), "rpc").await;
             Ok(snapshot)
         }
@@ -1986,6 +2043,7 @@ async fn fetch_address_snapshot_helius(
         oldest_tx_ms,
         wallet_age_days,
         first_funder,
+        source: "helius".to_string(),
     })
 }
 
@@ -2022,6 +2080,7 @@ async fn fetch_address_snapshot_rpc(
             oldest_tx_ms,
             wallet_age_days,
             first_funder: None,
+            source: "rpc".to_string(),
         })
     })
     .await
@@ -2060,6 +2119,7 @@ async fn get_persisted_address_snapshot(
         oldest_tx_ms: record.oldest_tx_ms,
         wallet_age_days: record.wallet_age_days,
         first_funder: record.first_funder,
+        source: format!("sqlite:{}", record.source),
     };
     cache_address_snapshot_memory(shared, address, snapshot.clone(), record.fetched_at_ms).await;
     Some(snapshot)
@@ -2806,8 +2866,103 @@ async fn persist_entity_links_for_buyer(shared: &SharedState, mint: &str, profil
     }
 }
 
+fn ordered_edge_endpoints(left: &str, right: &str) -> (String, String) {
+    if left <= right {
+        (left.to_string(), right.to_string())
+    } else {
+        (right.to_string(), left.to_string())
+    }
+}
+
 fn cluster_id_for_funder(funder: &str) -> String {
     format!("funder:{}", funder)
+}
+
+async fn persist_launch_participation_edges(shared: &SharedState, candidate: &Candidate) {
+    let creator_funder = candidate
+        .creator_profile
+        .as_ref()
+        .and_then(|profile| profile.first_funder.clone());
+    let mut participants = Vec::new();
+    let mut seen_buyers = HashSet::new();
+
+    for (idx, buy) in candidate.early_buys.iter().enumerate() {
+        let buyer = buy.buyer.to_string();
+        if !seen_buyers.insert(buyer.clone()) {
+            continue;
+        }
+        let funder = candidate
+            .buyer_profiles
+            .get(&buyer)
+            .and_then(|profile| profile.first_funder.clone());
+        participants.push((idx, buyer, funder));
+        if participants.len() >= shared.config.smart_money_max_buys {
+            break;
+        }
+    }
+
+    for (idx, buyer, funder) in &participants {
+        let launch_edge = ClusterEdgeRecord {
+            src: candidate.token.creator.clone(),
+            dst: buyer.clone(),
+            edge_type: format!("launch_participation:{}", candidate.token.mint),
+            weight: (shared.config.smart_money_max_buys.saturating_sub(*idx)).max(1) as i32,
+        };
+        if let Err(err) = shared.db.upsert_cluster_edge(&launch_edge).await {
+            warn!("upsert launch participation edge failed | {}", err);
+        }
+
+        if creator_funder
+            .as_deref()
+            .zip(funder.as_deref())
+            .is_some_and(|(creator_funder, buyer_funder)| creator_funder == buyer_funder)
+        {
+            let member = ClusterMemberRecord {
+                cluster_id: cluster_id_for_funder(creator_funder.as_deref().unwrap_or_default()),
+                address: buyer.clone(),
+                cluster_type: "creator_launch_peer".to_string(),
+                score: 70,
+            };
+            if let Err(err) = shared.db.upsert_cluster_member(&member).await {
+                warn!("upsert creator launch cluster member failed | {}", err);
+            }
+        }
+    }
+
+    for (left_idx, (_, left_buyer, left_funder)) in participants.iter().enumerate() {
+        for (_, right_buyer, right_funder) in participants.iter().skip(left_idx + 1) {
+            let (src, dst) = ordered_edge_endpoints(left_buyer, right_buyer);
+            let peer_edge = ClusterEdgeRecord {
+                src,
+                dst,
+                edge_type: format!("launch_peer:{}", candidate.token.mint),
+                weight: 1,
+            };
+            if let Err(err) = shared.db.upsert_cluster_edge(&peer_edge).await {
+                warn!("upsert launch peer edge failed | {}", err);
+            }
+
+            if let (Some(left_funder), Some(right_funder)) =
+                (left_funder.as_deref(), right_funder.as_deref())
+            {
+                if left_funder != right_funder {
+                    let (src, dst) = ordered_edge_endpoints(
+                        &cluster_id_for_funder(left_funder),
+                        &cluster_id_for_funder(right_funder),
+                    );
+                    let peer_edge = ClusterEdgeRecord {
+                        src,
+                        dst,
+                        edge_type: format!("launch_funder_peer:{}", candidate.token.mint),
+                        weight: 1,
+                    };
+                    if let Err(err) = shared.db.upsert_cluster_edge(&peer_edge).await {
+                        warn!("upsert launch funder peer edge failed | {}", err);
+                    }
+                }
+            }
+        }
+    }
 }
 
 async fn persist_candidate_analytics(
@@ -2821,6 +2976,7 @@ async fn persist_candidate_analytics(
     path: &str,
 ) {
     let stats = smart_money_stats(candidate, shared).await;
+    persist_launch_participation_edges(shared, candidate).await;
     let first_buy_ms = candidate
         .early_buys
         .iter()
@@ -2975,6 +3131,8 @@ async fn persist_candidate_analytics(
             "curve_score": curve_score,
             "buyer_quality_score": buyer_quality_score,
             "funder_diversity_penalty": funder_diversity_penalty,
+            "creator_funder_match_count": stats.creator_funder_match_count,
+            "creator_funder_match_sol": stats.creator_funder_match_sol,
             "dynamic_narrative_bonus": dynamic_bonus,
             "curve_progress_pct": curve_progress_pct,
             "buyer_quality_pct": buyer_quality_pct,
@@ -3233,6 +3391,8 @@ mod tests {
             buy_count: 2,
             eligible_buyers: 2,
             unique_funders: 0,
+            creator_funder_match_count: 0,
+            creator_funder_match_sol: 0.0,
             max_single_buyer_share: 0.55,
             max_single_buyer: Some("a".to_string()),
             creator_buy_count: 0,
@@ -3267,6 +3427,8 @@ mod tests {
             buy_count: 4,
             eligible_buyers: 4,
             unique_funders: 0,
+            creator_funder_match_count: 0,
+            creator_funder_match_sol: 0.0,
             max_single_buyer_share: 0.35,
             max_single_buyer: Some("a".to_string()),
             creator_buy_count: 0,
@@ -3294,6 +3456,8 @@ mod tests {
             buy_count: 2,
             eligible_buyers: 2,
             unique_funders: 0,
+            creator_funder_match_count: 0,
+            creator_funder_match_sol: 0.0,
             max_single_buyer_share: 0.55,
             max_single_buyer: Some("a".to_string()),
             creator_buy_count: 0,
@@ -3346,6 +3510,8 @@ mod tests {
             buy_count: 1,
             eligible_buyers: 1,
             unique_funders: 0,
+            creator_funder_match_count: 0,
+            creator_funder_match_sol: 0.0,
             max_single_buyer_share: 1.0,
             max_single_buyer: Some("creator".to_string()),
             creator_buy_count: 1,
@@ -3401,6 +3567,8 @@ mod tests {
             buy_count: 2,
             eligible_buyers: 2,
             unique_funders: 0,
+            creator_funder_match_count: 0,
+            creator_funder_match_sol: 0.0,
             max_single_buyer_share: 0.66,
             max_single_buyer: Some("other".to_string()),
             creator_buy_count: 1,
@@ -3459,6 +3627,8 @@ mod tests {
             buy_count: 4,
             eligible_buyers: 4,
             unique_funders: 0,
+            creator_funder_match_count: 0,
+            creator_funder_match_sol: 0.0,
             max_single_buyer_share: 0.36,
             max_single_buyer: Some("creator".to_string()),
             creator_buy_count: 1,
@@ -3474,6 +3644,72 @@ mod tests {
             gate3_reject_path("gate3 reject: creator self-buy detected"),
             "creator_self_buy"
         );
+    }
+
+    #[test]
+    fn gate3_rejects_creator_linked_cluster_concentration() {
+        let cfg = base_config();
+        let candidate = Candidate {
+            token: NewToken {
+                mint: "mint".to_string(),
+                name: "name".to_string(),
+                symbol: "sym".to_string(),
+                uri: String::new(),
+                creator: "creator".to_string(),
+                bonding_curve: String::new(),
+                signature: String::new(),
+                slot: 0,
+                discovered_at_ms: 0,
+                feed_source: "test".to_string(),
+                is_v2: true,
+            },
+            created_at: Instant::now(),
+            discovered_at_ms: 0,
+            status: CandidateStatus::Active,
+            narrative_keywords: Vec::new(),
+            dynamic_narrative_keywords: Vec::new(),
+            early_buys: Vec::new(),
+            buy_signatures: HashSet::new(),
+            creator_profile: Some(CreatorProfile {
+                address: "creator".to_string(),
+                total_tokens: 1,
+                graduated: 0,
+                rug_count: 0,
+                oldest_tx_ms: 0,
+                wallet_age_days: 0,
+                first_funder: Some("funder-a".to_string()),
+                fetched_at_ms: 0,
+            }),
+            buyer_profiles: HashMap::new(),
+            pending_buyer_profiles: HashSet::new(),
+            trace: CandidateTrace::default(),
+        };
+        let stats = WindowStats {
+            mode: SmartMoneyMode::EarlyBuyerFallback,
+            fast_threshold: 2,
+            soft_threshold: 2,
+            unique_sm_wallets: ["buyer-1".to_string(), "buyer-2".to_string()]
+                .into_iter()
+                .collect(),
+            sm_sol_total: 1.40,
+            total_eligible_sol: 1.50,
+            fastest_sm_ms: Some(20),
+            fast_reached_at_ms: Some(120),
+            soft_reached_at_ms: Some(120),
+            buy_count: 2,
+            eligible_buyers: 2,
+            unique_funders: 1,
+            creator_funder_match_count: 2,
+            creator_funder_match_sol: 1.35,
+            max_single_buyer_share: 0.51,
+            max_single_buyer: Some("buyer-1".to_string()),
+            creator_buy_count: 0,
+            creator_buy_sol: 0.0,
+            elapsed_ms: 120,
+        };
+        let reason =
+            gate3_reject_reason(&candidate, &stats, &cfg).expect("creator-linked cluster reject");
+        assert!(reason.contains("creator-linked cluster"));
     }
 
     #[test]
