@@ -10,6 +10,9 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
+use tracing::info;
+
+const REPLAY_PROGRESS_EVERY: usize = 1_000;
 
 #[derive(Debug, Clone)]
 pub struct ReplayPipelineSummary {
@@ -27,9 +30,21 @@ pub async fn run_pipeline(
 ) -> Result<ReplayPipelineSummary> {
     prepare_replay_db(config).await?;
 
-    let source_db = FilterDb::new(&config.filter_db_path).await?;
+    let source_db_path = if config.filter_db_path == config.replay_db_path {
+        &config.filter_db_path
+    } else {
+        &config.replay_db_path
+    };
+    let source_db = FilterDb::new(source_db_path).await?;
     let raw_events = source_db.list_raw_events_window(from_ms, to_ms).await?;
     let source_event_count = raw_events.len();
+    info!(
+        "Replay pipeline source prepared | raw_events={} | source_db={} | from_ms={} | to_ms={}",
+        source_event_count,
+        source_db_path,
+        from_ms,
+        to_ms,
+    );
 
     let mut replayed_events = Vec::with_capacity(raw_events.len());
     for record in raw_events {
@@ -65,7 +80,7 @@ pub async fn run_pipeline(
 
     let start = Instant::now();
     let mut previous_ts = replayed_events.first().map(|(ts, _)| *ts).unwrap_or(to_ms);
-    for (recorded_at_ms, event) in &replayed_events {
+    for (idx, (recorded_at_ms, event)) in replayed_events.iter().enumerate() {
         let delta_ms = recorded_at_ms.saturating_sub(previous_ts);
         let scaled_ms = ((delta_ms as f64) / config.replay_speedup.max(1.0)).round() as u64;
         if scaled_ms > 0 {
@@ -73,6 +88,15 @@ pub async fn run_pipeline(
         }
         if scanner_tx.send(event.clone()).await.is_err() {
             break;
+        }
+        if (idx + 1) % REPLAY_PROGRESS_EVERY == 0 || idx + 1 == replayed_events.len() {
+            info!(
+                "Replay pipeline progress | replayed={}/{} | elapsed_ms={} | latest_recorded_at_ms={}",
+                idx + 1,
+                replayed_events.len(),
+                start.elapsed().as_millis(),
+                recorded_at_ms,
+            );
         }
         previous_ts = *recorded_at_ms;
     }
