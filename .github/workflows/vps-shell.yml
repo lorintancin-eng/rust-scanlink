@@ -42,11 +42,33 @@ jobs:
             set -euo pipefail
             cd /home/ubuntu/rust-scanlink
 
-            if [ -f ./.env ]; then
-              set -a
-              . ./.env
-              set +a
-            fi
+            load_env_file() {
+              if [ ! -f ./.env ]; then
+                return 0
+              fi
+              while IFS= read -r raw_line || [ -n "$raw_line" ]; do
+                line="${raw_line%$'\r'}"
+                case "$line" in
+                  ""|\#*)
+                    continue
+                    ;;
+                esac
+                if [[ "$line" != *=* ]]; then
+                  continue
+                fi
+                key="${line%%=*}"
+                value="${line#*=}"
+                key="${key//[[:space:]]/}"
+                if [[ "$value" == \"*\" && "$value" == *\" ]]; then
+                  value="${value:1:${#value}-2}"
+                elif [[ "$value" == \'*\' && "$value" == *\' ]]; then
+                  value="${value:1:${#value}-2}"
+                fi
+                export "$key=$value"
+              done < ./.env
+            }
+
+            load_env_file
 
             FILTER_DB_PATH="${FILTER_DB_PATH:-data/filter.sqlite3}"
             RUNTIME_PID_DIR="$(dirname "$FILTER_DB_PATH")"
@@ -132,7 +154,7 @@ jobs:
 
                 TS="$(date +%Y%m%d-%H%M%S)"
                 LOG_FILE="scanner-$TS.log"
-                nohup bash -lc 'cd /home/ubuntu/rust-scanlink && if [ -f ./.env ]; then set -a; . ./.env; set +a; fi; exec ./rust-scanlink-trader' \
+                nohup ./rust-scanlink-trader \
                   >> "/home/ubuntu/rust-scanlink/$LOG_FILE" 2>&1 < /dev/null &
                 sleep 5
 
