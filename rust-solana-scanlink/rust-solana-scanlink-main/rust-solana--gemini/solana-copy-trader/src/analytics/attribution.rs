@@ -1,7 +1,6 @@
 use crate::filter::{
-    ExecutionReceiptRecord, FeedFirstHitRecord, FeedHealthRecord, FilterDb, FilterResultRecord,
-    FilterTimingRecord, Gate3SnapshotRecord, LabelSuggestionRecord, PostTradeOutcomeRecord,
-    ScoringBreakdownRecord,
+    FeedHealthRecord, FilterDb, FilterResultRecord, FilterTimingRecord, Gate3SnapshotRecord,
+    PostTradeOutcomeRecord, ScoringBreakdownRecord,
 };
 use anyhow::Result;
 use serde::Serialize;

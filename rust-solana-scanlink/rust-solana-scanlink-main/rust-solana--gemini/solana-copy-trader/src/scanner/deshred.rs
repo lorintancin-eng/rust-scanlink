@@ -48,7 +48,7 @@ pub async fn start_feed_loop(
             "scanner: connecting deshred feed={} url={}",
             endpoint.label, endpoint.url
         );
-        match run_stream(cfg.as_ref(), &endpoint, &tx, db.as_ref()).await {
+        match run_stream(cfg.as_ref(), &endpoint, &tx, db.as_ref(), &failover).await {
             Ok(()) => {
                 record_feed_health(
                     db.as_ref(),
@@ -103,6 +103,7 @@ async fn run_stream(
     endpoint: &FeedEndpoint,
     tx: &mpsc::Sender<ScannerEvent>,
     db: Option<&FilterDb>,
+    failover: &std::sync::Arc<Mutex<FailoverController>>,
 ) -> Result<()> {
     let mut client = GeyserGrpcClient::build_from_shared(endpoint.url.clone())?
         .x_token(endpoint.token.clone())?
@@ -205,10 +206,10 @@ async fn record_feed_health(
 
     if let Err(err) = db
         .insert_feed_health(&FeedHealthRecord {
-            feed_label: event.feed_label,
-            feed_url: event.feed_url,
-            status: event.status,
-            detail: event.detail,
+            feed_label: event.feed_label.clone(),
+            feed_url: event.feed_url.clone(),
+            status: event.status.clone(),
+            detail: event.detail.clone(),
             ts_ms: event.ts_ms,
         })
         .await

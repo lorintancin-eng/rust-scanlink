@@ -829,12 +829,13 @@ impl FilterDb {
     pub async fn get_funder_blacklist_reason(&self, address: &str) -> Result<Option<String>> {
         let address = address.to_string();
         self.with_conn(move |conn| {
-            conn.query_row(
-                "SELECT reason FROM funder_blacklist WHERE address = ?1",
-                params![address],
-                |row| row.get(0),
-            )
-            .optional()
+            Ok(conn
+                .query_row(
+                    "SELECT reason FROM funder_blacklist WHERE address = ?1",
+                    params![address],
+                    |row| row.get(0),
+                )
+                .optional()?)
         })
         .await
     }

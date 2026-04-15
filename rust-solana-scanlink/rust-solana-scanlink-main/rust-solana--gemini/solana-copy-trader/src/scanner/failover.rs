@@ -182,9 +182,10 @@ impl FailoverController {
         let Some(entry) = self.feeds.get_mut(feed_label) else {
             return None;
         };
+        let kind = entry.kind;
         entry.first_hit_count = entry.first_hit_count.saturating_add(1);
         entry.last_first_hit_ms = detected_at_ms;
-        self.recompute_preferred(entry.kind, detected_at_ms, "first_hit".to_string())
+        self.recompute_preferred(kind, detected_at_ms, "first_hit".to_string())
     }
 
     pub fn snapshot(&self) -> Vec<FeedRuntimeState> {
