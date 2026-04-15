@@ -1,0 +1,52 @@
+name: Deploy Rust Scanlink Trader To VPS
+
+on:
+  workflow_dispatch:
+    inputs:
+      build_run_id:
+        description: Build run ID that produced rust-scanlink-trader-linux
+        required: true
+        type: string
+
+jobs:
+  deploy-vps:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download Linux artifact from build run
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          mkdir -p artifact
+          gh run download "${{ inputs.build_run_id }}" -n rust-scanlink-trader-linux -D artifact
+          test -f artifact/rust-scanlink-trader
+          chmod 755 artifact/rust-scanlink-trader
+          ls -l artifact/rust-scanlink-trader
+
+      - name: Upload binary to VPS target directory
+        uses: appleboy/scp-action@v0.1.7
+        with:
+          host: ${{ secrets.VPS_HOST }}
+          username: ${{ secrets.VPS_USER }}
+          key: ${{ secrets.VPS_SSH_KEY }}
+          port: ${{ secrets.VPS_PORT }}
+          source: artifact/rust-scanlink-trader
+          target: /home/ubuntu/rust-scanlink/
+          strip_components: 1
+
+      - name: Verify deployed binary on VPS
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.VPS_HOST }}
+          username: ${{ secrets.VPS_USER }}
+          key: ${{ secrets.VPS_SSH_KEY }}
+          port: ${{ secrets.VPS_PORT }}
+          script_stop: true
+          script: |
+            set -euo pipefail
+            cd /home/ubuntu/rust-scanlink
+            test -f rust-scanlink-trader
+            chmod 755 rust-scanlink-trader
+            pwd
+            ls -l rust-scanlink-trader
+            sha256sum rust-scanlink-trader
