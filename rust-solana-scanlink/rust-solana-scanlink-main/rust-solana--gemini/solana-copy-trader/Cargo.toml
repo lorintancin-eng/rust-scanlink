@@ -1,6 +1,6 @@
 [package]
 name = "solana-copy-trader"
-version = "1.7.4"
+version = "1.7.5"
 edition = "2021"
 description = "High-performance Solana copy-trading bot in Rust"
 
@@ -47,7 +47,7 @@ anyhow = "1"
 thiserror = "2"
 dashmap = "6"
 chrono = "0.4"
-rusqlite = { version = "0.32", features = ["bundled"] }
+rusqlite = { version = "0.32", features = ["bundled", "backup"] }
 
 # Borsh for on-chain data deserialization
 borsh = "1"

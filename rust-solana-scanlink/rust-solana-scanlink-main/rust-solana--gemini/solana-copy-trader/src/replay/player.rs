@@ -3,9 +3,10 @@ use crate::filter;
 use crate::filter::FilterDb;
 use crate::scanner::raw_event::raw_event_to_scanner_event;
 use anyhow::{Context, Result};
+use rusqlite::{Connection, DatabaseName, OpenFlags};
 use solana_client::rpc_client::RpcClient;
 use solana_sdk::commitment_config::CommitmentConfig;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
@@ -102,14 +103,70 @@ async fn prepare_replay_db(config: &AppConfig) -> Result<()> {
     if let Some(parent) = target.parent() {
         tokio::fs::create_dir_all(parent).await?;
     }
-    if tokio::fs::try_exists(source).await? {
-        tokio::fs::copy(source, target).await.with_context(|| {
-            format!(
-                "copy replay db failed: {} -> {}",
-                source.display(),
-                target.display()
-            )
+    if !tokio::fs::try_exists(source).await? {
+        return Ok(());
+    }
+
+    let source = source.to_path_buf();
+    let target = target.to_path_buf();
+    tokio::task::spawn_blocking(move || snapshot_sqlite_db(&source, &target))
+        .await
+        .context("replay db snapshot join failed")??;
+
+    Ok(())
+}
+
+fn snapshot_sqlite_db(source: &Path, target: &Path) -> Result<()> {
+    let temp_target = replay_temp_path(target);
+    if temp_target.exists() {
+        std::fs::remove_file(&temp_target).with_context(|| {
+            format!("remove stale replay temp db failed: {}", temp_target.display())
         })?;
     }
+
+    let source_conn = Connection::open_with_flags(
+        source,
+        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )
+    .with_context(|| format!("open replay source db failed: {}", source.display()))?;
+
+    source_conn
+        .backup(
+            DatabaseName::Main,
+            &temp_target,
+            None::<fn(rusqlite::backup::Progress)>,
+        )
+        .with_context(|| {
+            format!(
+                "sqlite backup replay db failed: {} -> {}",
+                source.display(),
+                temp_target.display()
+            )
+        })?;
+
+    if target.exists() {
+        std::fs::remove_file(target)
+            .with_context(|| format!("remove stale replay target failed: {}", target.display()))?;
+    }
+
+    std::fs::rename(&temp_target, target).with_context(|| {
+        format!(
+            "promote replay temp db failed: {} -> {}",
+            temp_target.display(),
+            target.display()
+        )
+    })?;
+
     Ok(())
+}
+
+fn replay_temp_path(target: &Path) -> PathBuf {
+    let mut temp = target.to_path_buf();
+    let file_name = target
+        .file_name()
+        .and_then(|name| name.to_str())
+        .map(|name| format!("{name}.tmp"))
+        .unwrap_or_else(|| "replay.tmp".to_string());
+    temp.set_file_name(file_name);
+    temp
 }
