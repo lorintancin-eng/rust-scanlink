@@ -334,7 +334,7 @@ async fn main() -> Result<()> {
         config.coingecko_api_key.is_some(),
     );
     info!(
-        "Scanner feeds: mode={} | primary_label={} primary_url={} | secondary_label={} secondary_url={} | deshred_label={} deshred_url={} | persist_raw_events={} gate3_sequences={} scoring_breakdowns={} labels={} feed_health={} catchup_window_ms={} catchup_max_events={} failover_stale_ms={} replay_db={} replay_report={}",
+        "Scanner feeds: mode={} | primary_label={} primary_url={} | secondary_label={} secondary_url={} | deshred_label={} deshred_url={} | persist_raw_events={} gate3_sequences={} scoring_breakdowns={} labels={} feed_health={} catchup_window_ms={} catchup_max_events={} failover_stale_ms={} health_snapshot_secs={} replay_db={} replay_report={}",
         config.scanner_mode,
         config.scanner_primary_feed_label,
         config.scanner_grpc_url,
@@ -356,6 +356,7 @@ async fn main() -> Result<()> {
         config.scanner_catchup_window_ms,
         config.scanner_catchup_max_events,
         config.scanner_failover_stale_ms,
+        config.scanner_health_snapshot_secs,
         config.replay_db_path,
         config.replay_report_file,
     );
