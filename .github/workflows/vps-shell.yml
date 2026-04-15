@@ -59,11 +59,16 @@ jobs:
                 key="${line%%=*}"
                 value="${line#*=}"
                 key="${key//[[:space:]]/}"
-                if [[ "$value" == \"*\" && "$value" == *\" ]]; then
-                  value="${value:1:${#value}-2}"
-                elif [[ "$value" == \'*\' && "$value" == *\' ]]; then
-                  value="${value:1:${#value}-2}"
-                fi
+                case "$value" in
+                  \"*\")
+                    value="${value#\"}"
+                    value="${value%\"}"
+                    ;;
+                  \'*\')
+                    value="${value#\'}"
+                    value="${value%\'}"
+                    ;;
+                esac
                 export "$key=$value"
               done < ./.env
             }
