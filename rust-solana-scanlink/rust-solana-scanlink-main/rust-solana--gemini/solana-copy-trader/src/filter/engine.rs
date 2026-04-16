@@ -86,6 +86,16 @@ const QUALITY_CLUSTER_MAX_SHARE: f64 = 0.60;
 const QUALITY_CLUSTER_BONUS_SCORE: u32 = 6;
 const FAST_QUALITY_CLUSTER_SCORE_RELIEF: u32 = 4;
 const RAW_BUY_PERSIST_QUEUE_CAPACITY: usize = 8_192;
+const NARRATIVE_SOURCE_BASE_MARKET: &str = "base_market";
+const NARRATIVE_SOURCE_PREHEAT_SOCIAL: &str = "preheat_social";
+const NARRATIVE_SOURCE_PREHEAT_TELEGRAM: &str = "preheat_telegram";
+const NARRATIVE_SOURCE_PREHEAT_EVENT: &str = "preheat_event";
+const NARRATIVE_SOURCE_CONFIRMED_ONCHAIN: &str = "confirmed_onchain";
+const NARRATIVE_MASK_BASE_MARKET: u32 = 1 << 0;
+const NARRATIVE_MASK_SOCIAL: u32 = 1 << 1;
+const NARRATIVE_MASK_TELEGRAM: u32 = 1 << 2;
+const NARRATIVE_MASK_EVENT: u32 = 1 << 3;
+const NARRATIVE_MASK_ONCHAIN: u32 = 1 << 4;
 
 #[derive(Debug, Clone)]
 pub struct BuySignal {
@@ -109,6 +119,29 @@ enum CandidateStatus {
     Finalizing,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Default)]
+enum NarrativeTier {
+    #[default]
+    Preheat,
+    Base,
+    Confirmed,
+}
+
+#[derive(Debug, Clone, Default)]
+struct NarrativeHotTerm {
+    tier: NarrativeTier,
+    score: u32,
+    source_mask: u32,
+}
+
+#[derive(Debug, Clone)]
+struct NarrativeKeywordMatch {
+    keyword: String,
+    tier: NarrativeTier,
+    score: u32,
+    source_mask: u32,
+}
+
 #[derive(Debug, Clone, Default)]
 struct CandidateTrace {
     gate1_at_ms: Option<u64>,
@@ -128,6 +161,7 @@ struct Candidate {
     gate1_risk: Gate1RiskProfile,
     narrative_keywords: Vec<String>,
     dynamic_narrative_keywords: Vec<String>,
+    narrative_keyword_matches: Vec<NarrativeKeywordMatch>,
     early_buys: Vec<PumpBuyEvent>,
     buy_signatures: HashSet<String>,
     creator_profile: Option<CreatorProfile>,
@@ -143,6 +177,7 @@ struct HotLists {
     smart_money_funders: HashSet<String>,
     blocked_buyers: HashSet<String>,
     dynamic_hot_keywords: HashSet<String>,
+    narrative_terms: HashMap<String, NarrativeHotTerm>,
 }
 
 #[derive(Debug)]
@@ -270,6 +305,17 @@ struct ClusterAdjustment {
     quality_cluster: bool,
 }
 
+#[derive(Debug, Clone, Default)]
+struct NarrativeAdjustment {
+    preheat_hits: usize,
+    base_hits: usize,
+    confirmed_hits: usize,
+    preheat_bonus: u32,
+    base_bonus: u32,
+    confirmed_bonus: u32,
+    fast_required_score_relief: u32,
+}
+
 #[derive(Debug, Clone)]
 struct ScoringContext {
     participants_score: u32,
@@ -278,6 +324,7 @@ struct ScoringContext {
     curve_score: u32,
     buyer_quality_score: u32,
     dynamic_narrative_bonus: u32,
+    narrative: NarrativeAdjustment,
     funder_diversity_penalty: u32,
     runtime_risk: RuntimeRiskProfile,
     cluster: ClusterAdjustment,
@@ -495,6 +542,7 @@ struct Gate1Decision {
     risk: Gate1RiskProfile,
     narrative_keywords: Vec<String>,
     dynamic_narrative_keywords: Vec<String>,
+    narrative_keyword_matches: Vec<NarrativeKeywordMatch>,
 }
 
 async fn handle_new_token(
@@ -517,6 +565,7 @@ async fn handle_new_token(
         risk: gate1_risk,
         narrative_keywords: gate1_narrative_keywords,
         dynamic_narrative_keywords: gate1_dynamic_keywords,
+        narrative_keyword_matches,
     } = gate1;
     if !gate1_passed {
         let trace = CandidateTrace {
@@ -556,6 +605,7 @@ async fn handle_new_token(
             gate1_risk: gate1_risk,
             narrative_keywords: gate1_narrative_keywords,
             dynamic_narrative_keywords: gate1_dynamic_keywords,
+            narrative_keyword_matches,
             early_buys: Vec::new(),
             buy_signatures: HashSet::new(),
             creator_profile: None,
@@ -857,8 +907,8 @@ fn spawn_score_task(
 
 fn collect_narrative_keywords(
     token: &NewToken,
-    dynamic_hot_keywords: &HashSet<String>,
-) -> (Vec<String>, Vec<String>) {
+    narrative_terms: &HashMap<String, NarrativeHotTerm>,
+) -> (Vec<String>, Vec<String>, Vec<NarrativeKeywordMatch>) {
     let haystack = format!("{} {}", token.name, token.symbol);
     let tokens = tokenize_keyword_text(&haystack);
 
@@ -868,10 +918,28 @@ fn collect_narrative_keywords(
         .map(|kw| (*kw).to_string())
         .collect();
 
-    let mut dynamic_narrative_keywords: Vec<String> = dynamic_hot_keywords
+    let mut matched_terms: Vec<NarrativeKeywordMatch> = narrative_terms
         .iter()
-        .filter(|kw| tokens.contains(kw.as_str()))
-        .cloned()
+        .filter(|(kw, _)| tokens.contains(kw.as_str()))
+        .map(|(keyword, term)| NarrativeKeywordMatch {
+            keyword: keyword.clone(),
+            tier: term.tier,
+            score: term.score,
+            source_mask: term.source_mask,
+        })
+        .collect();
+
+    matched_terms.sort_by(|a, b| {
+        b.tier
+            .cmp(&a.tier)
+            .then_with(|| b.score.cmp(&a.score))
+            .then_with(|| a.keyword.cmp(&b.keyword))
+    });
+    matched_terms.dedup_by(|a, b| a.keyword == b.keyword);
+
+    let mut dynamic_narrative_keywords: Vec<String> = matched_terms
+        .iter()
+        .map(|item| item.keyword.clone())
         .collect();
 
     dynamic_narrative_keywords.sort();
@@ -880,7 +948,162 @@ fn collect_narrative_keywords(
     narrative_keywords.sort();
     narrative_keywords.dedup();
 
-    (narrative_keywords, dynamic_narrative_keywords)
+    (
+        narrative_keywords,
+        dynamic_narrative_keywords,
+        matched_terms,
+    )
+}
+
+fn narrative_tier_for_source(source: &str) -> NarrativeTier {
+    if source.starts_with("confirmed_") {
+        NarrativeTier::Confirmed
+    } else if source.starts_with("base_") {
+        NarrativeTier::Base
+    } else {
+        NarrativeTier::Preheat
+    }
+}
+
+fn narrative_source_mask(source: &str) -> u32 {
+    match source {
+        NARRATIVE_SOURCE_BASE_MARKET => NARRATIVE_MASK_BASE_MARKET,
+        NARRATIVE_SOURCE_PREHEAT_SOCIAL => NARRATIVE_MASK_SOCIAL,
+        NARRATIVE_SOURCE_PREHEAT_TELEGRAM => NARRATIVE_MASK_TELEGRAM,
+        NARRATIVE_SOURCE_PREHEAT_EVENT => NARRATIVE_MASK_EVENT,
+        NARRATIVE_SOURCE_CONFIRMED_ONCHAIN => NARRATIVE_MASK_ONCHAIN,
+        _ => 0,
+    }
+}
+
+fn merge_narrative_keyword_record(
+    map: &mut HashMap<String, NarrativeHotTerm>,
+    record: &DynamicKeywordRecord,
+) {
+    let tier = narrative_tier_for_source(&record.source);
+    let source_mask = narrative_source_mask(&record.source);
+    let entry = map.entry(record.keyword.clone()).or_default();
+    if tier > entry.tier {
+        entry.tier = tier;
+    }
+    entry.score = entry.score.saturating_add(record.score);
+    entry.source_mask |= source_mask;
+}
+
+fn normalize_seed_keywords(lines: Vec<String>) -> Vec<String> {
+    extract_dynamic_keywords_from_texts(lines)
+}
+
+fn build_ranked_keyword_records(
+    source: &str,
+    keywords: Vec<String>,
+    now_ms: u64,
+    ttl_secs: u64,
+) -> Vec<DynamicKeywordRecord> {
+    let expires_at_ms = now_ms.saturating_add(ttl_secs.saturating_mul(1000));
+    let mut seen = HashSet::new();
+    let mut ordered = Vec::new();
+    for keyword in keywords {
+        if seen.insert(keyword.clone()) {
+            ordered.push(keyword);
+        }
+    }
+    let total = ordered.len().max(1) as u32;
+    ordered
+        .into_iter()
+        .enumerate()
+        .map(|(idx, keyword)| DynamicKeywordRecord {
+            keyword,
+            source: source.to_string(),
+            score: total.saturating_sub(idx as u32),
+            expires_at_ms,
+        })
+        .collect()
+}
+
+fn build_counted_keyword_records(
+    source: &str,
+    keywords: Vec<(String, u32)>,
+    now_ms: u64,
+    ttl_secs: u64,
+) -> Vec<DynamicKeywordRecord> {
+    let expires_at_ms = now_ms.saturating_add(ttl_secs.saturating_mul(1000));
+    keywords
+        .into_iter()
+        .map(|(keyword, score)| DynamicKeywordRecord {
+            keyword,
+            source: source.to_string(),
+            score,
+            expires_at_ms,
+        })
+        .collect()
+}
+
+fn sort_narrative_snapshot(
+    map: &HashMap<String, NarrativeHotTerm>,
+    limit: usize,
+) -> Vec<(String, NarrativeHotTerm)> {
+    let mut items: Vec<(String, NarrativeHotTerm)> = map
+        .iter()
+        .map(|(keyword, term)| (keyword.clone(), term.clone()))
+        .collect();
+    items.sort_by(|a, b| {
+        b.1.tier
+            .cmp(&a.1.tier)
+            .then_with(|| b.1.score.cmp(&a.1.score))
+            .then_with(|| a.0.cmp(&b.0))
+    });
+    items.truncate(limit.max(1));
+    items
+}
+
+async fn fetch_onchain_confirmed_keywords(shared: &SharedState) -> Result<Vec<(String, u32)>> {
+    let now = now_ms();
+    let from_ms = now.saturating_sub(
+        shared
+            .config
+            .narrative_onchain_confirm_window_secs
+            .saturating_mul(1000),
+    );
+    let rows = shared.db.list_raw_events_window(from_ms, now).await?;
+    let mut mints_by_keyword: HashMap<String, HashSet<String>> = HashMap::new();
+
+    for row in rows {
+        if row.event_type != "new_token" {
+            continue;
+        }
+        let Ok(payload) = serde_json::from_str::<Value>(&row.payload_json) else {
+            continue;
+        };
+        let mut texts = Vec::new();
+        if let Some(name) = payload.get("name").and_then(Value::as_str) {
+            texts.push(name.to_string());
+        }
+        if let Some(symbol) = payload.get("symbol").and_then(Value::as_str) {
+            texts.push(symbol.to_string());
+        }
+        if texts.is_empty() {
+            continue;
+        }
+        let keywords = extract_dynamic_keywords_from_texts(texts);
+        for keyword in keywords {
+            mints_by_keyword
+                .entry(keyword)
+                .or_default()
+                .insert(row.mint.clone());
+        }
+    }
+
+    let mut ranked: Vec<(String, u32)> = mints_by_keyword
+        .into_iter()
+        .filter_map(|(keyword, mints)| {
+            let count = mints.len();
+            (count >= shared.config.narrative_onchain_confirm_min_mints)
+                .then_some((keyword, count as u32))
+        })
+        .collect();
+    ranked.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+    Ok(ranked)
 }
 
 fn tokenize_keyword_text(input: &str) -> HashSet<String> {
@@ -913,6 +1136,7 @@ async fn gate1_check(
             risk: Gate1RiskProfile::default(),
             narrative_keywords: Vec::new(),
             dynamic_narrative_keywords: Vec::new(),
+            narrative_keyword_matches: Vec::new(),
         };
     }
 
@@ -936,6 +1160,7 @@ async fn gate1_check(
             risk: Gate1RiskProfile::default(),
             narrative_keywords: Vec::new(),
             dynamic_narrative_keywords: Vec::new(),
+            narrative_keyword_matches: Vec::new(),
         };
     }
 
@@ -946,6 +1171,7 @@ async fn gate1_check(
             risk: Gate1RiskProfile::default(),
             narrative_keywords: Vec::new(),
             dynamic_narrative_keywords: Vec::new(),
+            narrative_keyword_matches: Vec::new(),
         };
     }
     if token.symbol.chars().count() > 10 {
@@ -958,6 +1184,7 @@ async fn gate1_check(
             risk: Gate1RiskProfile::default(),
             narrative_keywords: Vec::new(),
             dynamic_narrative_keywords: Vec::new(),
+            narrative_keyword_matches: Vec::new(),
         };
     }
 
@@ -973,11 +1200,12 @@ async fn gate1_check(
             risk: Gate1RiskProfile::default(),
             narrative_keywords: Vec::new(),
             dynamic_narrative_keywords: Vec::new(),
+            narrative_keyword_matches: Vec::new(),
         };
     }
 
-    let (narrative_keywords, dynamic_narrative_keywords) =
-        collect_narrative_keywords(token, &hotlists.dynamic_hot_keywords);
+    let (narrative_keywords, dynamic_narrative_keywords, narrative_keyword_matches) =
+        collect_narrative_keywords(token, &hotlists.narrative_terms);
     drop(hotlists);
 
     let (uri_host, uri_pattern, template_hash) = derive_template_identity(token);
@@ -1017,6 +1245,7 @@ async fn gate1_check(
             risk,
             narrative_keywords,
             dynamic_narrative_keywords,
+            narrative_keyword_matches,
         };
     }
 
@@ -1026,6 +1255,7 @@ async fn gate1_check(
         risk,
         narrative_keywords,
         dynamic_narrative_keywords,
+        narrative_keyword_matches,
     }
 }
 
@@ -1629,8 +1859,11 @@ async fn smart_money_stats(candidate: &Candidate, shared: &SharedState) -> Windo
         unique_sm_wallets.insert(buyer);
         sm_sol_total += buy_sol;
         let elapsed_ms = buy.detected_at_ms.saturating_sub(candidate.detected_at_ms);
-        let current_largest_funder_cluster_size =
-            funder_buy_counts.values().copied().max().unwrap_or_default();
+        let current_largest_funder_cluster_size = funder_buy_counts
+            .values()
+            .copied()
+            .max()
+            .unwrap_or_default();
         let current_largest_funder_cluster_share = if eligible_buyers.is_empty() {
             0.0
         } else {
@@ -1650,10 +1883,10 @@ async fn smart_money_stats(candidate: &Candidate, shared: &SharedState) -> Windo
         } else {
             shared.config.gate3_fast_min_sol
         };
-        let current_same_cluster_pressure =
-            eligible_buy_count >= SAME_FUNDER_CLUSTER_PENALTY_MIN_BUYS
-                && current_largest_funder_cluster_size >= SAME_FUNDER_CLUSTER_PENALTY_MIN_BUYS
-                && current_largest_funder_cluster_share >= SAME_FUNDER_CLUSTER_PENALTY_SHARE;
+        let current_same_cluster_pressure = eligible_buy_count
+            >= SAME_FUNDER_CLUSTER_PENALTY_MIN_BUYS
+            && current_largest_funder_cluster_size >= SAME_FUNDER_CLUSTER_PENALTY_MIN_BUYS
+            && current_largest_funder_cluster_share >= SAME_FUNDER_CLUSTER_PENALTY_SHARE;
         fastest_sm_ms = Some(match fastest_sm_ms {
             Some(current) => current.min(elapsed_ms),
             None => elapsed_ms,
@@ -1673,7 +1906,11 @@ async fn smart_money_stats(candidate: &Candidate, shared: &SharedState) -> Windo
         }
     }
 
-    let largest_funder_cluster_size = funder_buy_counts.values().copied().max().unwrap_or_default();
+    let largest_funder_cluster_size = funder_buy_counts
+        .values()
+        .copied()
+        .max()
+        .unwrap_or_default();
     let largest_funder_cluster_share = if eligible_buyers.is_empty() {
         0.0
     } else {
@@ -1809,6 +2046,49 @@ fn build_cluster_adjustment(
     }
 }
 
+fn build_narrative_adjustment(
+    candidate: &Candidate,
+    shared: &SharedState,
+    path: Gate3Path,
+) -> NarrativeAdjustment {
+    let mut adjustment = NarrativeAdjustment::default();
+    for term in &candidate.narrative_keyword_matches {
+        match term.tier {
+            NarrativeTier::Preheat => adjustment.preheat_hits += 1,
+            NarrativeTier::Base => adjustment.base_hits += 1,
+            NarrativeTier::Confirmed => adjustment.confirmed_hits += 1,
+        }
+    }
+    adjustment.preheat_bonus = (adjustment.preheat_hits as u32)
+        .saturating_mul(shared.config.narrative_preheat_bonus_per_hit);
+    adjustment.base_bonus =
+        (adjustment.base_hits as u32).saturating_mul(shared.config.narrative_base_bonus_per_hit);
+    adjustment.confirmed_bonus = (adjustment.confirmed_hits as u32)
+        .saturating_mul(shared.config.narrative_confirmed_bonus_per_hit);
+    let mut overflow = adjustment
+        .preheat_bonus
+        .saturating_add(adjustment.base_bonus)
+        .saturating_add(adjustment.confirmed_bonus)
+        .saturating_sub(shared.config.dynamic_narrative_bonus_cap);
+    if overflow > 0 {
+        let cut_confirmed = adjustment.confirmed_bonus.min(overflow);
+        adjustment.confirmed_bonus = adjustment.confirmed_bonus.saturating_sub(cut_confirmed);
+        overflow = overflow.saturating_sub(cut_confirmed);
+    }
+    if overflow > 0 {
+        let cut_base = adjustment.base_bonus.min(overflow);
+        adjustment.base_bonus = adjustment.base_bonus.saturating_sub(cut_base);
+        overflow = overflow.saturating_sub(cut_base);
+    }
+    if overflow > 0 {
+        adjustment.preheat_bonus = adjustment.preheat_bonus.saturating_sub(overflow);
+    }
+    if path == Gate3Path::Fast && adjustment.confirmed_hits > 0 {
+        adjustment.fast_required_score_relief = shared.config.narrative_confirmed_fast_score_relief;
+    }
+    adjustment
+}
+
 async fn build_scoring_context(
     shared: &SharedState,
     candidate: &Candidate,
@@ -1853,9 +2133,12 @@ async fn build_scoring_context(
         .await
         .unwrap_or(0.0);
     let buyer_quality_score = (buyer_quality_pct * 15.0).round().clamp(0.0, 15.0) as u32;
-    let dynamic_narrative_bonus = ((candidate.dynamic_narrative_keywords.len() as u32)
-        .saturating_mul(shared.config.dynamic_narrative_bonus_per_hit))
-    .min(shared.config.dynamic_narrative_bonus_cap);
+    let narrative = build_narrative_adjustment(candidate, shared, path);
+    let dynamic_narrative_bonus = narrative
+        .preheat_bonus
+        .saturating_add(narrative.base_bonus)
+        .saturating_add(narrative.confirmed_bonus)
+        .min(shared.config.dynamic_narrative_bonus_cap);
     let funder_diversity_penalty = if stats.eligible_buyers >= GATE3_MIN_UNIQUE_FUNDERS
         && stats.unique_funders < GATE3_MIN_UNIQUE_FUNDERS
     {
@@ -1895,7 +2178,8 @@ async fn build_scoring_context(
             .config
             .filter_fast_min_score
             .min(shared.config.filter_min_score)
-            .saturating_sub(cluster.fast_required_score_relief),
+            .saturating_sub(cluster.fast_required_score_relief)
+            .saturating_sub(narrative.fast_required_score_relief),
         Gate3Path::Soft => shared
             .config
             .filter_soft_min_score
@@ -1910,6 +2194,7 @@ async fn build_scoring_context(
         curve_score,
         buyer_quality_score,
         dynamic_narrative_bonus,
+        narrative,
         funder_diversity_penalty,
         runtime_risk,
         cluster,
@@ -1961,7 +2246,7 @@ async fn score_candidate(shared: &SharedState, mut candidate: Candidate) -> Scor
 
     let scoring = build_scoring_context(shared, &candidate, &stats, trigger.path).await;
     let reason = format!(
-        "mode={} path={} participants={} capital={} momentum={} curve={} buyer_quality={} narrative_bonus={} risk_penalty={} suspicious_cluster_penalty={} same_cluster_penalty={} cluster_bonus={} fast_relief={} total={} required={} | matched={} eligible={} unique_funders={} sol={:.2} fastest={}ms largest_cluster={}/{}({:.2}) hot_funders={} narrative={}",
+        "mode={} path={} participants={} capital={} momentum={} curve={} buyer_quality={} narrative_bonus={} preheat_hits={} base_hits={} confirmed_hits={} risk_penalty={} suspicious_cluster_penalty={} same_cluster_penalty={} cluster_bonus={} fast_relief={} narrative_fast_relief={} total={} required={} | matched={} eligible={} unique_funders={} sol={:.2} fastest={}ms largest_cluster={}/{}({:.2}) hot_funders={} narrative={}",
         smart_money_mode_label(stats.mode),
         gate3_path_label(trigger.path),
         scoring.participants_score,
@@ -1970,11 +2255,15 @@ async fn score_candidate(shared: &SharedState, mut candidate: Candidate) -> Scor
         scoring.curve_score,
         scoring.buyer_quality_score,
         scoring.dynamic_narrative_bonus,
+        scoring.narrative.preheat_hits,
+        scoring.narrative.base_hits,
+        scoring.narrative.confirmed_hits,
         scoring.runtime_risk.penalty_score,
         scoring.cluster.suspicious_funder_penalty,
         scoring.cluster.same_cluster_first_buy_penalty,
         scoring.cluster.quality_cluster_bonus,
         scoring.cluster.fast_required_score_relief,
+        scoring.narrative.fast_required_score_relief,
         scoring.total_score,
         scoring.required_score,
         stats.unique_sm_wallets.len(),
@@ -2351,7 +2640,8 @@ async fn fetch_address_snapshot(
 
     if let Some(mut snapshot) = stale_snapshot {
         snapshot.source = format!("stale:{}", snapshot.source);
-        maybe_spawn_address_snapshot_refresh(shared, address.to_string(), api_key.to_string()).await;
+        maybe_spawn_address_snapshot_refresh(shared, address.to_string(), api_key.to_string())
+            .await;
         warn!(
             "address snapshot stale-while-revalidate | address={} | source={}",
             address, snapshot.source
@@ -2423,7 +2713,10 @@ async fn maybe_spawn_address_snapshot_refresh(
                 );
             }
             Err(err) => {
-                warn!("address snapshot refresh failed | address={} | {}", address, err);
+                warn!(
+                    "address snapshot refresh failed | address={} | {}",
+                    address, err
+                );
             }
         }
 
@@ -2471,8 +2764,12 @@ async fn fetch_address_snapshot_helius(
             .with_context(|| format!("Helius oldest tx query failed: {}", address))?;
         let status = response.status();
         if status == StatusCode::TOO_MANY_REQUESTS {
-            let cooldown_ms = retry_after_to_ms(response.headers())
-                .unwrap_or(shared.config.address_snapshot_provider_cooldown_ms.max(1_000));
+            let cooldown_ms = retry_after_to_ms(response.headers()).unwrap_or(
+                shared
+                    .config
+                    .address_snapshot_provider_cooldown_ms
+                    .max(1_000),
+            );
             set_helius_snapshot_cooldown(shared, cooldown_ms).await;
             anyhow::bail!(
                 "Helius oldest tx rate limited: {} | cooldown_ms={}",
@@ -2525,7 +2822,10 @@ async fn fetch_address_snapshot_helius(
     }
 
     Err(last_error.unwrap_or_else(|| {
-        anyhow::anyhow!("Helius oldest tx failed without detailed error: {}", address)
+        anyhow::anyhow!(
+            "Helius oldest tx failed without detailed error: {}",
+            address
+        )
     }))
 }
 
@@ -2651,24 +2951,40 @@ async fn cache_address_snapshot_memory(
 }
 
 async fn helius_snapshot_cooldown_remaining_ms(shared: &SharedState) -> u64 {
-    let guard = shared.address_snapshot_helius_cooldown_until_ms.read().await;
+    let guard = shared
+        .address_snapshot_helius_cooldown_until_ms
+        .read()
+        .await;
     guard.saturating_sub(now_ms())
 }
 
 async fn set_helius_snapshot_cooldown(shared: &SharedState, cooldown_ms: u64) {
     let until_ms = now_ms().saturating_add(cooldown_ms);
-    let mut guard = shared.address_snapshot_helius_cooldown_until_ms.write().await;
+    let mut guard = shared
+        .address_snapshot_helius_cooldown_until_ms
+        .write()
+        .await;
     *guard = (*guard).max(until_ms);
 }
 
 async fn clear_helius_snapshot_cooldown(shared: &SharedState) {
-    let mut guard = shared.address_snapshot_helius_cooldown_until_ms.write().await;
+    let mut guard = shared
+        .address_snapshot_helius_cooldown_until_ms
+        .write()
+        .await;
     *guard = 0;
 }
 
 fn retry_after_to_ms(headers: &reqwest::header::HeaderMap) -> Option<u64> {
-    let value = headers.get(reqwest::header::RETRY_AFTER)?.to_str().ok()?.trim();
-    value.parse::<u64>().ok().map(|seconds| seconds.saturating_mul(1000))
+    let value = headers
+        .get(reqwest::header::RETRY_AFTER)?
+        .to_str()
+        .ok()?
+        .trim();
+    value
+        .parse::<u64>()
+        .ok()
+        .map(|seconds| seconds.saturating_mul(1000))
 }
 
 fn extract_first_funder(item: &Value, address: &str) -> Option<String> {
@@ -2709,45 +3025,124 @@ fn extract_first_funder(item: &Value, address: &str) -> Option<String> {
 }
 
 async fn refresh_dynamic_hot_keywords(shared: &SharedState) -> Result<()> {
-    let keywords = fetch_dynamic_hot_keywords(shared).await?;
-    if keywords.is_empty() {
-        anyhow::bail!("dynamic keyword sources returned no usable keywords");
+    let now = now_ms();
+    let market_keywords = match fetch_dynamic_hot_keywords(shared).await {
+        Ok(keywords) => keywords,
+        Err(err) => {
+            warn!("dynamic keywords: base market refresh failed: {}", err);
+            Vec::new()
+        }
+    };
+    let social_keywords = normalize_seed_keywords(
+        load_plaintext_set(&shared.config.narrative_social_keywords_file).await?,
+    );
+    let telegram_keywords = normalize_seed_keywords(
+        load_plaintext_set(&shared.config.narrative_telegram_keywords_file).await?,
+    );
+    let event_keywords = normalize_seed_keywords(
+        load_plaintext_set(&shared.config.narrative_event_keywords_file).await?,
+    );
+    let confirmed_keywords = match fetch_onchain_confirmed_keywords(shared).await {
+        Ok(keywords) => keywords,
+        Err(err) => {
+            warn!(
+                "dynamic keywords: onchain confirmation refresh failed: {}",
+                err
+            );
+            Vec::new()
+        }
+    };
+
+    let source_records = vec![
+        (
+            NARRATIVE_SOURCE_BASE_MARKET,
+            build_ranked_keyword_records(
+                NARRATIVE_SOURCE_BASE_MARKET,
+                market_keywords,
+                now,
+                shared.config.narrative_base_ttl_secs,
+            ),
+        ),
+        (
+            NARRATIVE_SOURCE_PREHEAT_SOCIAL,
+            build_ranked_keyword_records(
+                NARRATIVE_SOURCE_PREHEAT_SOCIAL,
+                social_keywords,
+                now,
+                shared.config.narrative_preheat_ttl_secs,
+            ),
+        ),
+        (
+            NARRATIVE_SOURCE_PREHEAT_TELEGRAM,
+            build_ranked_keyword_records(
+                NARRATIVE_SOURCE_PREHEAT_TELEGRAM,
+                telegram_keywords,
+                now,
+                shared.config.narrative_preheat_ttl_secs,
+            ),
+        ),
+        (
+            NARRATIVE_SOURCE_PREHEAT_EVENT,
+            build_ranked_keyword_records(
+                NARRATIVE_SOURCE_PREHEAT_EVENT,
+                event_keywords,
+                now,
+                shared.config.narrative_preheat_ttl_secs,
+            ),
+        ),
+        (
+            NARRATIVE_SOURCE_CONFIRMED_ONCHAIN,
+            build_counted_keyword_records(
+                NARRATIVE_SOURCE_CONFIRMED_ONCHAIN,
+                confirmed_keywords,
+                now,
+                shared.config.narrative_confirmed_ttl_secs,
+            ),
+        ),
+    ];
+
+    shared
+        .db
+        .replace_dynamic_keywords("dynamic_hot_refresh", &[])
+        .await?;
+    let mut merged = HashMap::new();
+    for (source, records) in &source_records {
+        shared.db.replace_dynamic_keywords(source, records).await?;
+        for record in records {
+            merge_narrative_keyword_record(&mut merged, record);
+        }
     }
 
-    write_plaintext_lines(&shared.config.dynamic_hot_keywords_file, &keywords).await?;
-    let expiry_ms = now_ms().saturating_add(
-        shared
-            .config
-            .dynamic_hot_refresh_secs
-            .max(30)
-            .saturating_mul(2)
-            * 1000,
-    );
-    let keyword_records: Vec<DynamicKeywordRecord> = keywords
-        .iter()
-        .enumerate()
-        .map(|(idx, keyword)| DynamicKeywordRecord {
-            keyword: keyword.clone(),
-            source: "dynamic_hot_refresh".to_string(),
-            score: shared
-                .config
-                .dynamic_hot_keywords_limit
-                .saturating_sub(idx)
-                .max(1) as u32,
-            expires_at_ms: expiry_ms,
-        })
-        .collect();
-    if let Err(err) = shared
-        .db
-        .replace_dynamic_keywords("dynamic_hot_refresh", &keyword_records)
-        .await
-    {
-        warn!("dynamic keyword sqlite sync failed: {}", err);
+    if merged.is_empty() {
+        anyhow::bail!("all narrative keyword sources returned no usable keywords");
     }
+
+    let snapshot = sort_narrative_snapshot(&merged, shared.config.dynamic_hot_keywords_limit);
+    let snapshot_keywords: Vec<String> = snapshot
+        .iter()
+        .map(|(keyword, _)| keyword.clone())
+        .collect();
+    let preheat_count = snapshot
+        .iter()
+        .filter(|(_, term)| term.tier == NarrativeTier::Preheat)
+        .count();
+    let base_count = snapshot
+        .iter()
+        .filter(|(_, term)| term.tier == NarrativeTier::Base)
+        .count();
+    let confirmed_count = snapshot
+        .iter()
+        .filter(|(_, term)| term.tier == NarrativeTier::Confirmed)
+        .count();
+
+    write_plaintext_lines(&shared.config.dynamic_hot_keywords_file, &snapshot_keywords).await?;
     info!(
-        "Dynamic hot keywords refreshed | count={} | sample={}",
-        keywords.len(),
-        keywords
+        "Dynamic narrative terms refreshed | total={} | preheat={} | base={} | confirmed={} | sample={}",
+        snapshot_keywords.len(),
+        preheat_count,
+        base_count,
+        confirmed_count,
+        snapshot_keywords
             .iter()
             .take(8)
             .cloned()
@@ -2995,28 +3390,48 @@ fn score_dynamic_keywords(scores: &mut HashMap<String, u32>, keywords: Vec<Strin
 }
 
 async fn reload_hotlists(shared: &SharedState) -> Result<()> {
+    let now = now_ms();
     let blacklist = load_plaintext_set(&shared.config.creator_blacklist_file).await?;
     let smart_money = load_plaintext_set(&shared.config.smart_money_file).await?;
     let smart_money_funders = load_plaintext_set(&shared.config.smart_money_funder_file).await?;
     let blocked_buyers = load_plaintext_set(&shared.config.blocked_buyers_file).await?;
     let dynamic_hot_keywords = load_plaintext_set(&shared.config.dynamic_hot_keywords_file).await?;
+    let active_dynamic_keywords = shared.db.list_active_dynamic_keywords(now).await?;
+    let mut narrative_terms = HashMap::new();
+    for record in &active_dynamic_keywords {
+        merge_narrative_keyword_record(&mut narrative_terms, record);
+    }
+    if narrative_terms.is_empty() {
+        for keyword in &dynamic_hot_keywords {
+            narrative_terms.insert(
+                keyword.clone(),
+                NarrativeHotTerm {
+                    tier: NarrativeTier::Preheat,
+                    score: 1,
+                    source_mask: 0,
+                },
+            );
+        }
+    }
     {
         let mut hotlists = shared.hotlists.write().await;
         hotlists.creator_blacklist = blacklist.iter().cloned().collect();
         hotlists.smart_money = smart_money.iter().cloned().collect();
         hotlists.smart_money_funders = smart_money_funders.iter().cloned().collect();
         hotlists.blocked_buyers = blocked_buyers.iter().cloned().collect();
-        hotlists.dynamic_hot_keywords = dynamic_hot_keywords.iter().cloned().collect();
+        hotlists.dynamic_hot_keywords = narrative_terms.keys().cloned().collect();
+        hotlists.narrative_terms = narrative_terms.clone();
     }
     shared.db.sync_blacklist(&blacklist).await?;
     shared.db.sync_smart_money(&smart_money).await?;
     info!(
-        "Filter hotlists loaded | blacklist={} | smart_money={} | smart_money_funders={} | blocked_buyers={} | dynamic_hot_keywords={}",
+        "Filter hotlists loaded | blacklist={} | smart_money={} | smart_money_funders={} | blocked_buyers={} | dynamic_hot_keywords={} | narrative_terms={}",
         blacklist.len(),
         smart_money.len(),
         smart_money_funders.len(),
         blocked_buyers.len(),
         dynamic_hot_keywords.len(),
+        narrative_terms.len(),
     );
     if shared.config.disable_smart_money_filter {
         warn!(
@@ -3357,10 +3772,16 @@ fn enqueue_raw_buy_persist(shared: &SharedState, buy: &PumpBuyEvent) {
     match shared.raw_buy_persist_tx.try_send(buy.clone()) {
         Ok(()) => {}
         Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
-            warn!("raw buy persist queue full; dropping event | mint={}", buy.mint);
+            warn!(
+                "raw buy persist queue full; dropping event | mint={}",
+                buy.mint
+            );
         }
         Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
-            warn!("raw buy persist queue closed; dropping event | mint={}", buy.mint);
+            warn!(
+                "raw buy persist queue closed; dropping event | mint={}",
+                buy.mint
+            );
         }
     }
 }
@@ -3706,7 +4127,24 @@ async fn persist_candidate_analytics(
             "creator_cluster_wallet_count": scoring.cluster.creator_cluster_wallet_count,
             "creator_cluster_rug_exposure": scoring.cluster.creator_cluster_rug_exposure,
             "dynamic_narrative_bonus": scoring.dynamic_narrative_bonus,
+            "narrative_preheat_hits": scoring.narrative.preheat_hits,
+            "narrative_base_hits": scoring.narrative.base_hits,
+            "narrative_confirmed_hits": scoring.narrative.confirmed_hits,
+            "narrative_preheat_bonus": scoring.narrative.preheat_bonus,
+            "narrative_base_bonus": scoring.narrative.base_bonus,
+            "narrative_confirmed_bonus": scoring.narrative.confirmed_bonus,
+            "narrative_fast_required_score_relief": scoring.narrative.fast_required_score_relief,
             "dynamic_narrative_keywords": &candidate.dynamic_narrative_keywords,
+            "dynamic_narrative_tiers": candidate
+                .narrative_keyword_matches
+                .iter()
+                .map(|item| json!({
+                    "keyword": item.keyword,
+                    "tier": format!("{:?}", item.tier),
+                    "score": item.score,
+                    "source_mask": item.source_mask,
+                }))
+                .collect::<Vec<_>>(),
             "curve_progress_pct": scoring.curve_progress_pct,
             "buyer_quality_pct": scoring.buyer_quality_pct,
             "reason": reason,
@@ -3977,11 +4415,19 @@ mod tests {
             blocked_buyers_file: String::new(),
             creator_blacklist_file: String::new(),
             dynamic_hot_keywords_file: String::new(),
+            narrative_social_keywords_file: String::new(),
+            narrative_telegram_keywords_file: String::new(),
+            narrative_event_keywords_file: String::new(),
             latency_metrics_file: String::new(),
             filter_hot_reload_secs: 0,
             dynamic_hot_refresh_secs: 60,
             dynamic_hot_keywords_enabled: true,
             dynamic_hot_keywords_limit: 40,
+            narrative_preheat_ttl_secs: 7_200,
+            narrative_base_ttl_secs: 86_400,
+            narrative_confirmed_ttl_secs: 21_600,
+            narrative_onchain_confirm_window_secs: 900,
+            narrative_onchain_confirm_min_mints: 2,
             persist_raw_scanner_events: true,
             persist_gate3_sequences: true,
             persist_scoring_breakdowns: true,
@@ -4010,6 +4456,10 @@ mod tests {
             filter_min_score: 60,
             filter_fast_min_score: 48,
             filter_soft_min_score: 58,
+            narrative_preheat_bonus_per_hit: 1,
+            narrative_base_bonus_per_hit: 1,
+            narrative_confirmed_bonus_per_hit: 2,
+            narrative_confirmed_fast_score_relief: 2,
             dynamic_narrative_bonus_per_hit: 3,
             dynamic_narrative_bonus_cap: 6,
             risk_template_repeat_threshold: 3,
@@ -4262,6 +4712,7 @@ mod tests {
             gate1_risk: Gate1RiskProfile::default(),
             narrative_keywords: Vec::new(),
             dynamic_narrative_keywords: Vec::new(),
+            narrative_keyword_matches: Vec::new(),
             early_buys: Vec::new(),
             buy_signatures: HashSet::new(),
             creator_profile: None,
@@ -4324,6 +4775,7 @@ mod tests {
             gate1_risk: Gate1RiskProfile::default(),
             narrative_keywords: Vec::new(),
             dynamic_narrative_keywords: Vec::new(),
+            narrative_keyword_matches: Vec::new(),
             early_buys: Vec::new(),
             buy_signatures: HashSet::new(),
             creator_profile: None,
@@ -4386,6 +4838,7 @@ mod tests {
             gate1_risk: Gate1RiskProfile::default(),
             narrative_keywords: Vec::new(),
             dynamic_narrative_keywords: Vec::new(),
+            narrative_keyword_matches: Vec::new(),
             early_buys: Vec::new(),
             buy_signatures: HashSet::new(),
             creator_profile: None,
@@ -4461,6 +4914,7 @@ mod tests {
             gate1_risk: Gate1RiskProfile::default(),
             narrative_keywords: Vec::new(),
             dynamic_narrative_keywords: Vec::new(),
+            narrative_keyword_matches: Vec::new(),
             early_buys: Vec::new(),
             buy_signatures: HashSet::new(),
             creator_profile: Some(CreatorProfile {
@@ -4526,11 +4980,22 @@ mod tests {
             feed_source: "test".to_string(),
             is_v2: true,
         };
-        let mut dynamic = HashSet::new();
-        dynamic.insert("full".to_string());
-        let (all_keywords, dynamic_keywords) = collect_narrative_keywords(&token, &dynamic);
+        let mut dynamic = HashMap::new();
+        dynamic.insert(
+            "full".to_string(),
+            NarrativeHotTerm {
+                tier: NarrativeTier::Confirmed,
+                score: 5,
+                source_mask: NARRATIVE_MASK_ONCHAIN,
+            },
+        );
+        let (all_keywords, dynamic_keywords, matches) =
+            collect_narrative_keywords(&token, &dynamic);
         assert!(!all_keywords.iter().any(|kw| kw == "ai"));
         assert!(dynamic_keywords.iter().any(|kw| kw == "full"));
+        assert!(matches
+            .iter()
+            .any(|item| item.keyword == "full" && item.tier == NarrativeTier::Confirmed));
     }
 
     #[test]

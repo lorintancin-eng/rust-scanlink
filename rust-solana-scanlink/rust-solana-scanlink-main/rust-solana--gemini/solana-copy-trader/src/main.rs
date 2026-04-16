@@ -28,8 +28,8 @@ use tokio::net::{lookup_host, TcpStream};
 use tokio::sync::{mpsc, RwLock, Semaphore};
 use tracing::{error, info, warn};
 
-use autosell::{AutoSellManager, Position, SellAccountSnapshot, SellSignal};
 use analytics::runtime::{build_runtime_report, log_runtime_report, persist_runtime_report};
+use autosell::{AutoSellManager, Position, SellAccountSnapshot, SellSignal};
 use config::{
     classify_stream_endpoint, infer_stream_region, is_rabbitstream_url, same_stream_endpoint,
     stream_provider, AppConfig,
@@ -112,7 +112,8 @@ fn log_scanner_topology(config: &AppConfig) {
         config.grpc_account_url,
         endpoint_profile(&config.grpc_account_url),
     );
-    if is_rabbitstream_url(&config.scanner_grpc_url) && config.scanner_secondary_grpc_url.is_none() {
+    if is_rabbitstream_url(&config.scanner_grpc_url) && config.scanner_secondary_grpc_url.is_none()
+    {
         warn!("Shyft topology: RabbitStream is primary but no Yellowstone fallback is configured");
     }
     if !is_rabbitstream_url(&config.scanner_grpc_url) && is_rabbitstream_url(&config.grpc_url) {
@@ -154,7 +155,8 @@ fn collect_endpoint_probe_targets(config: &AppConfig) -> Vec<EndpointProbeTarget
 }
 
 async fn probe_endpoint_connect_ms(url: &str) -> Result<u128> {
-    let parsed = reqwest::Url::parse(url).with_context(|| format!("invalid endpoint url: {url}"))?;
+    let parsed =
+        reqwest::Url::parse(url).with_context(|| format!("invalid endpoint url: {url}"))?;
     let host = parsed
         .host_str()
         .map(str::to_string)
@@ -205,9 +207,7 @@ fn spawn_endpoint_probe_task(config: &AppConfig) {
                 ),
                 Err(err) => warn!(
                     "Endpoint probe failed | role={} | url={} | {}",
-                    target.role,
-                    target.url,
-                    err,
+                    target.role, target.url, err,
                 ),
             }
         }
@@ -283,7 +283,10 @@ fn execution_feedback_from_receipts(
 }
 
 fn execution_status_is_success(status: &str) -> bool {
-    matches!(status, "confirmed" | "landed" | "bundle_accepted" | "success")
+    matches!(
+        status,
+        "confirmed" | "landed" | "bundle_accepted" | "success"
+    )
 }
 
 fn execution_status_is_failure(status: &str) -> bool {
@@ -472,13 +475,24 @@ async fn main() -> Result<()> {
         config.blocked_buyers_file,
     );
     info!(
-        "Dynamic hot keywords: enabled={} refresh_secs={} limit={} bonus_per_hit={} cap={} file={} | coingecko_pro={}",
+        "Dynamic hot keywords: enabled={} refresh_secs={} limit={} snapshot_file={} | social_file={} telegram_file={} event_file={} | preheat_ttl={}s base_ttl={}s confirmed_ttl={}s confirm_window={}s confirm_min_mints={} | bonuses preheat={} base={} confirmed={} fast_relief={} cap={} | coingecko_pro={}",
         config.dynamic_hot_keywords_enabled,
         config.dynamic_hot_refresh_secs,
         config.dynamic_hot_keywords_limit,
-        config.dynamic_narrative_bonus_per_hit,
-        config.dynamic_narrative_bonus_cap,
         config.dynamic_hot_keywords_file,
+        config.narrative_social_keywords_file,
+        config.narrative_telegram_keywords_file,
+        config.narrative_event_keywords_file,
+        config.narrative_preheat_ttl_secs,
+        config.narrative_base_ttl_secs,
+        config.narrative_confirmed_ttl_secs,
+        config.narrative_onchain_confirm_window_secs,
+        config.narrative_onchain_confirm_min_mints,
+        config.narrative_preheat_bonus_per_hit,
+        config.narrative_base_bonus_per_hit,
+        config.narrative_confirmed_bonus_per_hit,
+        config.narrative_confirmed_fast_score_relief,
+        config.dynamic_narrative_bonus_cap,
         config.coingecko_api_key.is_some(),
     );
     info!(
@@ -516,8 +530,7 @@ async fn main() -> Result<()> {
     spawn_endpoint_probe_task(config.as_ref());
     info!(
         "Execution feedback: window_secs={} refresh_secs={}",
-        config.execution_feedback_window_secs,
-        config.execution_feedback_refresh_secs,
+        config.execution_feedback_window_secs, config.execution_feedback_refresh_secs,
     );
     info!(
         "Runtime report: enabled={} interval_secs={} window_secs={} file={}",
@@ -588,13 +601,15 @@ async fn main() -> Result<()> {
             interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
             loop {
                 let to_ms = current_time_ms();
-                let from_ms = to_ms.saturating_sub(
-                    runtime_cfg
-                        .runtime_report_window_secs
-                        .saturating_mul(1000),
-                );
-                match build_runtime_report(runtime_db.as_ref(), runtime_cfg.as_ref(), from_ms, to_ms)
-                    .await
+                let from_ms = to_ms
+                    .saturating_sub(runtime_cfg.runtime_report_window_secs.saturating_mul(1000));
+                match build_runtime_report(
+                    runtime_db.as_ref(),
+                    runtime_cfg.as_ref(),
+                    from_ms,
+                    to_ms,
+                )
+                .await
                 {
                     Ok(report) => {
                         log_runtime_report(&report);
@@ -1149,8 +1164,10 @@ async fn execute_buy(
                                         path: execution_profile.signal_path.clone(),
                                         quality_score: execution_profile.quality_score,
                                         urgency_score: execution_profile.urgency_score,
-                                        execution_confidence: execution_profile.execution_confidence,
-                                        priority_fee_micro_lamport: config.priority_fee_micro_lamport,
+                                        execution_confidence: execution_profile
+                                            .execution_confidence,
+                                        priority_fee_micro_lamport: config
+                                            .priority_fee_micro_lamport,
                                         jito_tip_lamports: effective_tip_lamports,
                                         zero_slot_tip_lamports: effective_tip_lamports,
                                         recorded_at_ms: current_time_ms(),
@@ -1168,8 +1185,10 @@ async fn execute_buy(
                                 latency_ms: total_latency.as_millis() as u64,
                             });
 
-                            let user_ata =
-                                prefetched.as_ref().map(|pf| pf.user_ata).unwrap_or_else(|| {
+                            let user_ata = prefetched
+                                .as_ref()
+                                .map(|pf| pf.user_ata)
+                                .unwrap_or_else(|| {
                                     get_associated_token_address(&config.pubkey, mint)
                                 });
                             if config.auto_sell_enabled {

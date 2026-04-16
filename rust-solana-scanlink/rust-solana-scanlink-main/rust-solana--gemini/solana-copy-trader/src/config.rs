@@ -45,6 +45,9 @@ pub struct AppConfig {
     pub blocked_buyers_file: String,
     pub creator_blacklist_file: String,
     pub dynamic_hot_keywords_file: String,
+    pub narrative_social_keywords_file: String,
+    pub narrative_telegram_keywords_file: String,
+    pub narrative_event_keywords_file: String,
     pub latency_metrics_file: String,
     pub replay_db_path: String,
     pub replay_mode_enabled: bool,
@@ -62,6 +65,11 @@ pub struct AppConfig {
     pub dynamic_hot_refresh_secs: u64,
     pub dynamic_hot_keywords_enabled: bool,
     pub dynamic_hot_keywords_limit: usize,
+    pub narrative_preheat_ttl_secs: u64,
+    pub narrative_base_ttl_secs: u64,
+    pub narrative_confirmed_ttl_secs: u64,
+    pub narrative_onchain_confirm_window_secs: u64,
+    pub narrative_onchain_confirm_min_mints: usize,
     pub persist_raw_scanner_events: bool,
     pub persist_gate3_sequences: bool,
     pub persist_scoring_breakdowns: bool,
@@ -90,6 +98,10 @@ pub struct AppConfig {
     pub filter_min_score: u32,
     pub filter_fast_min_score: u32,
     pub filter_soft_min_score: u32,
+    pub narrative_preheat_bonus_per_hit: u32,
+    pub narrative_base_bonus_per_hit: u32,
+    pub narrative_confirmed_bonus_per_hit: u32,
+    pub narrative_confirmed_fast_score_relief: u32,
     pub dynamic_narrative_bonus_per_hit: u32,
     pub dynamic_narrative_bonus_cap: u32,
     pub risk_template_repeat_threshold: u32,
@@ -222,25 +234,26 @@ impl AppConfig {
         ])
         .or_else(|| grpc_token.clone())
         .or_else(|| grpc_account_token.clone());
-        let scanner_secondary_env = first_env(&["SCANNER_SECONDARY_GRPC_URL"])
-            .filter(|value| !value.trim().is_empty());
+        let scanner_secondary_env =
+            first_env(&["SCANNER_SECONDARY_GRPC_URL"]).filter(|value| !value.trim().is_empty());
         let scanner_secondary_auto_inferred = scanner_secondary_env.is_none()
             && is_rabbitstream_url(&scanner_grpc_url)
             && !same_stream_endpoint(&scanner_grpc_url, &grpc_account_url);
         let scanner_secondary_grpc_url = scanner_secondary_env
             .clone()
             .or_else(|| scanner_secondary_auto_inferred.then(|| grpc_account_url.clone()));
-        let scanner_secondary_grpc_token = first_env(&["SCANNER_SECONDARY_GRPC_TOKEN"]).or_else(|| {
-            scanner_secondary_grpc_url.as_ref().and_then(|url| {
-                if same_stream_endpoint(url, &grpc_account_url) {
-                    grpc_account_token
-                        .clone()
-                        .or_else(|| scanner_grpc_token.clone())
-                } else {
-                    scanner_grpc_token.clone()
-                }
-            })
-        });
+        let scanner_secondary_grpc_token =
+            first_env(&["SCANNER_SECONDARY_GRPC_TOKEN"]).or_else(|| {
+                scanner_secondary_grpc_url.as_ref().and_then(|url| {
+                    if same_stream_endpoint(url, &grpc_account_url) {
+                        grpc_account_token
+                            .clone()
+                            .or_else(|| scanner_grpc_token.clone())
+                    } else {
+                        scanner_grpc_token.clone()
+                    }
+                })
+            });
         let scanner_deshred_grpc_url = first_env(&["SCANNER_DESHRED_GRPC_URL", "DESHRED_GRPC_URL"])
             .filter(|value| !value.trim().is_empty())
             .or_else(|| {
@@ -318,11 +331,34 @@ impl AppConfig {
                 "DYNAMIC_HOT_KEYWORDS_FILE",
                 "data/dynamic_hot_keywords.txt",
             ),
+            narrative_social_keywords_file: env_or(
+                "NARRATIVE_SOCIAL_KEYWORDS_FILE",
+                "data/narrative_social_preheat.txt",
+            ),
+            narrative_telegram_keywords_file: env_or(
+                "NARRATIVE_TELEGRAM_KEYWORDS_FILE",
+                "data/narrative_telegram_preheat.txt",
+            ),
+            narrative_event_keywords_file: env_or(
+                "NARRATIVE_EVENT_KEYWORDS_FILE",
+                "data/narrative_event_preheat.txt",
+            ),
             latency_metrics_file: env_or("LATENCY_METRICS_FILE", "data/filter_latency.jsonl"),
             filter_hot_reload_secs: env_parse("FILTER_HOT_RELOAD_SECS", 300),
             dynamic_hot_refresh_secs: env_parse("DYNAMIC_HOT_REFRESH_SECS", 60),
             dynamic_hot_keywords_enabled: env_parse("DYNAMIC_HOT_KEYWORDS_ENABLED", true),
             dynamic_hot_keywords_limit: env_parse("DYNAMIC_HOT_KEYWORDS_LIMIT", 40),
+            narrative_preheat_ttl_secs: env_parse("NARRATIVE_PREHEAT_TTL_SECS", 7_200),
+            narrative_base_ttl_secs: env_parse("NARRATIVE_BASE_TTL_SECS", 86_400),
+            narrative_confirmed_ttl_secs: env_parse("NARRATIVE_CONFIRMED_TTL_SECS", 21_600),
+            narrative_onchain_confirm_window_secs: env_parse(
+                "NARRATIVE_ONCHAIN_CONFIRM_WINDOW_SECS",
+                900,
+            ),
+            narrative_onchain_confirm_min_mints: env_parse(
+                "NARRATIVE_ONCHAIN_CONFIRM_MIN_MINTS",
+                2,
+            ),
             persist_raw_scanner_events: env_parse("PERSIST_RAW_SCANNER_EVENTS", true),
             persist_gate3_sequences: env_parse("PERSIST_GATE3_SEQUENCES", true),
             persist_scoring_breakdowns: env_parse("PERSIST_SCORING_BREAKDOWNS", true),
@@ -357,6 +393,13 @@ impl AppConfig {
             filter_min_score: env_parse("FILTER_MIN_SCORE", 60),
             filter_fast_min_score: env_parse("FILTER_FAST_MIN_SCORE", 48),
             filter_soft_min_score: env_parse("FILTER_SOFT_MIN_SCORE", 58),
+            narrative_preheat_bonus_per_hit: env_parse("NARRATIVE_PREHEAT_BONUS_PER_HIT", 1),
+            narrative_base_bonus_per_hit: env_parse("NARRATIVE_BASE_BONUS_PER_HIT", 1),
+            narrative_confirmed_bonus_per_hit: env_parse("NARRATIVE_CONFIRMED_BONUS_PER_HIT", 2),
+            narrative_confirmed_fast_score_relief: env_parse(
+                "NARRATIVE_CONFIRMED_FAST_SCORE_RELIEF",
+                2,
+            ),
             dynamic_narrative_bonus_per_hit: env_parse("DYNAMIC_NARRATIVE_BONUS_PER_HIT", 3),
             dynamic_narrative_bonus_cap: env_parse("DYNAMIC_NARRATIVE_BONUS_CAP", 6),
             risk_template_repeat_threshold: env_parse("RISK_TEMPLATE_REPEAT_THRESHOLD", 3),

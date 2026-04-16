@@ -784,6 +784,34 @@ impl FilterDb {
         .await
     }
 
+    pub async fn list_active_dynamic_keywords(
+        &self,
+        now_ms: u64,
+    ) -> Result<Vec<DynamicKeywordRecord>> {
+        let path = self.path.clone();
+        tokio::task::spawn_blocking(move || {
+            let conn = open_conn(path.as_path())?;
+            let mut stmt = conn.prepare(
+                "SELECT keyword, source, score, expires_at_ms
+                 FROM dynamic_keywords
+                 WHERE expires_at_ms >= ?1
+                 ORDER BY score DESC, keyword ASC",
+            )?;
+            let rows = stmt.query_map(params![now_ms], |row| {
+                Ok(DynamicKeywordRecord {
+                    keyword: row.get(0)?,
+                    source: row.get(1)?,
+                    score: row.get::<_, u64>(2)? as u32,
+                    expires_at_ms: row.get(3)?,
+                })
+            })?;
+            rows.collect::<std::result::Result<Vec<_>, _>>()
+                .map_err(Into::into)
+        })
+        .await
+        .context("query active dynamic keywords failed")?
+    }
+
     pub async fn upsert_uri_pattern(&self, record: &UriPatternRecord) -> Result<()> {
         let record = record.clone();
         self.with_conn(move |conn| {
