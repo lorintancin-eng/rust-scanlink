@@ -8,7 +8,7 @@ use crate::scanner::failover::{
 use crate::scanner::feed::{FeedEndpoint, FeedKind};
 use crate::scanner::raw_event::raw_event_to_scanner_event;
 use crate::scanner::{
-    decoder, deshred, NewToken, PumpBuyEvent, ScannerEvent, PUMP_PROGRAM_ID,
+    decoder, NewToken, PumpBuyEvent, ScannerEvent, PUMP_PROGRAM_ID,
     SCANNER_BUY_CHANNEL_CAPACITY, SCANNER_NEW_TOKEN_CHANNEL_CAPACITY,
 };
 use anyhow::{Context, Result};
@@ -18,12 +18,13 @@ use std::{
     collections::{HashMap, HashSet},
     sync::{
         atomic::{AtomicU64, Ordering},
-        Arc,
+        Arc, Mutex as StdMutex,
     },
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 use tokio::io::AsyncWriteExt;
 use tokio::sync::{mpsc, Mutex};
+use tokio::task::JoinSet;
 use tokio::time::{sleep, timeout, Instant};
 use tonic::transport::ClientTlsConfig;
 use tracing::{debug, error, info, warn};
@@ -60,73 +61,38 @@ struct LiveDispatchMetrics {
 
 pub async fn start(
     cfg: Arc<AppConfig>,
-    db: Option<FilterDb>,
+    _db: Option<FilterDb>,
     new_token_tx: mpsc::Sender<NewToken>,
     buy_tx: mpsc::Sender<PumpBuyEvent>,
 ) -> Result<()> {
     let processed_endpoints = build_processed_endpoints(cfg.as_ref());
-    let deshred_endpoint = build_deshred_endpoint(cfg.as_ref());
     let processed_labels = processed_endpoints
         .iter()
         .map(format_endpoint_descriptor)
         .collect::<Vec<_>>()
         .join(",");
-    let deshred_label = deshred_endpoint
-        .as_ref()
-        .map(format_endpoint_descriptor)
-        .unwrap_or_else(|| "-".to_string());
-
-    match cfg.scanner_mode {
-        crate::scanner::feed::ScannerMode::ProcessedOnly if processed_endpoints.is_empty() => {
-            anyhow::bail!("SCANNER_MODE=processed-only but no processed feed is configured");
-        }
-        crate::scanner::feed::ScannerMode::DeshredOnly if deshred_endpoint.is_none() => {
-            anyhow::bail!("SCANNER_MODE=deshred-only but no deshred feed is configured");
-        }
-        crate::scanner::feed::ScannerMode::Hybrid
-            if processed_endpoints.is_empty() || deshred_endpoint.is_none() =>
-        {
-            anyhow::bail!(
-                "SCANNER_MODE=hybrid requires both processed and deshred feeds to be configured"
-            );
-        }
-        _ => {}
-    }
-
-    if processed_endpoints.is_empty() && deshred_endpoint.is_none() {
-        anyhow::bail!("scanner feed list is empty");
+    if processed_endpoints.is_empty() {
+        anyhow::bail!("scanner processed feed list is empty");
     }
 
     info!(
-        "scanner: starting feeds | mode={} | processed_feeds={} [{}] | deshred_feed={} | dedup_ttl_ms={} | dedup_max_keys={}",
+        "scanner: starting fast processed feeds | mode={} | processed_feeds={} [{}] | dedup_ttl_ms={} | dedup_max_keys={} | live_path=direct_dispatch",
         cfg.scanner_mode,
         processed_endpoints.len(),
         if processed_labels.is_empty() { "-" } else { processed_labels.as_str() },
-        deshred_label,
         SCANNER_DEDUP_TTL_MS,
         SCANNER_DEDUP_MAX_KEYS,
     );
+    if cfg.scanner_mode != crate::scanner::feed::ScannerMode::ProcessedOnly {
+        warn!(
+            "scanner: fast sniper path is forcing processed feeds only | configured_mode={} | deshred_feed_ignored={}",
+            cfg.scanner_mode,
+            cfg.scanner_deshred_grpc_url.is_some(),
+        );
+    }
 
-    let failover = Arc::new(Mutex::new(FailoverController::new(
-        cfg.scanner_failover_stale_ms,
-    )));
     let live_metrics = Arc::new(LiveDispatchMetrics::default());
-
-    let (raw_tx, mut raw_rx) = mpsc::channel::<ScannerEvent>(4096);
-    let catchup_replay_tx = raw_tx.clone();
-
-    if let Some(db) = db.as_ref() {
-        replay_pending_raw_events(cfg.as_ref(), db, &raw_tx, "startup").await?;
-    }
-
-    if cfg.scanner_health_snapshot_secs > 0 {
-        let snapshot_cfg = cfg.clone();
-        let snapshot_db = db.clone();
-        let snapshot_failover = failover.clone();
-        tokio::spawn(async move {
-            feed_runtime_snapshot_loop(snapshot_cfg, snapshot_db, snapshot_failover).await;
-        });
-    }
+    let seen = Arc::new(StdMutex::new(FastSeenCache::new(now_ms())));
 
     if SCANNER_LIVE_HEARTBEAT_SECS > 0 {
         let heartbeat_cfg = cfg.clone();
@@ -144,69 +110,103 @@ pub async fn start(
         });
     }
 
+    let mut task_set = JoinSet::new();
     for endpoint in processed_endpoints {
         let cfg_clone = cfg.clone();
-        let tx_clone = raw_tx.clone();
-        let db_clone = db.clone();
-        let failover_clone = failover.clone();
-        tokio::spawn(async move {
-            if let Err(err) =
-                start_processed_feed_loop(cfg_clone, endpoint, tx_clone, db_clone, failover_clone)
-                    .await
-            {
+        let endpoint_seen = seen.clone();
+        let endpoint_metrics = live_metrics.clone();
+        let endpoint_new_token_tx = new_token_tx.clone();
+        let endpoint_buy_tx = buy_tx.clone();
+        task_set.spawn(async move {
+            start_processed_feed_loop_fast(
+                cfg_clone,
+                endpoint,
+                endpoint_seen,
+                endpoint_metrics,
+                endpoint_new_token_tx,
+                endpoint_buy_tx,
+            )
+            .await
+        });
+    }
+
+    while let Some(joined) = task_set.join_next().await {
+        match joined {
+            Ok(Ok(())) => {
+                warn!("scanner: processed feed task exited because output channel closed");
+                return Ok(());
+            }
+            Ok(Err(err)) => {
                 error!("scanner: processed feed task exited | {}", err);
             }
-        });
-    }
-
-    if let Some(endpoint) = deshred_endpoint {
-        let cfg_clone = cfg.clone();
-        let tx_clone = raw_tx.clone();
-        let db_clone = db.clone();
-        let failover_clone = failover.clone();
-        tokio::spawn(async move {
-            if let Err(err) =
-                deshred::start_feed_loop(cfg_clone, endpoint, tx_clone, db_clone, failover_clone)
-                    .await
-            {
-                error!("scanner: deshred feed task exited | {}", err);
-            }
-        });
-    }
-
-    drop(raw_tx);
-
-    let mut seen = HashMap::<String, SeenSignal>::new();
-    let mut last_cleanup_ms = now_ms();
-    while let Some(event) = raw_rx.recv().await {
-        let now = now_ms();
-        if should_forward_event(
-            &mut seen,
-            &event,
-            now,
-            &mut last_cleanup_ms,
-            db.as_ref(),
-            cfg.as_ref(),
-            &failover,
-            &catchup_replay_tx,
-        )
-        .await?
-        {
-            if !dispatch_live_event(
-                cfg.as_ref(),
-                event,
-                &new_token_tx,
-                &buy_tx,
-                live_metrics.as_ref(),
-            )
-            .await?
-            {
-                return Ok(());
+            Err(err) => {
+                error!("scanner: processed feed task panicked | {}", err);
             }
         }
     }
 
     Ok(())
+}
+
+struct FastSeenCache {
+    entries: HashMap<String, SeenSignal>,
+    last_cleanup_ms: u64,
+}
+
+impl FastSeenCache {
+    fn new(now_ms: u64) -> Self {
+        Self {
+            entries: HashMap::new(),
+            last_cleanup_ms: now_ms,
+        }
+    }
+}
+
+fn should_forward_live_event(
+    cache: &StdMutex<FastSeenCache>,
+    event: &ScannerEvent,
+    now_ms: u64,
+) -> bool {
+    let (event_key, event_type, mint, signature, slot, feed_source) = event_identity(event);
+    let mut guard = match cache.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+
+    if now_ms.saturating_sub(guard.last_cleanup_ms) >= 30_000
+        || guard.entries.len() > SCANNER_DEDUP_MAX_KEYS
+    {
+        guard
+            .entries
+            .retain(|_, entry| now_ms.saturating_sub(entry.last_seen_ms) <= SCANNER_DEDUP_TTL_MS);
+        guard.last_cleanup_ms = now_ms;
+    }
+
+    match guard.entries.get_mut(&event_key) {
+        Some(existing) => {
+            existing.last_seen_ms = now_ms;
+            existing.sources.insert(feed_source.to_string());
+            false
+        }
+        None => {
+            let mut sources = HashSet::new();
+            sources.insert(feed_source.to_string());
+            guard.entries.insert(
+                event_key,
+                SeenSignal {
+                    event_type,
+                    mint: mint.to_string(),
+                    signature: signature.to_string(),
+                    slot,
+                    first_feed_source: feed_source.to_string(),
+                    first_seen_ms: now_ms,
+                    last_seen_ms: now_ms,
+                    sources,
+                },
+            );
+            true
+        }
+    }
 }
 
 async fn dispatch_live_event(
@@ -543,29 +543,172 @@ async fn warn_if_feed_first_hit_write_failed(db: &FilterDb, record: FeedFirstHit
 }
 
 fn event_identity(event: &ScannerEvent) -> (String, &'static str, &str, &str, u64, &str) {
-    let meta = event.meta();
-    let event_type = if meta.event_type == "new_token" {
-        "new"
-    } else {
-        "buy"
+    match event {
+        ScannerEvent::NewToken(token) => (
+            format!("new:{}:{}", token.signature, token.mint),
+            "new",
+            token.mint.as_str(),
+            token.signature.as_str(),
+            token.slot,
+            token.feed_source.as_str(),
+        ),
+        ScannerEvent::Buy(buy) => (
+            format!("buy:{}:{}", buy.signature, buy.mint),
+            "buy",
+            buy.mint.as_str(),
+            buy.signature.as_str(),
+            buy.slot,
+            buy.feed_source.as_str(),
+        ),
+    }
+}
+
+async fn start_processed_feed_loop_fast(
+    cfg: Arc<AppConfig>,
+    endpoint: FeedEndpoint,
+    seen: Arc<StdMutex<FastSeenCache>>,
+    metrics: Arc<LiveDispatchMetrics>,
+    new_token_tx: mpsc::Sender<NewToken>,
+    buy_tx: mpsc::Sender<PumpBuyEvent>,
+) -> Result<()> {
+    debug_assert_eq!(endpoint.kind, FeedKind::Processed);
+    let mut retry_delay = Duration::from_secs(1);
+
+    loop {
+        info!(
+            "scanner: connecting fast processed feed={} url={} profile={}",
+            endpoint.label,
+            endpoint.url,
+            format_endpoint_descriptor(&endpoint),
+        );
+        match run_processed_stream_fast(
+            cfg.as_ref(),
+            &endpoint,
+            &seen,
+            metrics.as_ref(),
+            &new_token_tx,
+            &buy_tx,
+        )
+        .await
+        {
+            Ok(()) => {
+                warn!(
+                    "scanner: processed output channel closed | feed={}",
+                    endpoint.label
+                );
+                return Ok(());
+            }
+            Err(err) => {
+                let (sleep_for, retry_class) = retry_delay_for_processed_error(retry_delay, &err);
+                error!(
+                    "scanner: fast processed feed disconnected | feed={} | retry_class={:?} | retry_in_ms={} | {}",
+                    endpoint.label,
+                    retry_class,
+                    sleep_for.as_millis(),
+                    err
+                );
+                sleep(sleep_for).await;
+                retry_delay = next_processed_retry_delay(sleep_for, retry_class);
+            }
+        }
+    }
+}
+
+async fn run_processed_stream_fast(
+    cfg: &AppConfig,
+    endpoint: &FeedEndpoint,
+    seen: &Arc<StdMutex<FastSeenCache>>,
+    metrics: &LiveDispatchMetrics,
+    new_token_tx: &mpsc::Sender<NewToken>,
+    buy_tx: &mpsc::Sender<PumpBuyEvent>,
+) -> Result<()> {
+    let mut client = GeyserGrpcClient::build_from_shared(endpoint.url.clone())?
+        .x_token(endpoint.token.clone())?
+        .connect_timeout(Duration::from_secs(10))
+        .timeout(Duration::from_secs(30))
+        .tls_config(ClientTlsConfig::new().with_native_roots())?
+        .max_decoding_message_size(64 * 1024 * 1024)
+        .connect()
+        .await
+        .context("scanner gRPC connect failed")?;
+
+    let (subscribe_tx, mut stream) = client
+        .subscribe_with_request(Some(build_subscribe_request()))
+        .await
+        .context("scanner subscribe request failed")?;
+    let keepalive_task =
+        spawn_keepalive_task(endpoint.label.clone(), "processed", subscribe_tx, build_ping_request);
+
+    info!(
+        "scanner: fast processed subscription ready | feed={} | program={} | idle_timeout_secs={}",
+        endpoint.label, PUMP_PROGRAM_ID, cfg.scanner_idle_timeout_secs
+    );
+
+    let mut last_message_at = Instant::now();
+    let idle_timeout = Duration::from_secs(cfg.scanner_idle_timeout_secs);
+
+    let result = 'stream: loop {
+        let next = timeout(Duration::from_secs(5), stream.next()).await;
+        match next {
+            Ok(Some(Ok(update))) => {
+                last_message_at = Instant::now();
+                match update.update_oneof {
+                    Some(UpdateOneof::Transaction(tx_update)) => {
+                        if let Some(tx_info) = tx_update.transaction.as_ref() {
+                            for event in decoder::decode_transaction(
+                                &endpoint.label,
+                                tx_update.slot,
+                                tx_info,
+                            ) {
+                                let should_forward =
+                                    should_forward_live_event(seen.as_ref(), &event, now_ms());
+                                if !should_forward {
+                                    continue;
+                                }
+                                if !dispatch_live_event(
+                                    cfg,
+                                    event,
+                                    new_token_tx,
+                                    buy_tx,
+                                    metrics,
+                                )
+                                .await?
+                                {
+                                    break 'stream Ok(());
+                                }
+                            }
+                        }
+                    }
+                    Some(UpdateOneof::Ping(_)) => {
+                        debug!("scanner: processed ping | feed={}", endpoint.label);
+                    }
+                    Some(UpdateOneof::Pong(_)) => {
+                        debug!("scanner: processed pong | feed={}", endpoint.label);
+                    }
+                    Some(other) => {
+                        debug!(
+                            "scanner: ignored non-transaction processed update | feed={} | kind={:?}",
+                            endpoint.label,
+                            std::mem::discriminant(&other)
+                        );
+                    }
+                    None => {}
+                }
+            }
+            Ok(Some(Err(err))) => break Err(err).context("scanner stream read failed"),
+            Ok(None) => break Err(anyhow::anyhow!("scanner stream ended unexpectedly")),
+            Err(_) if last_message_at.elapsed() >= idle_timeout => {
+                break Err(anyhow::anyhow!(
+                    "scanner processed feed idle timeout | feed={} | idle_secs={}",
+                    endpoint.label,
+                    cfg.scanner_idle_timeout_secs
+                ));
+            }
+            Err(_) => {}
+        }
     };
-    (
-        format!("{}:{}:{}", event_type, meta.signature, meta.mint),
-        event_type,
-        match event {
-            ScannerEvent::NewToken(token) => token.mint.as_str(),
-            ScannerEvent::Buy(buy) => buy.mint.as_str(),
-        },
-        match event {
-            ScannerEvent::NewToken(token) => token.signature.as_str(),
-            ScannerEvent::Buy(buy) => buy.signature.as_str(),
-        },
-        meta.slot,
-        match event {
-            ScannerEvent::NewToken(token) => token.feed_source.as_str(),
-            ScannerEvent::Buy(buy) => buy.feed_source.as_str(),
-        },
-    )
+    keepalive_task.abort();
+    result
 }
 
 async fn start_processed_feed_loop(
