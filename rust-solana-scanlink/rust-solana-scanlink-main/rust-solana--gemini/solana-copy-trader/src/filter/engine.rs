@@ -3924,6 +3924,7 @@ mod tests {
             scanner_grpc_token: None,
             scanner_secondary_grpc_url: None,
             scanner_secondary_grpc_token: None,
+            scanner_secondary_auto_inferred: false,
             scanner_deshred_grpc_url: None,
             scanner_deshred_grpc_token: None,
             scanner_mode: ScannerMode::ProcessedOnly,

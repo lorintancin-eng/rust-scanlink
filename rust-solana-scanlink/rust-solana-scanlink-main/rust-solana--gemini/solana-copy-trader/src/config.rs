@@ -27,6 +27,7 @@ pub struct AppConfig {
     pub scanner_grpc_token: Option<String>,
     pub scanner_secondary_grpc_url: Option<String>,
     pub scanner_secondary_grpc_token: Option<String>,
+    pub scanner_secondary_auto_inferred: bool,
     pub scanner_deshred_grpc_url: Option<String>,
     pub scanner_deshred_grpc_token: Option<String>,
     pub scanner_mode: ScannerMode,
@@ -195,6 +196,50 @@ impl AppConfig {
             .context("Invalid TARGET_WALLETS")?
             .unwrap_or_default();
 
+        let grpc_url = first_env(&["RABBITSTREAM_URL", "GRPC_URL"])
+            .unwrap_or_else(|| "https://grpc.triton.one".to_string());
+        let grpc_token = first_env(&["RABBITSTREAM_TOKEN", "GRPC_TOKEN"]);
+        let grpc_account_url = first_env(&["GRPC_ACCOUNT_URL", "SHYFT_GRPC_URL"])
+            .or_else(|| first_env(&["GRPC_URL"]).filter(|url| !is_rabbitstream_url(url)))
+            .unwrap_or_else(|| "https://grpc.triton.one".to_string());
+        let grpc_account_token = first_env(&["GRPC_ACCOUNT_TOKEN", "SHYFT_GRPC_TOKEN"])
+            .or_else(|| first_env(&["GRPC_TOKEN", "RABBITSTREAM_TOKEN"]));
+        let scanner_grpc_url = first_env(&[
+            "SCANNER_GRPC_URL",
+            "RABBITSTREAM_URL",
+            "GRPC_URL",
+            "SHYFT_GRPC_URL",
+            "GRPC_ACCOUNT_URL",
+        ])
+        .unwrap_or_else(|| grpc_url.clone());
+        let scanner_grpc_token = first_env(&[
+            "SCANNER_GRPC_TOKEN",
+            "RABBITSTREAM_TOKEN",
+            "GRPC_TOKEN",
+            "SHYFT_GRPC_TOKEN",
+            "GRPC_ACCOUNT_TOKEN",
+        ])
+        .or_else(|| grpc_token.clone())
+        .or_else(|| grpc_account_token.clone());
+        let scanner_secondary_env = first_env(&["SCANNER_SECONDARY_GRPC_URL"])
+            .filter(|value| !value.trim().is_empty());
+        let scanner_secondary_auto_inferred = scanner_secondary_env.is_none()
+            && is_rabbitstream_url(&scanner_grpc_url)
+            && !same_stream_endpoint(&scanner_grpc_url, &grpc_account_url);
+        let scanner_secondary_grpc_url = scanner_secondary_env
+            .clone()
+            .or_else(|| scanner_secondary_auto_inferred.then(|| grpc_account_url.clone()));
+        let scanner_secondary_grpc_token = first_env(&["SCANNER_SECONDARY_GRPC_TOKEN"]).or_else(|| {
+            scanner_secondary_grpc_url.as_ref().and_then(|url| {
+                if same_stream_endpoint(url, &grpc_account_url) {
+                    grpc_account_token
+                        .clone()
+                        .or_else(|| scanner_grpc_token.clone())
+                } else {
+                    scanner_grpc_token.clone()
+                }
+            })
+        });
         let scanner_deshred_grpc_url = first_env(&["SCANNER_DESHRED_GRPC_URL", "DESHRED_GRPC_URL"])
             .filter(|value| !value.trim().is_empty())
             .or_else(|| {
@@ -217,32 +262,15 @@ impl AppConfig {
         Ok(Self {
             rpc_url: env_or("RPC_URL", "https://api.mainnet-beta.solana.com"),
             secondary_rpc_url: std::env::var("SECONDARY_RPC_URL").ok(),
-            grpc_url: first_env(&["RABBITSTREAM_URL", "GRPC_URL"])
-                .unwrap_or_else(|| "https://grpc.triton.one".to_string()),
-            grpc_token: first_env(&["RABBITSTREAM_TOKEN", "GRPC_TOKEN"]),
-            // 账户监控 gRPC：显式使用普通 Yellowstone gRPC，避免误接 RabbitStream。
-            grpc_account_url: first_env(&["GRPC_ACCOUNT_URL", "SHYFT_GRPC_URL"])
-                .or_else(|| first_env(&["GRPC_URL"]).filter(|url| !is_rabbitstream_url(url)))
-                .unwrap_or_else(|| "https://grpc.triton.one".to_string()),
-            grpc_account_token: first_env(&["GRPC_ACCOUNT_TOKEN", "SHYFT_GRPC_TOKEN"])
-                .or_else(|| first_env(&["GRPC_TOKEN", "RABBITSTREAM_TOKEN"])),
-            scanner_grpc_url: first_env(&[
-                "SCANNER_GRPC_URL",
-                "SHYFT_GRPC_URL",
-                "GRPC_ACCOUNT_URL",
-                "GRPC_URL",
-            ])
-            .unwrap_or_else(|| "https://grpc.triton.one".to_string()),
-            scanner_grpc_token: first_env(&[
-                "SCANNER_GRPC_TOKEN",
-                "SHYFT_GRPC_TOKEN",
-                "GRPC_ACCOUNT_TOKEN",
-                "GRPC_TOKEN",
-                "RABBITSTREAM_TOKEN",
-            ]),
-            scanner_secondary_grpc_url: first_env(&["SCANNER_SECONDARY_GRPC_URL"])
-                .filter(|value| !value.trim().is_empty()),
-            scanner_secondary_grpc_token: first_env(&["SCANNER_SECONDARY_GRPC_TOKEN"]),
+            grpc_url,
+            grpc_token,
+            grpc_account_url,
+            grpc_account_token,
+            scanner_grpc_url,
+            scanner_grpc_token,
+            scanner_secondary_grpc_url,
+            scanner_secondary_grpc_token,
+            scanner_secondary_auto_inferred,
             scanner_deshred_grpc_url,
             scanner_deshred_grpc_token: first_env(&[
                 "SCANNER_DESHRED_GRPC_TOKEN",
@@ -451,8 +479,69 @@ fn first_env(keys: &[&str]) -> Option<String> {
     })
 }
 
-fn is_rabbitstream_url(url: &str) -> bool {
+pub fn is_rabbitstream_url(url: &str) -> bool {
     url.to_ascii_lowercase().contains("rabbitstream")
+}
+
+pub fn same_stream_endpoint(left: &str, right: &str) -> bool {
+    normalize_stream_endpoint(left) == normalize_stream_endpoint(right)
+}
+
+pub fn classify_stream_endpoint(url: &str) -> &'static str {
+    let lower = url.to_ascii_lowercase();
+    if lower.contains("rabbitstream") {
+        "rabbitstream"
+    } else if lower.contains("grpc.")
+        || lower.contains("yellowstone")
+        || lower.contains("helius-rpc.com")
+    {
+        "yellowstone"
+    } else if supports_deshred_endpoint(url) {
+        "deshred"
+    } else {
+        "grpc"
+    }
+}
+
+pub fn stream_provider(url: &str) -> &'static str {
+    let lower = url.to_ascii_lowercase();
+    if lower.contains("shyft.to") {
+        "shyft"
+    } else if lower.contains("helius") {
+        "helius"
+    } else if lower.contains("triton.one") || lower.contains("rpcpool.com") {
+        "triton"
+    } else if lower.contains("jito") {
+        "jito"
+    } else {
+        "custom"
+    }
+}
+
+pub fn infer_stream_region(url: &str) -> Option<&'static str> {
+    let lower = url.to_ascii_lowercase();
+    const REGION_HINTS: [(&str, &str); 13] = [
+        (".ny.", "ny"),
+        (".va.", "va"),
+        (".fra.", "fra"),
+        (".ams.", "ams"),
+        ("-ewr.", "ewr"),
+        ("-pitt.", "pitt"),
+        ("-slc.", "slc"),
+        ("-lax.", "lax"),
+        ("-lon.", "lon"),
+        ("-tyo.", "tyo"),
+        ("-sgp.", "sgp"),
+        ("-ams.", "ams"),
+        ("-fra.", "fra"),
+    ];
+    REGION_HINTS
+        .iter()
+        .find_map(|(needle, region)| lower.contains(needle).then_some(*region))
+}
+
+fn normalize_stream_endpoint(url: &str) -> String {
+    url.trim().trim_end_matches('/').to_ascii_lowercase()
 }
 
 fn supports_deshred_endpoint(url: &str) -> bool {

@@ -12,7 +12,7 @@ mod telegram;
 mod tx;
 mod utils;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use solana_client::rpc_client::RpcClient;
 use solana_sdk::pubkey::Pubkey;
 use spl_associated_token_account::get_associated_token_address;
@@ -24,12 +24,16 @@ use std::str::FromStr;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use tokio::net::{lookup_host, TcpStream};
 use tokio::sync::{mpsc, RwLock, Semaphore};
 use tracing::{error, info, warn};
 
 use autosell::{AutoSellManager, Position, SellAccountSnapshot, SellSignal};
 use analytics::runtime::{build_runtime_report, log_runtime_report, persist_runtime_report};
-use config::AppConfig;
+use config::{
+    classify_stream_endpoint, infer_stream_region, is_rabbitstream_url, same_stream_endpoint,
+    stream_provider, AppConfig,
+};
 use filter::{BuySignal as SniperBuySignal, ExecutionReceiptRecord, FilterDb};
 use groups::CopyGroup;
 use grpc::{AccountSubscriber, AccountUpdate, AtaBalanceCache, BondingCurveCache};
@@ -62,6 +66,150 @@ struct BuyPathTimings {
 
 struct RuntimeGuard {
     path: PathBuf,
+}
+
+#[derive(Debug, Clone)]
+struct EndpointProbeTarget {
+    role: &'static str,
+    url: String,
+}
+
+fn endpoint_profile(url: &str) -> String {
+    format!(
+        "{}:{}@{}",
+        stream_provider(url),
+        classify_stream_endpoint(url),
+        infer_stream_region(url).unwrap_or("-")
+    )
+}
+
+fn log_scanner_topology(config: &AppConfig) {
+    let primary_profile = endpoint_profile(&config.scanner_grpc_url);
+    let secondary_profile = config
+        .scanner_secondary_grpc_url
+        .as_deref()
+        .map(endpoint_profile)
+        .unwrap_or_else(|| "-".to_string());
+    let topology = if is_rabbitstream_url(&config.scanner_grpc_url) {
+        if config.scanner_secondary_grpc_url.is_some() {
+            "rabbit_primary_with_yellowstone_fallback"
+        } else {
+            "rabbit_primary_only"
+        }
+    } else {
+        "yellowstone_primary"
+    };
+    info!(
+        "Shyft topology | profile={} | scanner_primary={} ({}) | scanner_secondary={} ({}) | secondary_auto={} | account_stream={} ({}) | catchup=raw_event_replay",
+        topology,
+        config.scanner_primary_feed_label,
+        primary_profile,
+        config.scanner_secondary_feed_label,
+        secondary_profile,
+        config.scanner_secondary_auto_inferred,
+        config.grpc_account_url,
+        endpoint_profile(&config.grpc_account_url),
+    );
+    if is_rabbitstream_url(&config.scanner_grpc_url) && config.scanner_secondary_grpc_url.is_none() {
+        warn!("Shyft topology: RabbitStream is primary but no Yellowstone fallback is configured");
+    }
+    if !is_rabbitstream_url(&config.scanner_grpc_url) && is_rabbitstream_url(&config.grpc_url) {
+        warn!(
+            "Shyft topology: scanner primary is not RabbitStream even though a RabbitStream URL is available | scanner_primary={} | tx_stream={}",
+            config.scanner_grpc_url,
+            config.grpc_url,
+        );
+    }
+}
+
+fn collect_endpoint_probe_targets(config: &AppConfig) -> Vec<EndpointProbeTarget> {
+    let mut targets = Vec::new();
+    targets.push(EndpointProbeTarget {
+        role: "scanner_primary",
+        url: config.scanner_grpc_url.clone(),
+    });
+    if let Some(url) = config.scanner_secondary_grpc_url.clone() {
+        if !same_stream_endpoint(&url, &config.scanner_grpc_url) {
+            targets.push(EndpointProbeTarget {
+                role: "scanner_secondary",
+                url,
+            });
+        }
+    }
+    if !same_stream_endpoint(&config.grpc_account_url, &config.scanner_grpc_url)
+        && config
+            .scanner_secondary_grpc_url
+            .as_deref()
+            .map(|url| !same_stream_endpoint(url, &config.grpc_account_url))
+            .unwrap_or(true)
+    {
+        targets.push(EndpointProbeTarget {
+            role: "account_stream",
+            url: config.grpc_account_url.clone(),
+        });
+    }
+    targets
+}
+
+async fn probe_endpoint_connect_ms(url: &str) -> Result<u128> {
+    let parsed = reqwest::Url::parse(url).with_context(|| format!("invalid endpoint url: {url}"))?;
+    let host = parsed
+        .host_str()
+        .map(str::to_string)
+        .with_context(|| format!("missing endpoint host: {url}"))?;
+    let port = parsed.port_or_known_default().unwrap_or(443);
+    let mut best_ms: Option<u128> = None;
+
+    for _ in 0..2 {
+        let started = Instant::now();
+        let addrs = tokio::time::timeout(
+            Duration::from_millis(1_500),
+            lookup_host((host.as_str(), port)),
+        )
+        .await
+        .with_context(|| format!("dns lookup timeout for {host}:{port}"))?
+        .with_context(|| format!("dns lookup failed for {host}:{port}"))?;
+        for addr in addrs {
+            match tokio::time::timeout(Duration::from_millis(1_500), TcpStream::connect(addr)).await
+            {
+                Ok(Ok(stream)) => {
+                    let elapsed_ms = started.elapsed().as_millis();
+                    best_ms = Some(best_ms.map_or(elapsed_ms, |best| best.min(elapsed_ms)));
+                    drop(stream);
+                    break;
+                }
+                Ok(Err(_)) | Err(_) => {}
+            }
+        }
+    }
+
+    best_ms.with_context(|| format!("tcp connect failed for {host}:{port}"))
+}
+
+fn spawn_endpoint_probe_task(config: &AppConfig) {
+    let targets = collect_endpoint_probe_targets(config);
+    if targets.is_empty() {
+        return;
+    }
+    tokio::spawn(async move {
+        for target in targets {
+            match probe_endpoint_connect_ms(&target.url).await {
+                Ok(connect_ms) => info!(
+                    "Endpoint probe | role={} | url={} | profile={} | tcp_connect_ms={}",
+                    target.role,
+                    target.url,
+                    endpoint_profile(&target.url),
+                    connect_ms,
+                ),
+                Err(err) => warn!(
+                    "Endpoint probe failed | role={} | url={} | {}",
+                    target.role,
+                    target.url,
+                    err,
+                ),
+            }
+        }
+    });
 }
 
 fn execution_feedback_from_receipts(
@@ -332,7 +480,7 @@ async fn main() -> Result<()> {
         config.coingecko_api_key.is_some(),
     );
     info!(
-        "Scanner feeds: mode={} | primary_label={} primary_url={} | secondary_label={} secondary_url={} | deshred_label={} deshred_url={} | persist_raw_events={} gate3_sequences={} scoring_breakdowns={} labels={} feed_health={} catchup_window_ms={} catchup_max_events={} failover_stale_ms={} health_snapshot_secs={} replay_db={} replay_report={}",
+        "Scanner feeds: mode={} | primary_label={} primary_url={} | secondary_label={} secondary_url={} | secondary_auto={} | account_url={} | deshred_label={} deshred_url={} | persist_raw_events={} gate3_sequences={} scoring_breakdowns={} labels={} feed_health={} catchup_window_ms={} catchup_max_events={} failover_stale_ms={} health_snapshot_secs={} replay_db={} replay_report={}",
         config.scanner_mode,
         config.scanner_primary_feed_label,
         config.scanner_grpc_url,
@@ -341,6 +489,8 @@ async fn main() -> Result<()> {
             .scanner_secondary_grpc_url
             .as_deref()
             .unwrap_or("-"),
+        config.scanner_secondary_auto_inferred,
+        config.grpc_account_url,
         config.scanner_deshred_feed_label,
         config
             .scanner_deshred_grpc_url
@@ -358,6 +508,8 @@ async fn main() -> Result<()> {
         config.replay_db_path,
         config.replay_report_file,
     );
+    log_scanner_topology(config.as_ref());
+    spawn_endpoint_probe_task(config.as_ref());
     info!(
         "Execution feedback: window_secs={} refresh_secs={}",
         config.execution_feedback_window_secs,

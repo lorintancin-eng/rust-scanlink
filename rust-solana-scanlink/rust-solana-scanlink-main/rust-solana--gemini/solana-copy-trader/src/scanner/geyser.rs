@@ -1,4 +1,6 @@
-use crate::config::AppConfig;
+use crate::config::{
+    classify_stream_endpoint, infer_stream_region, same_stream_endpoint, stream_provider, AppConfig,
+};
 use crate::filter::{FeedFirstHitRecord, FeedHealthRecord, FilterDb};
 use crate::scanner::failover::{
     FailoverController, FeedFirstHitEvent, FeedHealthEvent, FeedRuntimeSnapshot,
@@ -43,13 +45,13 @@ pub async fn start(cfg: Arc<AppConfig>, tx: mpsc::Sender<ScannerEvent>) -> Resul
     let deshred_endpoint = build_deshred_endpoint(cfg.as_ref());
     let processed_labels = processed_endpoints
         .iter()
-        .map(|endpoint| endpoint.label.as_str())
+        .map(format_endpoint_descriptor)
         .collect::<Vec<_>>()
         .join(",");
     let deshred_label = deshred_endpoint
         .as_ref()
-        .map(|endpoint| endpoint.label.as_str())
-        .unwrap_or("-");
+        .map(format_endpoint_descriptor)
+        .unwrap_or_else(|| "-".to_string());
 
     match cfg.scanner_mode {
         crate::scanner::feed::ScannerMode::ProcessedOnly if processed_endpoints.is_empty() => {
@@ -76,11 +78,7 @@ pub async fn start(cfg: Arc<AppConfig>, tx: mpsc::Sender<ScannerEvent>) -> Resul
         "scanner: starting feeds | mode={} | processed_feeds={} [{}] | deshred_feed={} | dedup_ttl_ms={} | dedup_max_keys={}",
         cfg.scanner_mode,
         processed_endpoints.len(),
-        if processed_labels.is_empty() {
-            "-"
-        } else {
-            processed_labels.as_str()
-        },
+        if processed_labels.is_empty() { "-" } else { processed_labels.as_str() },
         deshred_label,
         SCANNER_DEDUP_TTL_MS,
         SCANNER_DEDUP_MAX_KEYS,
@@ -186,16 +184,34 @@ fn build_processed_endpoints(cfg: &AppConfig) -> Vec<FeedEndpoint> {
     ));
 
     if let Some(url) = cfg.scanner_secondary_grpc_url.clone() {
-        endpoints.push(FeedEndpoint::processed(
-            cfg.scanner_secondary_feed_label.clone(),
-            url,
-            cfg.scanner_secondary_grpc_token
-                .clone()
-                .or_else(|| cfg.scanner_grpc_token.clone()),
-        ));
+        if same_stream_endpoint(&cfg.scanner_grpc_url, &url) {
+            warn!(
+                "scanner: skipping duplicate processed fallback | primary={} | secondary={}",
+                cfg.scanner_grpc_url, url
+            );
+        } else {
+            endpoints.push(FeedEndpoint::processed(
+                cfg.scanner_secondary_feed_label.clone(),
+                url,
+                cfg.scanner_secondary_grpc_token
+                    .clone()
+                    .or_else(|| cfg.scanner_grpc_token.clone()),
+            ));
+        }
     }
 
     endpoints
+}
+
+fn format_endpoint_descriptor(endpoint: &FeedEndpoint) -> String {
+    let region = infer_stream_region(&endpoint.url).unwrap_or("-");
+    format!(
+        "{}:{}:{}@{}",
+        endpoint.label,
+        stream_provider(&endpoint.url),
+        classify_stream_endpoint(&endpoint.url),
+        region
+    )
 }
 
 fn build_deshred_endpoint(cfg: &AppConfig) -> Option<FeedEndpoint> {

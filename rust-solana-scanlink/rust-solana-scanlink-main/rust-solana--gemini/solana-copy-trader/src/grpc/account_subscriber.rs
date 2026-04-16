@@ -14,6 +14,7 @@ use yellowstone_grpc_proto::geyser::{
 };
 use yellowstone_grpc_proto::prelude::subscribe_update::UpdateOneof;
 
+use crate::config::{classify_stream_endpoint, infer_stream_region, stream_provider};
 use crate::processor::pumpfun::BondingCurveState;
 
 // ============================================
@@ -225,8 +226,12 @@ impl AccountSubscriber {
 
         let accounts = self.get_subscribed_addresses();
         info!(
-            "Account subscriber connecting to gRPC for {} accounts",
+            "Account subscriber connecting to gRPC for {} accounts | url={} | profile={}:{}@{}",
             accounts.len(),
+            self.grpc_url,
+            stream_provider(&self.grpc_url),
+            classify_stream_endpoint(&self.grpc_url),
+            infer_stream_region(&self.grpc_url).unwrap_or("-"),
         );
 
         let mut client = GeyserGrpcClient::build_from_shared(self.grpc_url.clone())?
