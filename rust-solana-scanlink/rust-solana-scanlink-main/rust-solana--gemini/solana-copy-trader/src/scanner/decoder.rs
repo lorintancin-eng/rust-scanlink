@@ -1,7 +1,11 @@
 use crate::scanner::{DISC_BUY, DISC_CREATE, DISC_CREATE_V2, PUMP_PROGRAM_ID};
 use serde::{Deserialize, Serialize};
 use solana_sdk::pubkey::Pubkey;
-use std::time::{Instant, SystemTime, UNIX_EPOCH};
+use std::{
+    collections::HashMap,
+    sync::{Mutex, OnceLock},
+    time::{Instant, SystemTime, UNIX_EPOCH},
+};
 use tracing::{debug, info, warn};
 use yellowstone_grpc_proto::prelude::{
     Message, SubscribeUpdateDeshredTransactionInfo, SubscribeUpdateTransactionInfo,
@@ -9,6 +13,12 @@ use yellowstone_grpc_proto::prelude::{
 };
 
 const MAX_FALLBACK_BUY_LAMPORTS: u64 = 50_000_000_000;
+const MAX_NEW_TOKEN_NAME_LEN: usize = 96;
+const MAX_NEW_TOKEN_SYMBOL_LEN: usize = 32;
+const MAX_NEW_TOKEN_URI_LEN: usize = 512;
+const MIN_NEW_TOKEN_ACCOUNT_COUNT: usize = 3;
+
+static UNKNOWN_PUMP_DISC_COUNTS: OnceLock<Mutex<HashMap<[u8; 8], usize>>> = OnceLock::new();
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct ScannerEventRawMeta {
@@ -314,10 +324,81 @@ fn decode_instruction(
         return;
     }
 
+    if let Some(token) = decode_create_like_unknown_instruction(
+        slot,
+        signature,
+        feed_source,
+        detected_at_ms,
+        data,
+        account_indices,
+        account_keys,
+    ) {
+        info!(
+            "scanner: recovered create-like Pump instruction | sig={} | disc={:?} | mint={} | creator={} | feed={}",
+            signature, disc, token.mint, token.creator, token.feed_source
+        );
+        events.push(ScannerEvent::NewToken(token));
+        return;
+    }
+
+    log_unknown_pump_instruction(
+        signature,
+        feed_source,
+        disc,
+        data.len(),
+        account_indices.len(),
+    );
+
     debug!(
         "扫链：发现未识别 Pump 指令 | sig={} | disc={:?} | feed={}",
         signature, disc, feed_source
     );
+}
+
+fn decode_create_like_unknown_instruction(
+    slot: u64,
+    signature: &str,
+    feed_source: &str,
+    detected_at_ms: u64,
+    data: &[u8],
+    account_indices: &[u8],
+    account_keys: &[Pubkey],
+) -> Option<NewToken> {
+    if account_indices.len() < MIN_NEW_TOKEN_ACCOUNT_COUNT || data.len() <= 8 {
+        return None;
+    }
+    let payload = &data[8..];
+    let mut offset = 0usize;
+    let name = read_borsh_string(payload, &mut offset)?;
+    let symbol = read_borsh_string(payload, &mut offset)?;
+    let uri = read_borsh_string(payload, &mut offset)?;
+    if !looks_like_new_token_payload(&name, &symbol, &uri) {
+        return None;
+    }
+
+    let mint = indexed_account(account_indices, account_keys, 0)?;
+    let bonding_curve = indexed_account(account_indices, account_keys, 2)?;
+    let creator = read_pubkey_string(payload, &mut offset).or_else(|| {
+        instruction_accounts(account_indices, account_keys)
+            .last()
+            .map(ToString::to_string)
+    })?;
+
+    Some(NewToken {
+        mint: mint.to_string(),
+        bonding_curve: bonding_curve.to_string(),
+        creator,
+        feed_source: feed_source.to_string(),
+        name,
+        symbol,
+        uri,
+        is_v2: true,
+        detected_at_ms,
+        signature: signature.to_string(),
+        slot,
+        instruction_data: data.to_vec(),
+        instruction_accounts: instruction_accounts(account_indices, account_keys),
+    })
 }
 
 fn decode_new_token(
@@ -425,6 +506,13 @@ fn indexed_account(
     account_keys.get(account_idx).copied()
 }
 
+fn instruction_accounts(account_indices: &[u8], account_keys: &[Pubkey]) -> Vec<Pubkey> {
+    account_indices
+        .iter()
+        .filter_map(|idx| account_keys.get(*idx as usize).copied())
+        .collect()
+}
+
 fn build_account_keys(
     static_keys: &[Vec<u8>],
     loaded_writable_addresses: &[Vec<u8>],
@@ -478,6 +566,48 @@ fn read_pubkey_string(data: &[u8], offset: &mut usize) -> Option<String> {
     let bytes: [u8; 32] = data[*offset..*offset + 32].try_into().ok()?;
     *offset += 32;
     Some(Pubkey::new_from_array(bytes).to_string())
+}
+
+fn looks_like_new_token_payload(name: &str, symbol: &str, uri: &str) -> bool {
+    let name = name.trim();
+    let symbol = symbol.trim();
+    let uri = uri.trim();
+    if name.is_empty()
+        || symbol.is_empty()
+        || uri.is_empty()
+        || name.len() > MAX_NEW_TOKEN_NAME_LEN
+        || symbol.len() > MAX_NEW_TOKEN_SYMBOL_LEN
+        || uri.len() > MAX_NEW_TOKEN_URI_LEN
+    {
+        return false;
+    }
+
+    uri.starts_with("http://")
+        || uri.starts_with("https://")
+        || uri.starts_with("ipfs://")
+        || uri.starts_with("ar://")
+}
+
+fn log_unknown_pump_instruction(
+    signature: &str,
+    feed_source: &str,
+    disc: [u8; 8],
+    data_len: usize,
+    account_count: usize,
+) {
+    let counts = UNKNOWN_PUMP_DISC_COUNTS.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut guard = match counts.lock() {
+        Ok(guard) => guard,
+        Err(_) => return,
+    };
+    let counter = guard.entry(disc).or_insert(0);
+    *counter += 1;
+    if *counter <= 3 || *counter % 100 == 0 {
+        warn!(
+            "scanner: unknown Pump instruction | sig={} | feed={} | disc={:?} | data_len={} | accounts={} | seen={}",
+            signature, feed_source, disc, data_len, account_count, *counter
+        );
+    }
 }
 
 fn estimate_buy_sol_amount_lamports(
@@ -558,6 +688,63 @@ mod tests {
             Some(expected.to_string())
         );
         assert_eq!(off, 32);
+    }
+
+    #[test]
+    fn create_like_unknown_instruction_detects_metadata_payload() {
+        let mint = Pubkey::new_unique();
+        let filler = Pubkey::new_unique();
+        let bonding_curve = Pubkey::new_unique();
+        let creator = Pubkey::new_unique();
+        let account_keys = vec![mint, filler, bonding_curve];
+        let account_indices = vec![0u8, 1u8, 2u8];
+
+        let mut data = vec![9, 8, 7, 6, 5, 4, 3, 2];
+        data.extend_from_slice(&(4u32.to_le_bytes()));
+        data.extend_from_slice(b"PEPE");
+        data.extend_from_slice(&(4u32.to_le_bytes()));
+        data.extend_from_slice(b"PEPE");
+        let uri = b"https://example.com/meta.json";
+        data.extend_from_slice(&((uri.len() as u32).to_le_bytes()));
+        data.extend_from_slice(uri);
+        data.extend_from_slice(creator.as_ref());
+
+        let token = decode_create_like_unknown_instruction(
+            1,
+            "sig",
+            "secondary_processed",
+            123,
+            &data,
+            &account_indices,
+            &account_keys,
+        )
+        .expect("fallback should decode");
+
+        assert_eq!(token.mint, mint.to_string());
+        assert_eq!(token.bonding_curve, bonding_curve.to_string());
+        assert_eq!(token.creator, creator.to_string());
+        assert_eq!(token.name, "PEPE");
+    }
+
+    #[test]
+    fn create_like_unknown_instruction_rejects_non_metadata_payload() {
+        let account_keys = vec![
+            Pubkey::new_unique(),
+            Pubkey::new_unique(),
+            Pubkey::new_unique(),
+        ];
+        let account_indices = vec![0u8, 1u8, 2u8];
+        let data = vec![9u8; 32];
+        assert!(decode_create_like_unknown_instruction(
+            1,
+            "sig",
+            "secondary_processed",
+            123,
+            &data,
+            &account_indices,
+            &account_keys,
+        )
+        .is_none());
     }
 
     #[test]
