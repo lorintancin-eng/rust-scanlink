@@ -115,6 +115,7 @@ pub struct AppConfig {
     pub creator_fresh_wallet_token_limit: u32,
     /// 临时停用买入/卖出，只保留扫描和过滤
     pub execution_enabled: bool,
+    pub scanner_live_tokens_file: String,
     /// 扫链层发现的新币清单
     pub scanned_tokens_file: String,
     /// 过滤通过后的候选代币清单
@@ -392,6 +393,10 @@ impl AppConfig {
             creator_min_wallet_age_days: env_parse("CREATOR_MIN_WALLET_AGE_DAYS", 1),
             creator_fresh_wallet_token_limit: env_parse("CREATOR_FRESH_WALLET_TOKEN_LIMIT", 2),
             execution_enabled: env_parse("EXECUTION_ENABLED", false),
+            scanner_live_tokens_file: env_or(
+                "SCANNER_LIVE_TOKENS_FILE",
+                "data/scanner_live_tokens.jsonl",
+            ),
             scanned_tokens_file: env_or("SCANNED_TOKENS_FILE", "data/scanned_tokens.jsonl"),
             passed_tokens_file: env_or("PASSED_TOKENS_FILE", "data/passed_tokens.jsonl"),
             keypair: std::sync::Arc::new(keypair),

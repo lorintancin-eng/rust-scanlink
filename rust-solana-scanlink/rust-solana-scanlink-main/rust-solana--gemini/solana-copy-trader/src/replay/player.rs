@@ -2,6 +2,10 @@ use crate::config::AppConfig;
 use crate::filter;
 use crate::filter::FilterDb;
 use crate::scanner::raw_event::raw_event_to_scanner_event;
+use crate::scanner::{
+    NewToken, PumpBuyEvent, ScannerEvent, SCANNER_BUY_CHANNEL_CAPACITY,
+    SCANNER_NEW_TOKEN_CHANNEL_CAPACITY,
+};
 use anyhow::{Context, Result};
 use rusqlite::{Connection, DatabaseName, OpenFlags};
 use solana_client::rpc_client::RpcClient;
@@ -66,12 +70,21 @@ pub async fn run_pipeline(
         CommitmentConfig::confirmed(),
     ));
 
-    let (scanner_tx, scanner_rx) = mpsc::channel(4096);
+    let (new_token_tx, new_token_rx) = mpsc::channel::<NewToken>(SCANNER_NEW_TOKEN_CHANNEL_CAPACITY);
+    let (scanner_buy_tx, scanner_buy_rx) =
+        mpsc::channel::<PumpBuyEvent>(SCANNER_BUY_CHANNEL_CAPACITY);
     let (buy_tx, mut buy_rx) = mpsc::channel(512);
     let replay_filter_db = FilterDb::new(&replay_config.filter_db_path).await?;
     let replay_config = Arc::new(replay_config);
     let filter_task =
-        tokio::spawn(filter::run(replay_config, replay_filter_db, rpc_client, scanner_rx, buy_tx));
+        tokio::spawn(filter::run(
+            replay_config,
+            replay_filter_db,
+            rpc_client,
+            new_token_rx,
+            scanner_buy_rx,
+            buy_tx,
+        ));
     let buy_counter = tokio::spawn(async move {
         let mut count = 0usize;
         while buy_rx.recv().await.is_some() {
@@ -88,8 +101,17 @@ pub async fn run_pipeline(
         if scaled_ms > 0 {
             tokio::time::sleep(Duration::from_millis(scaled_ms.min(250))).await;
         }
-        if scanner_tx.send(event.clone()).await.is_err() {
-            break;
+        match event {
+            ScannerEvent::NewToken(token) => {
+                if new_token_tx.send(token.clone()).await.is_err() {
+                    break;
+                }
+            }
+            ScannerEvent::Buy(buy) => {
+                if scanner_buy_tx.send(buy.clone()).await.is_err() {
+                    break;
+                }
+            }
         }
         if (idx + 1) % REPLAY_PROGRESS_EVERY == 0 || idx + 1 == replayed_events.len() {
             info!(
@@ -102,7 +124,8 @@ pub async fn run_pipeline(
         }
         previous_ts = *recorded_at_ms;
     }
-    drop(scanner_tx);
+    drop(new_token_tx);
+    drop(scanner_buy_tx);
 
     filter_task
         .await

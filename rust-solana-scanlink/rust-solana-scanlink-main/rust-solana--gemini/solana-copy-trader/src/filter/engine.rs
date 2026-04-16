@@ -11,9 +11,7 @@ use crate::filter::risk::{
     RiskSignalSeed, RuntimeRiskInput, RuntimeRiskProfile,
 };
 use crate::processor::pumpfun::BondingCurveState;
-use crate::scanner::{
-    NewToken, PumpBuyEvent, ScannerEvent, DISC_CREATE, DISC_CREATE_V2, PUMP_PROGRAM_ID,
-};
+use crate::scanner::{NewToken, PumpBuyEvent, DISC_CREATE, DISC_CREATE_V2, PUMP_PROGRAM_ID};
 use anyhow::{Context, Result};
 use futures::stream::{self, StreamExt};
 use reqwest::StatusCode;
@@ -87,6 +85,7 @@ const QUALITY_CLUSTER_MIN_HOT_FUNDERS: usize = 2;
 const QUALITY_CLUSTER_MAX_SHARE: f64 = 0.60;
 const QUALITY_CLUSTER_BONUS_SCORE: u32 = 6;
 const FAST_QUALITY_CLUSTER_SCORE_RELIEF: u32 = 4;
+const RAW_BUY_PERSIST_QUEUE_CAPACITY: usize = 8_192;
 
 #[derive(Debug, Clone)]
 pub struct BuySignal {
@@ -297,6 +296,7 @@ struct SharedState {
     rpc_client: Arc<RpcClient>,
     http: reqwest::Client,
     db: FilterDb,
+    raw_buy_persist_tx: mpsc::Sender<PumpBuyEvent>,
     hotlists: Arc<RwLock<HotLists>>,
     address_snapshot_cache: Arc<RwLock<HashMap<String, CachedAddressSnapshot>>>,
     address_snapshot_refreshes: Arc<RwLock<HashSet<String>>>,
@@ -307,9 +307,12 @@ pub async fn run(
     config: Arc<AppConfig>,
     db: FilterDb,
     rpc_client: Arc<RpcClient>,
-    mut scanner_rx: mpsc::Receiver<ScannerEvent>,
+    mut new_token_rx: mpsc::Receiver<NewToken>,
+    mut buy_rx: mpsc::Receiver<PumpBuyEvent>,
     buy_signal_tx: mpsc::Sender<BuySignal>,
 ) -> Result<()> {
+    let (raw_buy_persist_tx, raw_buy_persist_rx) =
+        mpsc::channel::<PumpBuyEvent>(RAW_BUY_PERSIST_QUEUE_CAPACITY);
     let shared = SharedState {
         config: config.clone(),
         rpc_client,
@@ -318,11 +321,13 @@ pub async fn run(
             .build()
             .context("filter http client init failed")?,
         db,
+        raw_buy_persist_tx,
         hotlists: Arc::new(RwLock::new(HotLists::default())),
         address_snapshot_cache: Arc::new(RwLock::new(HashMap::new())),
         address_snapshot_refreshes: Arc::new(RwLock::new(HashSet::new())),
         address_snapshot_helius_cooldown_until_ms: Arc::new(RwLock::new(0)),
     };
+    spawn_raw_buy_persist_worker(shared.clone(), raw_buy_persist_rx);
     if config.dynamic_hot_keywords_enabled {
         if let Err(err) = refresh_dynamic_hot_keywords(&shared).await {
             warn!("dynamic hot keyword refresh failed during startup: {}", err);
@@ -345,22 +350,28 @@ pub async fn run(
         tokio::time::interval(Duration::from_secs(config.dynamic_hot_refresh_secs.max(30)));
     dynamic_hot_refresh.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     dynamic_hot_refresh.tick().await;
+    let mut new_token_stream_open = true;
+    let mut buy_stream_open = true;
+    let mut internal_stream_open = true;
 
     loop {
+        if !new_token_stream_open && !buy_stream_open && !internal_stream_open {
+            break;
+        }
         tokio::select! {
-            maybe_event = scanner_rx.recv() => {
-                let Some(event) = maybe_event else { break; };
-                match event {
-                    ScannerEvent::NewToken(token) => {
-                        handle_new_token(&shared, &internal_tx, &mut candidates, &mut creator_window, token).await?;
-                    }
-                    ScannerEvent::Buy(buy) => {
-                        handle_buy_event(&shared, &internal_tx, &mut candidates, buy).await;
-                    }
-                }
+            biased;
+            maybe_new_token = new_token_rx.recv(), if new_token_stream_open => {
+                let Some(token) = maybe_new_token else {
+                    new_token_stream_open = false;
+                    continue;
+                };
+                handle_new_token(&shared, &internal_tx, &mut candidates, &mut creator_window, token).await?;
             }
-            maybe_msg = internal_rx.recv() => {
-                let Some(msg) = maybe_msg else { break; };
+            maybe_msg = internal_rx.recv(), if internal_stream_open => {
+                let Some(msg) = maybe_msg else {
+                    internal_stream_open = false;
+                    continue;
+                };
                 match msg {
                     InternalMessage::CreatorGateResolved { mint, token, result } => {
                         handle_creator_gate_resolution(&shared, &internal_tx, &mut candidates, mint, token, result).await;
@@ -415,6 +426,13 @@ pub async fn run(
                         }
                     }
                 }
+            }
+            maybe_buy = buy_rx.recv(), if buy_stream_open => {
+                let Some(buy) = maybe_buy else {
+                    buy_stream_open = false;
+                    continue;
+                };
+                handle_buy_event(&shared, &internal_tx, &mut candidates, buy).await;
             }
             _ = tick.tick() => {
                 let mut expired = Vec::new();
@@ -490,25 +508,6 @@ async fn handle_new_token(
         return Ok(());
     }
 
-    if let Err(err) = append_jsonl(
-        &shared.config.scanned_tokens_file,
-        &json!({
-            "detected_at_ms": token.detected_at_ms,
-            "mint": &token.mint,
-            "symbol": &token.symbol,
-            "name": &token.name,
-            "creator": &token.creator,
-            "bonding_curve": &token.bonding_curve,
-            "signature": &token.signature,
-            "slot": token.slot,
-            "uri": &token.uri,
-            "is_v2": token.is_v2,
-        }),
-    )
-    .await
-    {
-        warn!("scanned_tokens append failed: {}", err);
-    }
     persist_raw_new_token_event(shared, &token).await;
 
     let gate1 = gate1_check(shared, creator_window, &token).await;
@@ -678,7 +677,7 @@ async fn handle_buy_event(
     candidates: &mut HashMap<String, Candidate>,
     buy: PumpBuyEvent,
 ) {
-    persist_raw_buy_event(shared, &buy).await;
+    enqueue_raw_buy_persist(shared, &buy);
     let mut reject_now: Option<(String, String, String, String, usize, usize)> = None;
 
     {
@@ -3339,6 +3338,33 @@ async fn persist_raw_new_token_event(shared: &SharedState, token: &NewToken) {
     }
 }
 
+fn spawn_raw_buy_persist_worker(
+    shared: SharedState,
+    mut raw_buy_persist_rx: mpsc::Receiver<PumpBuyEvent>,
+) {
+    tokio::spawn(async move {
+        while let Some(buy) = raw_buy_persist_rx.recv().await {
+            persist_raw_buy_event(&shared, &buy).await;
+        }
+        info!("filter: raw buy persist worker stopped");
+    });
+}
+
+fn enqueue_raw_buy_persist(shared: &SharedState, buy: &PumpBuyEvent) {
+    if !shared.config.persist_raw_scanner_events {
+        return;
+    }
+    match shared.raw_buy_persist_tx.try_send(buy.clone()) {
+        Ok(()) => {}
+        Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+            warn!("raw buy persist queue full; dropping event | mint={}", buy.mint);
+        }
+        Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+            warn!("raw buy persist queue closed; dropping event | mint={}", buy.mint);
+        }
+    }
+}
+
 async fn persist_raw_buy_event(shared: &SharedState, buy: &PumpBuyEvent) {
     if !shared.config.persist_raw_scanner_events {
         return;
@@ -4004,6 +4030,7 @@ mod tests {
             creator_min_wallet_age_days: 1,
             creator_fresh_wallet_token_limit: 2,
             execution_enabled: false,
+            scanner_live_tokens_file: String::new(),
             scanned_tokens_file: String::new(),
             passed_tokens_file: String::new(),
             keypair: std::sync::Arc::new(keypair.insecure_clone()),

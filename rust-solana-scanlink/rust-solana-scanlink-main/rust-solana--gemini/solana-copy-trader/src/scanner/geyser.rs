@@ -7,14 +7,22 @@ use crate::scanner::failover::{
 };
 use crate::scanner::feed::{FeedEndpoint, FeedKind};
 use crate::scanner::raw_event::raw_event_to_scanner_event;
-use crate::scanner::{decoder, deshred, ScannerEvent, PUMP_PROGRAM_ID};
+use crate::scanner::{
+    decoder, deshred, NewToken, PumpBuyEvent, ScannerEvent, PUMP_PROGRAM_ID,
+    SCANNER_BUY_CHANNEL_CAPACITY, SCANNER_NEW_TOKEN_CHANNEL_CAPACITY,
+};
 use anyhow::{Context, Result};
 use futures::{Sink, SinkExt, StreamExt};
+use serde_json::{json, Value};
 use std::{
     collections::{HashMap, HashSet},
-    sync::Arc,
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc,
+    },
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
+use tokio::io::AsyncWriteExt;
 use tokio::sync::{mpsc, Mutex};
 use tokio::time::{sleep, timeout, Instant};
 use tonic::transport::ClientTlsConfig;
@@ -29,6 +37,7 @@ const SCANNER_DEDUP_TTL_MS: u64 = 120_000;
 const SCANNER_DEDUP_MAX_KEYS: usize = 16_384;
 const SCANNER_FAST_RETRY_MAX_DELAY: Duration = Duration::from_secs(5);
 const SCANNER_KEEPALIVE_SECS: u64 = 10;
+const SCANNER_LIVE_HEARTBEAT_SECS: u64 = 30;
 
 #[derive(Debug, Clone)]
 struct SeenSignal {
@@ -42,10 +51,18 @@ struct SeenSignal {
     sources: HashSet<String>,
 }
 
+#[derive(Default)]
+struct LiveDispatchMetrics {
+    new_token_count: AtomicU64,
+    buy_count: AtomicU64,
+    dropped_buy_count: AtomicU64,
+}
+
 pub async fn start(
     cfg: Arc<AppConfig>,
     db: Option<FilterDb>,
-    tx: mpsc::Sender<ScannerEvent>,
+    new_token_tx: mpsc::Sender<NewToken>,
+    buy_tx: mpsc::Sender<PumpBuyEvent>,
 ) -> Result<()> {
     let processed_endpoints = build_processed_endpoints(cfg.as_ref());
     let deshred_endpoint = build_deshred_endpoint(cfg.as_ref());
@@ -93,6 +110,7 @@ pub async fn start(
     let failover = Arc::new(Mutex::new(FailoverController::new(
         cfg.scanner_failover_stale_ms,
     )));
+    let live_metrics = Arc::new(LiveDispatchMetrics::default());
 
     let (raw_tx, mut raw_rx) = mpsc::channel::<ScannerEvent>(4096);
     let catchup_replay_tx = raw_tx.clone();
@@ -107,6 +125,22 @@ pub async fn start(
         let snapshot_failover = failover.clone();
         tokio::spawn(async move {
             feed_runtime_snapshot_loop(snapshot_cfg, snapshot_db, snapshot_failover).await;
+        });
+    }
+
+    if SCANNER_LIVE_HEARTBEAT_SECS > 0 {
+        let heartbeat_cfg = cfg.clone();
+        let heartbeat_metrics = live_metrics.clone();
+        let heartbeat_new_token_tx = new_token_tx.clone();
+        let heartbeat_buy_tx = buy_tx.clone();
+        tokio::spawn(async move {
+            live_dispatch_heartbeat_loop(
+                heartbeat_cfg,
+                heartbeat_metrics,
+                heartbeat_new_token_tx,
+                heartbeat_buy_tx,
+            )
+            .await;
         });
     }
 
@@ -158,13 +192,139 @@ pub async fn start(
         )
         .await?
         {
-            if tx.send(event).await.is_err() {
+            if !dispatch_live_event(
+                cfg.as_ref(),
+                event,
+                &new_token_tx,
+                &buy_tx,
+                live_metrics.as_ref(),
+            )
+            .await?
+            {
                 return Ok(());
             }
         }
     }
 
     Ok(())
+}
+
+async fn dispatch_live_event(
+    cfg: &AppConfig,
+    event: ScannerEvent,
+    new_token_tx: &mpsc::Sender<NewToken>,
+    buy_tx: &mpsc::Sender<PumpBuyEvent>,
+    metrics: &LiveDispatchMetrics,
+) -> Result<bool> {
+    match event {
+        ScannerEvent::NewToken(token) => {
+            persist_scanner_live_token(cfg, &token).await;
+            metrics.new_token_count.fetch_add(1, Ordering::Relaxed);
+            Ok(new_token_tx.send(token).await.is_ok())
+        }
+        ScannerEvent::Buy(buy) => {
+            metrics.buy_count.fetch_add(1, Ordering::Relaxed);
+            match buy_tx.try_send(buy) {
+                Ok(()) => Ok(true),
+                Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+                    let dropped = metrics.dropped_buy_count.fetch_add(1, Ordering::Relaxed) + 1;
+                    if dropped == 1 || dropped % 100 == 0 {
+                        warn!(
+                            "scanner: buy channel full; dropping live buy events | dropped_total={}",
+                            dropped
+                        );
+                    }
+                    Ok(true)
+                }
+                Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => Ok(false),
+            }
+        }
+    }
+}
+
+async fn persist_scanner_live_token(cfg: &AppConfig, token: &NewToken) {
+    let record = scanner_live_token_record(token);
+    if let Err(err) = append_jsonl(&cfg.scanner_live_tokens_file, &record).await {
+        warn!("scanner: scanner_live_tokens append failed | {}", err);
+    }
+    if cfg.scanned_tokens_file != cfg.scanner_live_tokens_file {
+        if let Err(err) = append_jsonl(&cfg.scanned_tokens_file, &record).await {
+            warn!("scanner: scanned_tokens append failed | {}", err);
+        }
+    }
+}
+
+fn scanner_live_token_record(token: &NewToken) -> Value {
+    json!({
+        "detected_at_ms": token.detected_at_ms,
+        "mint": &token.mint,
+        "symbol": &token.symbol,
+        "name": &token.name,
+        "creator": &token.creator,
+        "bonding_curve": &token.bonding_curve,
+        "signature": &token.signature,
+        "slot": token.slot,
+        "uri": &token.uri,
+        "is_v2": token.is_v2,
+        "feed_source": &token.feed_source,
+    })
+}
+
+async fn append_jsonl(path: &str, value: &Value) -> Result<()> {
+    let path_ref = std::path::Path::new(path);
+    if let Some(parent) = path_ref.parent() {
+        tokio::fs::create_dir_all(parent).await?;
+    }
+
+    let mut file = tokio::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path_ref)
+        .await
+        .with_context(|| format!("open scanner output file failed: {}", path_ref.display()))?;
+
+    let mut line = serde_json::to_vec(value)?;
+    line.push(b'\n');
+    file.write_all(&line).await?;
+    Ok(())
+}
+
+async fn live_dispatch_heartbeat_loop(
+    cfg: Arc<AppConfig>,
+    metrics: Arc<LiveDispatchMetrics>,
+    new_token_tx: mpsc::Sender<NewToken>,
+    buy_tx: mpsc::Sender<PumpBuyEvent>,
+) {
+    let mut interval = tokio::time::interval(Duration::from_secs(SCANNER_LIVE_HEARTBEAT_SECS));
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    interval.tick().await;
+
+    let mut prev_new_tokens = 0u64;
+    let mut prev_buys = 0u64;
+    let mut prev_dropped_buys = 0u64;
+    loop {
+        interval.tick().await;
+        let new_tokens = metrics.new_token_count.load(Ordering::Relaxed);
+        let buys = metrics.buy_count.load(Ordering::Relaxed);
+        let dropped_buys = metrics.dropped_buy_count.load(Ordering::Relaxed);
+        info!(
+            "scanner: live heartbeat | mode={} | new_token_live_count={} (+{}) | buy_live_count={} (+{}) | buy_dropped_total={} (+{}) | new_token_queue_depth={} | buy_queue_depth={} | live_file={} | scanned_file={}",
+            cfg.scanner_mode,
+            new_tokens,
+            new_tokens.saturating_sub(prev_new_tokens),
+            buys,
+            buys.saturating_sub(prev_buys),
+            dropped_buys,
+            dropped_buys.saturating_sub(prev_dropped_buys),
+            SCANNER_NEW_TOKEN_CHANNEL_CAPACITY.saturating_sub(new_token_tx.capacity()),
+            SCANNER_BUY_CHANNEL_CAPACITY.saturating_sub(buy_tx.capacity()),
+            cfg.scanner_live_tokens_file,
+            cfg.scanned_tokens_file,
+        );
+        prev_new_tokens = new_tokens;
+        prev_buys = buys;
+        prev_dropped_buys = dropped_buys;
+    }
 }
 
 fn build_processed_endpoints(cfg: &AppConfig) -> Vec<FeedEndpoint> {
