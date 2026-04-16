@@ -9,7 +9,7 @@ use crate::scanner::feed::{FeedEndpoint, FeedKind};
 use crate::scanner::raw_event::raw_event_to_scanner_event;
 use crate::scanner::{decoder, deshred, ScannerEvent, PUMP_PROGRAM_ID};
 use anyhow::{Context, Result};
-use futures::StreamExt;
+use futures::{Sink, SinkExt, StreamExt};
 use std::{
     collections::{HashMap, HashSet},
     sync::Arc,
@@ -22,11 +22,13 @@ use tracing::{debug, error, info, warn};
 use yellowstone_grpc_client::GeyserGrpcClient;
 use yellowstone_grpc_proto::prelude::{
     subscribe_update::UpdateOneof, CommitmentLevel, SubscribeRequest,
-    SubscribeRequestFilterTransactions,
+    SubscribeRequestFilterTransactions, SubscribeRequestPing,
 };
 
 const SCANNER_DEDUP_TTL_MS: u64 = 120_000;
 const SCANNER_DEDUP_MAX_KEYS: usize = 16_384;
+const SCANNER_FAST_RETRY_MAX_DELAY: Duration = Duration::from_secs(5);
+const SCANNER_KEEPALIVE_SECS: u64 = 10;
 
 #[derive(Debug, Clone)]
 struct SeenSignal {
@@ -40,7 +42,11 @@ struct SeenSignal {
     sources: HashSet<String>,
 }
 
-pub async fn start(cfg: Arc<AppConfig>, tx: mpsc::Sender<ScannerEvent>) -> Result<()> {
+pub async fn start(
+    cfg: Arc<AppConfig>,
+    db: Option<FilterDb>,
+    tx: mpsc::Sender<ScannerEvent>,
+) -> Result<()> {
     let processed_endpoints = build_processed_endpoints(cfg.as_ref());
     let deshred_endpoint = build_deshred_endpoint(cfg.as_ref());
     let processed_labels = processed_endpoints
@@ -84,16 +90,6 @@ pub async fn start(cfg: Arc<AppConfig>, tx: mpsc::Sender<ScannerEvent>) -> Resul
         SCANNER_DEDUP_MAX_KEYS,
     );
 
-    let db = match FilterDb::new(&cfg.filter_db_path).await {
-        Ok(db) => Some(db),
-        Err(err) => {
-            warn!(
-                "scanner: failed to open filter db for feed metrics | {}",
-                err
-            );
-            None
-        }
-    };
     let failover = Arc::new(Mutex::new(FailoverController::new(
         cfg.scanner_failover_stale_ms,
     )));
@@ -230,6 +226,56 @@ fn build_deshred_endpoint(cfg: &AppConfig) -> Option<FeedEndpoint> {
     })
 }
 
+#[derive(Debug, Clone, Copy)]
+enum ProcessedRetryClass {
+    FastReconnect,
+    Backoff,
+}
+
+fn classify_processed_retry(err: &anyhow::Error) -> ProcessedRetryClass {
+    let message = err.to_string().to_ascii_lowercase();
+    if message.contains("stream ended unexpectedly")
+        || message.contains("idle timeout")
+        || message.contains("transport error")
+        || message.contains("connection reset")
+    {
+        ProcessedRetryClass::FastReconnect
+    } else {
+        ProcessedRetryClass::Backoff
+    }
+}
+
+fn next_processed_retry_delay(current: Duration, class: ProcessedRetryClass) -> Duration {
+    match class {
+        ProcessedRetryClass::FastReconnect => {
+            if current.is_zero() {
+                Duration::from_secs(1)
+            } else {
+                (current * 2).min(SCANNER_FAST_RETRY_MAX_DELAY)
+            }
+        }
+        ProcessedRetryClass::Backoff => {
+            if current.is_zero() {
+                Duration::from_secs(1)
+            } else {
+                (current * 2).min(Duration::from_secs(30))
+            }
+        }
+    }
+}
+
+fn retry_delay_for_processed_error(
+    retry_delay: Duration,
+    err: &anyhow::Error,
+) -> (Duration, ProcessedRetryClass) {
+    let class = classify_processed_retry(err);
+    let sleep_for = match class {
+        ProcessedRetryClass::FastReconnect => retry_delay.min(SCANNER_FAST_RETRY_MAX_DELAY),
+        ProcessedRetryClass::Backoff => retry_delay.min(Duration::from_secs(30)),
+    };
+    (sleep_for, class)
+}
+
 async fn should_forward_event(
     seen: &mut HashMap<String, SeenSignal>,
     event: &ScannerEvent,
@@ -251,20 +297,23 @@ async fn should_forward_event(
             existing.last_seen_ms = now_ms;
             if existing.sources.insert(feed_source.to_string()) {
                 if let Some(db) = db {
-                    db.upsert_feed_first_hit(&FeedFirstHitRecord {
-                        event_key,
-                        event_type: existing.event_type.to_string(),
-                        mint: existing.mint.clone(),
-                        signature: existing.signature.clone(),
-                        slot: existing.slot,
-                        first_feed_source: existing.first_feed_source.clone(),
-                        first_seen_ms: existing.first_seen_ms,
-                        last_feed_source: feed_source.to_string(),
-                        last_seen_ms: now_ms,
-                        distinct_source_count: existing.sources.len(),
-                        lag_to_latest_ms: now_ms.saturating_sub(existing.first_seen_ms),
-                    })
-                    .await?;
+                    warn_if_feed_first_hit_write_failed(
+                        db,
+                        FeedFirstHitRecord {
+                            event_key,
+                            event_type: existing.event_type.to_string(),
+                            mint: existing.mint.clone(),
+                            signature: existing.signature.clone(),
+                            slot: existing.slot,
+                            first_feed_source: existing.first_feed_source.clone(),
+                            first_seen_ms: existing.first_seen_ms,
+                            last_feed_source: feed_source.to_string(),
+                            last_seen_ms: now_ms,
+                            distinct_source_count: existing.sources.len(),
+                            lag_to_latest_ms: now_ms.saturating_sub(existing.first_seen_ms),
+                        },
+                    )
+                    .await;
                 }
             }
             Ok(false)
@@ -283,20 +332,23 @@ async fn should_forward_event(
                 sources,
             };
             if let Some(db) = db {
-                db.upsert_feed_first_hit(&FeedFirstHitRecord {
-                    event_key: event_key.clone(),
-                    event_type: event_type.to_string(),
-                    mint: mint.to_string(),
-                    signature: signature.to_string(),
-                    slot,
-                    first_feed_source: feed_source.to_string(),
-                    first_seen_ms: now_ms,
-                    last_feed_source: feed_source.to_string(),
-                    last_seen_ms: now_ms,
-                    distinct_source_count: 1,
-                    lag_to_latest_ms: 0,
-                })
-                .await?;
+                warn_if_feed_first_hit_write_failed(
+                    db,
+                    FeedFirstHitRecord {
+                        event_key: event_key.clone(),
+                        event_type: event_type.to_string(),
+                        mint: mint.to_string(),
+                        signature: signature.to_string(),
+                        slot,
+                        first_feed_source: feed_source.to_string(),
+                        first_seen_ms: now_ms,
+                        last_feed_source: feed_source.to_string(),
+                        last_seen_ms: now_ms,
+                        distinct_source_count: 1,
+                        lag_to_latest_ms: 0,
+                    },
+                )
+                .await;
             }
             observe_first_hit(
                 failover,
@@ -317,6 +369,16 @@ async fn should_forward_event(
             seen.insert(event_key, first_seen);
             Ok(true)
         }
+    }
+}
+
+async fn warn_if_feed_first_hit_write_failed(db: &FilterDb, record: FeedFirstHitRecord) {
+    if let Err(err) = db.upsert_feed_first_hit(&record).await {
+        warn!(
+            "scanner: feed_first_hit write failed | event_key={} | {}",
+            record.event_key,
+            err
+        );
     }
 }
 
@@ -355,7 +417,6 @@ async fn start_processed_feed_loop(
 ) -> Result<()> {
     debug_assert_eq!(endpoint.kind, FeedKind::Processed);
     let mut retry_delay = Duration::from_secs(1);
-    const MAX_DELAY: Duration = Duration::from_secs(30);
 
     loop {
         record_feed_health(
@@ -399,6 +460,7 @@ async fn start_processed_feed_loop(
                 return Ok(());
             }
             Err(err) => {
+                let (sleep_for, retry_class) = retry_delay_for_processed_error(retry_delay, &err);
                 record_feed_health(
                     db.as_ref(),
                     cfg.as_ref(),
@@ -414,13 +476,14 @@ async fn start_processed_feed_loop(
                 )
                 .await;
                 error!(
-                    "scanner: processed feed disconnected | feed={} | retry_in={}s | {}",
+                    "scanner: processed feed disconnected | feed={} | retry_class={:?} | retry_in_ms={} | {}",
                     endpoint.label,
-                    retry_delay.as_secs(),
+                    retry_class,
+                    sleep_for.as_millis(),
                     err
                 );
-                sleep(retry_delay).await;
-                retry_delay = (retry_delay * 2).min(MAX_DELAY);
+                sleep(sleep_for).await;
+                retry_delay = next_processed_retry_delay(sleep_for, retry_class);
             }
         }
     }
@@ -443,10 +506,12 @@ async fn run_processed_stream(
         .await
         .context("scanner gRPC connect failed")?;
 
-    let (_, mut stream) = client
+    let (subscribe_tx, mut stream) = client
         .subscribe_with_request(Some(build_subscribe_request()))
         .await
         .context("scanner subscribe request failed")?;
+    let keepalive_task =
+        spawn_keepalive_task(endpoint.label.clone(), "processed", subscribe_tx, build_ping_request);
 
     record_feed_health(
         db,
@@ -478,7 +543,7 @@ async fn run_processed_stream(
     let mut last_message_at = Instant::now();
     let idle_timeout = Duration::from_secs(cfg.scanner_idle_timeout_secs);
 
-    loop {
+    let result = 'stream: loop {
         let next = timeout(Duration::from_secs(5), stream.next()).await;
         match next {
             Ok(Some(Ok(update))) => {
@@ -492,7 +557,7 @@ async fn run_processed_stream(
                                 tx_info,
                             ) {
                                 if tx.send(event).await.is_err() {
-                                    return Ok(());
+                                    break 'stream Ok(());
                                 }
                             }
                         }
@@ -513,18 +578,20 @@ async fn run_processed_stream(
                     None => {}
                 }
             }
-            Ok(Some(Err(err))) => return Err(err).context("scanner stream read failed"),
-            Ok(None) => anyhow::bail!("scanner stream ended unexpectedly"),
+            Ok(Some(Err(err))) => break Err(err).context("scanner stream read failed"),
+            Ok(None) => break Err(anyhow::anyhow!("scanner stream ended unexpectedly")),
             Err(_) if last_message_at.elapsed() >= idle_timeout => {
-                anyhow::bail!(
+                break Err(anyhow::anyhow!(
                     "scanner processed feed idle timeout | feed={} | idle_secs={}",
                     endpoint.label,
                     cfg.scanner_idle_timeout_secs
-                );
+                ));
             }
             Err(_) => {}
         }
-    }
+    };
+    keepalive_task.abort();
+    result
 }
 
 async fn record_feed_health(
@@ -557,6 +624,48 @@ async fn record_feed_health(
         warn!("scanner: insert feed health failed | {}", err);
     }
     observe_health_change(failover, endpoint, &event, Some(db)).await;
+}
+
+fn build_ping_request(id: i32) -> SubscribeRequest {
+    SubscribeRequest {
+        ping: Some(SubscribeRequestPing { id }),
+        ..Default::default()
+    }
+}
+
+fn spawn_keepalive_task<S, Request, F>(
+    feed_label: String,
+    feed_kind: &'static str,
+    mut sink: S,
+    mut build_request: F,
+) -> tokio::task::JoinHandle<()>
+where
+    S: Sink<Request> + Unpin + Send + 'static,
+    S::Error: std::fmt::Display + Send + Sync + 'static,
+    Request: Send + 'static,
+    F: FnMut(i32) -> Request + Send + 'static,
+{
+    tokio::spawn(async move {
+        let mut interval =
+            tokio::time::interval(Duration::from_secs(SCANNER_KEEPALIVE_SECS.max(1)));
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        interval.tick().await;
+
+        let mut ping_id = 1i32;
+        loop {
+            interval.tick().await;
+            if let Err(err) = sink.send(build_request(ping_id)).await {
+                warn!(
+                    "scanner: {} keepalive send failed | feed={} | {}",
+                    feed_kind,
+                    feed_label,
+                    err
+                );
+                break;
+            }
+            ping_id = ping_id.checked_add(1).unwrap_or(1);
+        }
+    })
 }
 
 fn build_subscribe_request() -> SubscribeRequest {

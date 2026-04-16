@@ -527,7 +527,8 @@ async fn main() -> Result<()> {
         config.rpc_url.clone(),
         solana_sdk::commitment_config::CommitmentConfig::confirmed(),
     ));
-    let execution_db = Arc::new(FilterDb::new(&config.filter_db_path).await?);
+    let shared_filter_db = FilterDb::new(&config.filter_db_path).await?;
+    let execution_db = Arc::new(shared_filter_db.clone());
     let execution_feedback = Arc::new(RwLock::new(ExecutionFeedback::default()));
 
     if config.execution_feedback_refresh_secs > 0 {
@@ -707,17 +708,19 @@ async fn main() -> Result<()> {
     }
 
     let scanner_cfg = config.clone();
+    let scanner_db = shared_filter_db.clone();
     let scanner_tx_task = scanner_tx.clone();
     tokio::spawn(async move {
-        if let Err(err) = scanner::geyser::start(scanner_cfg, scanner_tx_task).await {
+        if let Err(err) = scanner::geyser::start(scanner_cfg, Some(scanner_db), scanner_tx_task).await {
             error!("扫链层退出: {}", err);
         }
     });
 
     let filter_cfg = config.clone();
+    let filter_db = shared_filter_db.clone();
     let filter_rpc = rpc_client.clone();
     tokio::spawn(async move {
-        if let Err(err) = filter::run(filter_cfg, filter_rpc, scanner_rx, buy_signal_tx).await {
+        if let Err(err) = filter::run(filter_cfg, filter_db, filter_rpc, scanner_rx, buy_signal_tx).await {
             error!("过滤层退出: {}", err);
         }
     });

@@ -1834,6 +1834,7 @@ fn open_conn(path: &Path) -> Result<Connection> {
     let conn = Connection::open(path)
         .with_context(|| format!("open SQLite failed: {}", path.display()))?;
     conn.pragma_update(None, "journal_mode", "WAL")?;
-    conn.busy_timeout(Duration::from_secs(5))?;
+    conn.pragma_update(None, "synchronous", "NORMAL")?;
+    conn.busy_timeout(Duration::from_secs(15))?;
     Ok(conn)
 }

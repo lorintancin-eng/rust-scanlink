@@ -305,11 +305,11 @@ struct SharedState {
 
 pub async fn run(
     config: Arc<AppConfig>,
+    db: FilterDb,
     rpc_client: Arc<RpcClient>,
     mut scanner_rx: mpsc::Receiver<ScannerEvent>,
     buy_signal_tx: mpsc::Sender<BuySignal>,
 ) -> Result<()> {
-    let db = FilterDb::new(&config.filter_db_path).await?;
     let shared = SharedState {
         config: config.clone(),
         rpc_client,

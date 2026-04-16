@@ -68,8 +68,10 @@ pub async fn run_pipeline(
 
     let (scanner_tx, scanner_rx) = mpsc::channel(4096);
     let (buy_tx, mut buy_rx) = mpsc::channel(512);
+    let replay_filter_db = FilterDb::new(&replay_config.filter_db_path).await?;
     let replay_config = Arc::new(replay_config);
-    let filter_task = tokio::spawn(filter::run(replay_config, rpc_client, scanner_rx, buy_tx));
+    let filter_task =
+        tokio::spawn(filter::run(replay_config, replay_filter_db, rpc_client, scanner_rx, buy_tx));
     let buy_counter = tokio::spawn(async move {
         let mut count = 0usize;
         while buy_rx.recv().await.is_some() {
