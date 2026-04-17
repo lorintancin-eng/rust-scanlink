@@ -1,5 +1,6 @@
 use anyhow::{Context, Result};
 use rusqlite::{params, Connection, OptionalExtension};
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
@@ -870,6 +871,54 @@ impl FilterDb {
                 params![&creator, &template_hash, next_count, last_mint, updated_at_ms],
             )?;
             Ok(next_count)
+        })
+        .await
+    }
+
+    pub async fn list_creator_template_counts(&self) -> Result<HashMap<(String, String), u32>> {
+        let path = self.path.clone();
+        tokio::task::spawn_blocking(move || {
+            let conn = open_conn(path.as_path())?;
+            let mut stmt = conn.prepare(
+                "SELECT creator, template_hash, repeat_count
+                 FROM creator_templates",
+            )?;
+            let mut rows = stmt.query([])?;
+            let mut counts = HashMap::new();
+            while let Some(row) = rows.next()? {
+                let creator: String = row.get(0)?;
+                let template_hash: String = row.get(1)?;
+                let repeat_count: u32 = row.get(2)?;
+                counts.insert((creator, template_hash), repeat_count);
+            }
+            Ok(counts)
+        })
+        .await
+        .context("query creator template counts failed")?
+    }
+
+    pub async fn upsert_creator_template_count(
+        &self,
+        creator: &str,
+        template_hash: &str,
+        repeat_count: u32,
+        last_mint: Option<&str>,
+        updated_at_ms: u64,
+    ) -> Result<()> {
+        let creator = creator.to_string();
+        let template_hash = template_hash.to_string();
+        let last_mint = last_mint.map(str::to_string);
+        self.with_conn(move |conn| {
+            conn.execute(
+                "INSERT INTO creator_templates(creator, template_hash, repeat_count, last_mint, updated_at_ms)
+                 VALUES(?1, ?2, ?3, ?4, ?5)
+                 ON CONFLICT(creator, template_hash) DO UPDATE SET
+                    repeat_count = excluded.repeat_count,
+                    last_mint = excluded.last_mint,
+                    updated_at_ms = excluded.updated_at_ms",
+                params![creator, template_hash, repeat_count, last_mint, updated_at_ms],
+            )?;
+            Ok(())
         })
         .await
     }

@@ -11,7 +11,10 @@ use crate::filter::risk::{
     RiskSignalSeed, RuntimeRiskInput, RuntimeRiskProfile,
 };
 use crate::processor::pumpfun::BondingCurveState;
-use crate::scanner::{NewToken, PumpBuyEvent, DISC_CREATE, DISC_CREATE_V2, PUMP_PROGRAM_ID};
+use crate::scanner::{
+    NewToken, PumpBuyEvent, DISC_CREATE, DISC_CREATE_V2, PUMP_PROGRAM_ID,
+    SCANNER_NEW_TOKEN_CHANNEL_CAPACITY,
+};
 use anyhow::{Context, Result};
 use futures::stream::{self, StreamExt};
 use reqwest::StatusCode;
@@ -200,6 +203,45 @@ enum InternalMessage {
     },
 }
 
+#[derive(Debug)]
+struct Gate1Result {
+    token: NewToken,
+    decision: Gate1Decision,
+    gate1_at_ms: u64,
+}
+
+#[derive(Debug, Clone)]
+struct Gate1PersistArtifacts {
+    creator: String,
+    template_hash: String,
+    template_repeat_count: u32,
+    mint: String,
+    updated_at_ms: u64,
+    uri_pattern_record: Option<UriPatternRecord>,
+}
+
+#[derive(Debug, Clone)]
+enum FilterPersistTask {
+    Gate1Artifacts(Gate1PersistArtifacts),
+    CreatorLinks {
+        token: NewToken,
+        profile: CreatorProfile,
+    },
+    BuyerLinks {
+        mint: String,
+        profile: BuyerProfile,
+    },
+    CandidateAnalytics {
+        candidate: Candidate,
+        passed: bool,
+        reject_gate: Option<String>,
+        score: Option<u32>,
+        reason: String,
+        mode: String,
+        path: String,
+    },
+}
+
 #[derive(Debug, Clone)]
 struct CreatorGateResult {
     passed: bool,
@@ -344,6 +386,7 @@ struct SharedState {
     rpc_client: Arc<RpcClient>,
     http: reqwest::Client,
     db: FilterDb,
+    persist_tx: mpsc::UnboundedSender<FilterPersistTask>,
     raw_new_token_persist_tx: mpsc::Sender<NewToken>,
     raw_buy_persist_tx: mpsc::Sender<PumpBuyEvent>,
     hotlists: Arc<RwLock<HotLists>>,
@@ -356,7 +399,7 @@ pub async fn run(
     config: Arc<AppConfig>,
     db: FilterDb,
     rpc_client: Arc<RpcClient>,
-    mut new_token_rx: mpsc::Receiver<NewToken>,
+    new_token_rx: mpsc::Receiver<NewToken>,
     mut buy_rx: mpsc::Receiver<PumpBuyEvent>,
     buy_signal_tx: mpsc::Sender<BuySignal>,
 ) -> Result<()> {
@@ -364,6 +407,7 @@ pub async fn run(
         mpsc::channel::<NewToken>(RAW_NEW_TOKEN_PERSIST_QUEUE_CAPACITY);
     let (raw_buy_persist_tx, raw_buy_persist_rx) =
         mpsc::channel::<PumpBuyEvent>(RAW_BUY_PERSIST_QUEUE_CAPACITY);
+    let (persist_tx, persist_rx) = mpsc::unbounded_channel::<FilterPersistTask>();
     let shared = SharedState {
         config: config.clone(),
         rpc_client,
@@ -372,6 +416,7 @@ pub async fn run(
             .build()
             .context("filter http client init failed")?,
         db,
+        persist_tx,
         raw_new_token_persist_tx,
         raw_buy_persist_tx,
         hotlists: Arc::new(RwLock::new(HotLists::default())),
@@ -379,6 +424,7 @@ pub async fn run(
         address_snapshot_refreshes: Arc::new(RwLock::new(HashSet::new())),
         address_snapshot_helius_cooldown_until_ms: Arc::new(RwLock::new(0)),
     };
+    spawn_filter_persist_worker(shared.clone(), persist_rx);
     spawn_raw_new_token_persist_worker(shared.clone(), raw_new_token_persist_rx);
     spawn_raw_buy_persist_worker(shared.clone(), raw_buy_persist_rx);
     if config.dynamic_hot_keywords_enabled {
@@ -390,35 +436,47 @@ pub async fn run(
     if let Err(err) = shared.db.backfill_entity_graph().await {
         warn!("entity graph backfill failed during startup: {}", err);
     }
+    let creator_template_counts = match shared.db.list_creator_template_counts().await {
+        Ok(counts) => counts,
+        Err(err) => {
+            warn!(
+                "creator template preload failed during startup; using empty cache: {}",
+                err
+            );
+            HashMap::new()
+        }
+    };
+    spawn_hotlist_refresh_worker(shared.clone());
+    let (gate1_result_tx, mut gate1_result_rx) =
+        mpsc::channel::<Gate1Result>(SCANNER_NEW_TOKEN_CHANNEL_CAPACITY);
+    spawn_gate1_worker(
+        shared.clone(),
+        new_token_rx,
+        gate1_result_tx,
+        creator_template_counts,
+    );
 
     let (internal_tx, mut internal_rx) = mpsc::unbounded_channel::<InternalMessage>();
     let mut candidates: HashMap<String, Candidate> = HashMap::new();
-    let mut creator_window: HashMap<String, VecDeque<u64>> = HashMap::new();
 
     let mut tick = tokio::time::interval(Duration::from_millis(200));
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-    let mut hot_reload = tokio::time::interval(Duration::from_secs(config.filter_hot_reload_secs));
-    hot_reload.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-    let mut dynamic_hot_refresh =
-        tokio::time::interval(Duration::from_secs(config.dynamic_hot_refresh_secs.max(30)));
-    dynamic_hot_refresh.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-    dynamic_hot_refresh.tick().await;
-    let mut new_token_stream_open = true;
+    let mut gate1_stream_open = true;
     let mut buy_stream_open = true;
     let mut internal_stream_open = true;
 
     loop {
-        if !new_token_stream_open && !buy_stream_open && !internal_stream_open {
+        if !gate1_stream_open && !buy_stream_open && !internal_stream_open {
             break;
         }
         tokio::select! {
             biased;
-            maybe_new_token = new_token_rx.recv(), if new_token_stream_open => {
-                let Some(token) = maybe_new_token else {
-                    new_token_stream_open = false;
+            maybe_gate1 = gate1_result_rx.recv(), if gate1_stream_open => {
+                let Some(result) = maybe_gate1 else {
+                    gate1_stream_open = false;
                     continue;
                 };
-                handle_new_token(&shared, &internal_tx, &mut candidates, &mut creator_window, token).await?;
+                handle_gate1_result(&shared, &internal_tx, &mut candidates, result).await?;
             }
             maybe_msg = internal_rx.recv(), if internal_stream_open => {
                 let Some(msg) = maybe_msg else {
@@ -524,24 +582,89 @@ pub async fn run(
                     }
                 }
             }
-            _ = hot_reload.tick() => {
-                if let Err(err) = reload_hotlists(&shared).await {
-                    warn!("filter: hot reload failed: {}", err);
-                }
-            }
-            _ = dynamic_hot_refresh.tick(), if shared.config.dynamic_hot_keywords_enabled => {
-                if let Err(err) = refresh_dynamic_hot_keywords(&shared).await {
-                    warn!("dynamic hot keyword refresh failed: {}", err);
-                } else if let Err(err) = reload_hotlists(&shared).await {
-                    warn!("filter: hot reload after dynamic refresh failed: {}", err);
-                }
-            }
         }
     }
 
     Ok(())
 }
 
+fn spawn_hotlist_refresh_worker(shared: SharedState) {
+    let hot_reload_enabled = shared.config.filter_hot_reload_secs > 0;
+    let dynamic_hot_enabled = shared.config.dynamic_hot_keywords_enabled;
+    if !hot_reload_enabled && !dynamic_hot_enabled {
+        return;
+    }
+
+    tokio::spawn(async move {
+        let mut hot_reload = tokio::time::interval(Duration::from_secs(
+            shared.config.filter_hot_reload_secs.max(1),
+        ));
+        hot_reload.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        hot_reload.tick().await;
+
+        let mut dynamic_hot_refresh = tokio::time::interval(Duration::from_secs(
+            shared.config.dynamic_hot_refresh_secs.max(30),
+        ));
+        dynamic_hot_refresh.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        dynamic_hot_refresh.tick().await;
+
+        loop {
+            tokio::select! {
+                _ = hot_reload.tick(), if hot_reload_enabled => {
+                    if let Err(err) = reload_hotlists(&shared).await {
+                        warn!("filter: hot reload failed: {}", err);
+                    }
+                }
+                _ = dynamic_hot_refresh.tick(), if dynamic_hot_enabled => {
+                    if let Err(err) = refresh_dynamic_hot_keywords(&shared).await {
+                        warn!("dynamic hot keyword refresh failed: {}", err);
+                    } else if let Err(err) = reload_hotlists(&shared).await {
+                        warn!("filter: hot reload after dynamic refresh failed: {}", err);
+                    }
+                }
+            }
+        }
+    });
+}
+
+fn spawn_gate1_worker(
+    shared: SharedState,
+    mut new_token_rx: mpsc::Receiver<NewToken>,
+    gate1_result_tx: mpsc::Sender<Gate1Result>,
+    mut creator_template_counts: HashMap<(String, String), u32>,
+) {
+    tokio::spawn(async move {
+        let mut creator_window: HashMap<String, VecDeque<u64>> = HashMap::new();
+        while let Some(token) = new_token_rx.recv().await {
+            let (decision, persist_artifacts) = gate1_check(
+                &shared,
+                &mut creator_window,
+                &mut creator_template_counts,
+                &token,
+            )
+            .await;
+            let gate1_at_ms = now_ms();
+            enqueue_raw_new_token_persist(&shared, &token);
+            if let Some(artifacts) = persist_artifacts {
+                enqueue_persist_task(&shared, FilterPersistTask::Gate1Artifacts(artifacts));
+            }
+            if gate1_result_tx
+                .send(Gate1Result {
+                    token,
+                    decision,
+                    gate1_at_ms,
+                })
+                .await
+                .is_err()
+            {
+                break;
+            }
+        }
+        info!("filter: gate1 worker stopped");
+    });
+}
+
+#[derive(Debug, Clone)]
 struct Gate1Decision {
     passed: bool,
     reason: String,
@@ -551,18 +674,21 @@ struct Gate1Decision {
     narrative_keyword_matches: Vec<NarrativeKeywordMatch>,
 }
 
-async fn handle_new_token(
+async fn handle_gate1_result(
     shared: &SharedState,
     internal_tx: &mpsc::UnboundedSender<InternalMessage>,
     candidates: &mut HashMap<String, Candidate>,
-    creator_window: &mut HashMap<String, VecDeque<u64>>,
-    token: NewToken,
+    result: Gate1Result,
 ) -> Result<()> {
+    let Gate1Result {
+        token,
+        decision,
+        gate1_at_ms,
+    } = result;
     if candidates.contains_key(&token.mint) {
         return Ok(());
     }
 
-    let gate1 = gate1_check(shared, creator_window, &token).await;
     let Gate1Decision {
         passed: gate1_passed,
         reason: gate1_reason,
@@ -570,11 +696,10 @@ async fn handle_new_token(
         narrative_keywords: gate1_narrative_keywords,
         dynamic_narrative_keywords: gate1_dynamic_keywords,
         narrative_keyword_matches,
-    } = gate1;
-    enqueue_raw_new_token_persist(shared, &token);
+    } = decision;
     if !gate1_passed {
         let trace = CandidateTrace {
-            gate1_at_ms: Some(now_ms()),
+            gate1_at_ms: Some(gate1_at_ms),
             ..Default::default()
         };
         record_token_outcome(
@@ -599,7 +724,6 @@ async fn handle_new_token(
         return Ok(());
     }
 
-    let gate1_at_ms = now_ms();
     candidates.insert(
         token.mint.clone(),
         Candidate {
@@ -685,7 +809,13 @@ async fn handle_creator_gate_resolution(
     candidate.status = CandidateStatus::Active;
     candidate.creator_profile = result.profile;
     if let Some(profile) = candidate.creator_profile.as_ref() {
-        persist_entity_links_for_creator(shared, &candidate.token, profile).await;
+        enqueue_persist_task(
+            shared,
+            FilterPersistTask::CreatorLinks {
+                token: candidate.token.clone(),
+                profile: profile.clone(),
+            },
+        );
     }
     candidate.trace.gate3_open_at_ms.get_or_insert_with(now_ms);
 
@@ -710,7 +840,13 @@ async fn handle_buyer_profile_resolution(
     };
     candidate.pending_buyer_profiles.remove(&address);
     if let Some(profile) = profile {
-        persist_entity_links_for_buyer(shared, &candidate.token.mint, &profile).await;
+        enqueue_persist_task(
+            shared,
+            FilterPersistTask::BuyerLinks {
+                mint: candidate.token.mint.clone(),
+                profile: profile.clone(),
+            },
+        );
         candidate.buyer_profiles.insert(address, profile);
     }
 
@@ -1131,18 +1267,22 @@ fn tokenize_keyword_text(input: &str) -> HashSet<String> {
 async fn gate1_check(
     shared: &SharedState,
     creator_window: &mut HashMap<String, VecDeque<u64>>,
+    creator_template_counts: &mut HashMap<(String, String), u32>,
     token: &NewToken,
-) -> Gate1Decision {
+) -> (Gate1Decision, Option<Gate1PersistArtifacts>) {
     let hotlists = shared.hotlists.read().await;
     if hotlists.creator_blacklist.contains(&token.creator) {
-        return Gate1Decision {
-            passed: false,
-            reason: "gate1 reject: creator blacklist hit".to_string(),
-            risk: Gate1RiskProfile::default(),
-            narrative_keywords: Vec::new(),
-            dynamic_narrative_keywords: Vec::new(),
-            narrative_keyword_matches: Vec::new(),
-        };
+        return (
+            Gate1Decision {
+                passed: false,
+                reason: "gate1 reject: creator blacklist hit".to_string(),
+                risk: Gate1RiskProfile::default(),
+                narrative_keywords: Vec::new(),
+                dynamic_narrative_keywords: Vec::new(),
+                narrative_keyword_matches: Vec::new(),
+            },
+            None,
+        );
     }
 
     let now = now_ms();
@@ -1156,41 +1296,50 @@ async fn gate1_check(
         }
     }
     if window.len() >= FACTORY_THRESHOLD {
-        return Gate1Decision {
-            passed: false,
-            reason: format!(
-                "gate1 reject: factory creator pattern ({} launches in 5m)",
-                window.len()
-            ),
-            risk: Gate1RiskProfile::default(),
-            narrative_keywords: Vec::new(),
-            dynamic_narrative_keywords: Vec::new(),
-            narrative_keyword_matches: Vec::new(),
-        };
+        return (
+            Gate1Decision {
+                passed: false,
+                reason: format!(
+                    "gate1 reject: factory creator pattern ({} launches in 5m)",
+                    window.len()
+                ),
+                risk: Gate1RiskProfile::default(),
+                narrative_keywords: Vec::new(),
+                dynamic_narrative_keywords: Vec::new(),
+                narrative_keyword_matches: Vec::new(),
+            },
+            None,
+        );
     }
 
     if token.name.trim().is_empty() || token.symbol.trim().is_empty() {
-        return Gate1Decision {
-            passed: false,
-            reason: "gate1 reject: empty name or symbol".to_string(),
-            risk: Gate1RiskProfile::default(),
-            narrative_keywords: Vec::new(),
-            dynamic_narrative_keywords: Vec::new(),
-            narrative_keyword_matches: Vec::new(),
-        };
+        return (
+            Gate1Decision {
+                passed: false,
+                reason: "gate1 reject: empty name or symbol".to_string(),
+                risk: Gate1RiskProfile::default(),
+                narrative_keywords: Vec::new(),
+                dynamic_narrative_keywords: Vec::new(),
+                narrative_keyword_matches: Vec::new(),
+            },
+            None,
+        );
     }
     if token.symbol.chars().count() > 10 {
-        return Gate1Decision {
-            passed: false,
-            reason: format!(
-                "gate1 reject: symbol too long ({})",
-                token.symbol.chars().count()
-            ),
-            risk: Gate1RiskProfile::default(),
-            narrative_keywords: Vec::new(),
-            dynamic_narrative_keywords: Vec::new(),
-            narrative_keyword_matches: Vec::new(),
-        };
+        return (
+            Gate1Decision {
+                passed: false,
+                reason: format!(
+                    "gate1 reject: symbol too long ({})",
+                    token.symbol.chars().count()
+                ),
+                risk: Gate1RiskProfile::default(),
+                narrative_keywords: Vec::new(),
+                dynamic_narrative_keywords: Vec::new(),
+                narrative_keyword_matches: Vec::new(),
+            },
+            None,
+        );
     }
 
     let lower = format!(
@@ -1199,14 +1348,17 @@ async fn gate1_check(
         token.symbol.to_lowercase()
     );
     if let Some(keyword) = GATE1_BLACK_KEYWORDS.iter().find(|kw| lower.contains(**kw)) {
-        return Gate1Decision {
-            passed: false,
-            reason: format!("gate1 reject: blacklist keyword {}", keyword),
-            risk: Gate1RiskProfile::default(),
-            narrative_keywords: Vec::new(),
-            dynamic_narrative_keywords: Vec::new(),
-            narrative_keyword_matches: Vec::new(),
-        };
+        return (
+            Gate1Decision {
+                passed: false,
+                reason: format!("gate1 reject: blacklist keyword {}", keyword),
+                risk: Gate1RiskProfile::default(),
+                narrative_keywords: Vec::new(),
+                dynamic_narrative_keywords: Vec::new(),
+                narrative_keyword_matches: Vec::new(),
+            },
+            None,
+        );
     }
 
     let (narrative_keywords, dynamic_narrative_keywords, narrative_keyword_matches) =
@@ -1214,54 +1366,58 @@ async fn gate1_check(
     drop(hotlists);
 
     let (uri_host, uri_pattern, template_hash) = derive_template_identity(token);
-    let template_repeat_count = shared
-        .db
-        .record_creator_template(&token.creator, &template_hash, Some(&token.mint), now)
-        .await
-        .unwrap_or(1);
+    let template_key = (token.creator.clone(), template_hash.clone());
+    let template_repeat_count = creator_template_counts
+        .entry(template_key)
+        .and_modify(|count| *count = count.saturating_add(1))
+        .or_insert(1);
     let risk = analyze_gate1_risk(
         token,
         uri_host.clone(),
         uri_pattern.clone(),
         template_hash,
-        template_repeat_count,
+        *template_repeat_count,
         shared.config.as_ref(),
     );
-    if let Some(pattern) = uri_pattern {
-        let label = uri_host.unwrap_or_else(|| "unknown".to_string());
-        if let Err(err) = shared
-            .db
-            .upsert_uri_pattern(&UriPatternRecord {
-                pattern,
-                label,
-                risk_score: risk.penalty_score as i32,
-                mint_count: 1,
-                last_seen_ms: now,
-            })
-            .await
-        {
-            warn!("upsert uri pattern failed | mint={} | {}", token.mint, err);
-        }
-    }
+    let persist_artifacts = Gate1PersistArtifacts {
+        creator: token.creator.clone(),
+        template_hash: risk.template_hash.clone(),
+        template_repeat_count: risk.template_repeat_count,
+        mint: token.mint.clone(),
+        updated_at_ms: now,
+        uri_pattern_record: uri_pattern.map(|pattern| UriPatternRecord {
+            pattern,
+            label: uri_host.unwrap_or_else(|| "unknown".to_string()),
+            risk_score: risk.penalty_score as i32,
+            mint_count: 1,
+            last_seen_ms: now,
+        }),
+    };
     if let Some(reason) = risk.hard_reject_reason.clone() {
-        return Gate1Decision {
-            passed: false,
-            reason,
+        return (
+            Gate1Decision {
+                passed: false,
+                reason,
+                risk,
+                narrative_keywords,
+                dynamic_narrative_keywords,
+                narrative_keyword_matches,
+            },
+            Some(persist_artifacts),
+        );
+    }
+
+    (
+        Gate1Decision {
+            passed: true,
+            reason: "gate1 pass".to_string(),
             risk,
             narrative_keywords,
             dynamic_narrative_keywords,
             narrative_keyword_matches,
-        };
-    }
-
-    Gate1Decision {
-        passed: true,
-        reason: "gate1 pass".to_string(),
-        risk,
-        narrative_keywords,
-        dynamic_narrative_keywords,
-        narrative_keyword_matches,
-    }
+        },
+        Some(persist_artifacts),
+    )
 }
 
 async fn creator_gate(shared: &SharedState, token: &NewToken) -> Result<CreatorGateResult> {
@@ -3526,6 +3682,7 @@ async fn record_candidate_outcome(
     let reason_ref = reason.clone();
     let mode_ref = mode.clone();
     let path_ref = path.clone();
+    let analytics_candidate = candidate.clone();
     record_token_outcome(
         shared,
         &candidate.token,
@@ -3541,17 +3698,18 @@ async fn record_candidate_outcome(
         None,
     )
     .await;
-    persist_candidate_analytics(
+    enqueue_persist_task(
         shared,
-        candidate,
-        passed,
-        reject_gate_ref.as_deref(),
-        score_ref,
-        &reason_ref,
-        &mode_ref,
-        &path_ref,
-    )
-    .await;
+        FilterPersistTask::CandidateAnalytics {
+            candidate: analytics_candidate,
+            passed,
+            reject_gate: reject_gate_ref,
+            score: score_ref,
+            reason: reason_ref,
+            mode: mode_ref,
+            path: path_ref.clone(),
+        },
+    );
 
     if passed {
         spawn_post_trade_outcome_tracking(
@@ -3672,6 +3830,78 @@ async fn record_token_outcome(
             path,
             reason
         );
+    }
+}
+
+fn spawn_filter_persist_worker(
+    shared: SharedState,
+    mut persist_rx: mpsc::UnboundedReceiver<FilterPersistTask>,
+) {
+    tokio::spawn(async move {
+        while let Some(task) = persist_rx.recv().await {
+            match task {
+                FilterPersistTask::Gate1Artifacts(artifacts) => {
+                    if let Err(err) = shared
+                        .db
+                        .upsert_creator_template_count(
+                            &artifacts.creator,
+                            &artifacts.template_hash,
+                            artifacts.template_repeat_count,
+                            Some(&artifacts.mint),
+                            artifacts.updated_at_ms,
+                        )
+                        .await
+                    {
+                        warn!(
+                            "upsert creator template failed | creator={} | mint={} | {}",
+                            artifacts.creator, artifacts.mint, err
+                        );
+                    }
+                    if let Some(record) = artifacts.uri_pattern_record.as_ref() {
+                        if let Err(err) = shared.db.upsert_uri_pattern(record).await {
+                            warn!(
+                                "upsert uri pattern failed | mint={} | {}",
+                                artifacts.mint, err
+                            );
+                        }
+                    }
+                }
+                FilterPersistTask::CreatorLinks { token, profile } => {
+                    persist_entity_links_for_creator(&shared, &token, &profile).await;
+                }
+                FilterPersistTask::BuyerLinks { mint, profile } => {
+                    persist_entity_links_for_buyer(&shared, &mint, &profile).await;
+                }
+                FilterPersistTask::CandidateAnalytics {
+                    candidate,
+                    passed,
+                    reject_gate,
+                    score,
+                    reason,
+                    mode,
+                    path,
+                } => {
+                    persist_candidate_analytics(
+                        &shared,
+                        &candidate,
+                        passed,
+                        reject_gate.as_deref(),
+                        score,
+                        &reason,
+                        &mode,
+                        &path,
+                    )
+                    .await;
+                }
+            }
+        }
+        info!("filter: persist worker stopped");
+    });
+}
+
+fn enqueue_persist_task(shared: &SharedState, task: FilterPersistTask) {
+    if shared.persist_tx.send(task).is_err() {
+        warn!("filter persist queue closed; dropping background task");
     }
 }
 
