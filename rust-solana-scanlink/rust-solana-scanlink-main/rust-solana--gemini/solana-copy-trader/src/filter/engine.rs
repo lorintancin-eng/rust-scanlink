@@ -85,6 +85,7 @@ const QUALITY_CLUSTER_MIN_HOT_FUNDERS: usize = 2;
 const QUALITY_CLUSTER_MAX_SHARE: f64 = 0.60;
 const QUALITY_CLUSTER_BONUS_SCORE: u32 = 6;
 const FAST_QUALITY_CLUSTER_SCORE_RELIEF: u32 = 4;
+const RAW_NEW_TOKEN_PERSIST_QUEUE_CAPACITY: usize = 1_024;
 const RAW_BUY_PERSIST_QUEUE_CAPACITY: usize = 8_192;
 const NARRATIVE_SOURCE_BASE_MARKET: &str = "base_market";
 const NARRATIVE_SOURCE_PREHEAT_SOCIAL: &str = "preheat_social";
@@ -343,6 +344,7 @@ struct SharedState {
     rpc_client: Arc<RpcClient>,
     http: reqwest::Client,
     db: FilterDb,
+    raw_new_token_persist_tx: mpsc::Sender<NewToken>,
     raw_buy_persist_tx: mpsc::Sender<PumpBuyEvent>,
     hotlists: Arc<RwLock<HotLists>>,
     address_snapshot_cache: Arc<RwLock<HashMap<String, CachedAddressSnapshot>>>,
@@ -358,6 +360,8 @@ pub async fn run(
     mut buy_rx: mpsc::Receiver<PumpBuyEvent>,
     buy_signal_tx: mpsc::Sender<BuySignal>,
 ) -> Result<()> {
+    let (raw_new_token_persist_tx, raw_new_token_persist_rx) =
+        mpsc::channel::<NewToken>(RAW_NEW_TOKEN_PERSIST_QUEUE_CAPACITY);
     let (raw_buy_persist_tx, raw_buy_persist_rx) =
         mpsc::channel::<PumpBuyEvent>(RAW_BUY_PERSIST_QUEUE_CAPACITY);
     let shared = SharedState {
@@ -368,12 +372,14 @@ pub async fn run(
             .build()
             .context("filter http client init failed")?,
         db,
+        raw_new_token_persist_tx,
         raw_buy_persist_tx,
         hotlists: Arc::new(RwLock::new(HotLists::default())),
         address_snapshot_cache: Arc::new(RwLock::new(HashMap::new())),
         address_snapshot_refreshes: Arc::new(RwLock::new(HashSet::new())),
         address_snapshot_helius_cooldown_until_ms: Arc::new(RwLock::new(0)),
     };
+    spawn_raw_new_token_persist_worker(shared.clone(), raw_new_token_persist_rx);
     spawn_raw_buy_persist_worker(shared.clone(), raw_buy_persist_rx);
     if config.dynamic_hot_keywords_enabled {
         if let Err(err) = refresh_dynamic_hot_keywords(&shared).await {
@@ -556,8 +562,6 @@ async fn handle_new_token(
         return Ok(());
     }
 
-    persist_raw_new_token_event(shared, &token).await;
-
     let gate1 = gate1_check(shared, creator_window, &token).await;
     let Gate1Decision {
         passed: gate1_passed,
@@ -567,6 +571,7 @@ async fn handle_new_token(
         dynamic_narrative_keywords: gate1_dynamic_keywords,
         narrative_keyword_matches,
     } = gate1;
+    enqueue_raw_new_token_persist(shared, &token);
     if !gate1_passed {
         let trace = CandidateTrace {
             gate1_at_ms: Some(now_ms()),
@@ -3750,6 +3755,39 @@ async fn persist_raw_new_token_event(shared: &SharedState, token: &NewToken) {
     };
     if let Err(err) = shared.db.insert_raw_event(&record).await {
         warn!("raw new_token insert failed: {}", err);
+    }
+}
+
+fn spawn_raw_new_token_persist_worker(
+    shared: SharedState,
+    mut raw_new_token_persist_rx: mpsc::Receiver<NewToken>,
+) {
+    tokio::spawn(async move {
+        while let Some(token) = raw_new_token_persist_rx.recv().await {
+            persist_raw_new_token_event(&shared, &token).await;
+        }
+        info!("filter: raw new_token persist worker stopped");
+    });
+}
+
+fn enqueue_raw_new_token_persist(shared: &SharedState, token: &NewToken) {
+    if !shared.config.persist_raw_scanner_events {
+        return;
+    }
+    match shared.raw_new_token_persist_tx.try_send(token.clone()) {
+        Ok(()) => {}
+        Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+            warn!(
+                "raw new_token persist queue full; dropping event | mint={}",
+                token.mint
+            );
+        }
+        Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+            warn!(
+                "raw new_token persist queue closed; dropping event | mint={}",
+                token.mint
+            );
+        }
     }
 }
 
