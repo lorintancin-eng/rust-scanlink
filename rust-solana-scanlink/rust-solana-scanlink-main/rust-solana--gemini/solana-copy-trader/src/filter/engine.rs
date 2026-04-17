@@ -26,7 +26,7 @@ use std::str::FromStr;
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::io::AsyncWriteExt;
-use tokio::sync::{mpsc, RwLock};
+use tokio::sync::{mpsc, oneshot, OwnedSemaphorePermit, RwLock, Semaphore};
 use tracing::{error, info, warn};
 
 const GATE1_BLACK_KEYWORDS: &[&str] = &[
@@ -84,6 +84,9 @@ const GATE2_FRESH_WALLET_PENALTY_SCORE: u32 = 4;
 const GATE2_NO_GRADUATED_PENALTY_SCORE: u32 = 6;
 const GATE2_LARGE_FUNDER_CLUSTER_PENALTY_SCORE: u32 = 4;
 const GATE2_FAST_TIMEOUT_PENALTY_SCORE: u32 = 4;
+const GATE2_STALE_CACHE_PENALTY_SCORE: u32 = 2;
+const GATE2_CACHE_MISS_PENALTY_SCORE: u32 = 4;
+const GATE2_REMOTE_BUSY_PENALTY_SCORE: u32 = 3;
 const SAME_FUNDER_CLUSTER_PENALTY_MIN_BUYS: usize = 3;
 const SAME_FUNDER_CLUSTER_PENALTY_SHARE: f64 = 0.66;
 const SAME_FUNDER_CLUSTER_PENALTY_SCORE: u32 = 8;
@@ -342,6 +345,12 @@ struct CachedAddressSnapshot {
     fetched_at_ms: u64,
 }
 
+#[derive(Debug, Clone)]
+struct CachedCreatorProfile {
+    profile: CreatorProfile,
+    fetched_at_ms: u64,
+}
+
 #[derive(Debug, Clone, Default)]
 struct CreatorClusterProfile {
     funder: Option<String>,
@@ -412,6 +421,10 @@ struct SharedState {
     address_snapshot_cache: Arc<RwLock<HashMap<String, CachedAddressSnapshot>>>,
     address_snapshot_refreshes: Arc<RwLock<HashSet<String>>>,
     address_snapshot_helius_cooldown_until_ms: Arc<RwLock<u64>>,
+    creator_profile_cache: Arc<RwLock<HashMap<String, CachedCreatorProfile>>>,
+    creator_profile_refreshes: Arc<RwLock<HashSet<String>>>,
+    creator_profile_retry_after_ms: Arc<RwLock<HashMap<String, u64>>>,
+    creator_gate_remote_semaphore: Arc<Semaphore>,
 }
 
 pub async fn run(
@@ -442,6 +455,12 @@ pub async fn run(
         address_snapshot_cache: Arc::new(RwLock::new(HashMap::new())),
         address_snapshot_refreshes: Arc::new(RwLock::new(HashSet::new())),
         address_snapshot_helius_cooldown_until_ms: Arc::new(RwLock::new(0)),
+        creator_profile_cache: Arc::new(RwLock::new(HashMap::new())),
+        creator_profile_refreshes: Arc::new(RwLock::new(HashSet::new())),
+        creator_profile_retry_after_ms: Arc::new(RwLock::new(HashMap::new())),
+        creator_gate_remote_semaphore: Arc::new(Semaphore::new(
+            config.creator_gate_remote_concurrency.max(1),
+        )),
     };
     spawn_filter_persist_worker(shared.clone(), persist_rx);
     spawn_raw_new_token_persist_worker(shared.clone(), raw_new_token_persist_rx);
@@ -1486,21 +1505,35 @@ async fn creator_gate(
     token: &NewToken,
     task_spawned_at_ms: u64,
 ) -> Result<CreatorGateResult> {
-    let cached = shared.db.get_creator_profile(&token.creator).await?;
-    if let Some(profile) = cached.as_ref() {
-        if now_ms().saturating_sub(profile.fetched_at_ms) <= CREATOR_CACHE_TTL_MS {
-            let mut result = apply_creator_entity_rules(
-                shared,
-                apply_creator_rules(shared.config.as_ref(), profile.clone()),
-            )
-            .await?;
-            result.task_spawned_at_ms = task_spawned_at_ms;
-            result.remote_started_at_ms = None;
-            result.result_ready_at_ms = now_ms();
-            return Ok(result);
-        }
+    if let Some(profile) =
+        get_cached_creator_profile(shared, &token.creator, CREATOR_CACHE_TTL_MS).await
+    {
+        let mut result = apply_creator_entity_rules(
+            shared,
+            apply_creator_rules(shared.config.as_ref(), profile),
+        )
+        .await?;
+        result.task_spawned_at_ms = task_spawned_at_ms;
+        result.remote_started_at_ms = None;
+        result.result_ready_at_ms = now_ms();
+        return Ok(result);
     }
 
+    if let Some(profile) =
+        get_persisted_creator_profile(shared, &token.creator, CREATOR_CACHE_TTL_MS).await
+    {
+        let mut result = apply_creator_entity_rules(
+            shared,
+            apply_creator_rules(shared.config.as_ref(), profile),
+        )
+        .await?;
+        result.task_spawned_at_ms = task_spawned_at_ms;
+        result.remote_started_at_ms = None;
+        result.result_ready_at_ms = now_ms();
+        return Ok(result);
+    }
+
+    let cached = get_any_creator_profile(shared, &token.creator).await;
     let Some(api_key) = shared.config.helius_api_key.as_deref() else {
         let mut result = apply_creator_entity_rules(
             shared,
@@ -1520,31 +1553,138 @@ async fn creator_gate(
         return Ok(result);
     };
 
+    if let Some(profile) = cached.clone() {
+        let age_ms = now_ms().saturating_sub(profile.fetched_at_ms);
+        let mut result = apply_creator_entity_rules(
+            shared,
+            apply_creator_rules(shared.config.as_ref(), profile.clone()),
+        )
+        .await?;
+        push_creator_gate_warning(
+            &mut result,
+            format!("stale_creator_profile_cache(age_ms={})", age_ms),
+            GATE2_STALE_CACHE_PENALTY_SCORE,
+        );
+        result.task_spawned_at_ms = task_spawned_at_ms;
+        result.remote_started_at_ms = None;
+        result.result_ready_at_ms = now_ms();
+        let _ = maybe_spawn_creator_profile_refresh(
+            shared,
+            token.clone(),
+            api_key.to_string(),
+            Some(profile),
+            None,
+        )
+        .await;
+        return Ok(finalize_creator_gate_result(result));
+    }
+
+    let retry_after_ms = creator_profile_retry_remaining_ms(shared, &token.creator).await;
+    if retry_after_ms > 0 {
+        return Ok(creator_gate_provisional_pass(
+            format!("cache_miss_retry_cooldown({}ms)", retry_after_ms),
+            GATE2_CACHE_MISS_PENALTY_SCORE,
+            task_spawned_at_ms,
+            None,
+        ));
+    }
+
     let normal_timeout_ms = shared.config.creator_gate_timeout_ms.max(1);
     let fast_timeout_ms = shared
         .config
         .creator_gate_sniper_fast_timeout_ms
         .max(1)
         .min(normal_timeout_ms);
-    let remote_started_at_ms = now_ms();
-    let remote_future = creator_gate_remote(shared, token, api_key, cached.clone());
-    let mut result =
-        match tokio::time::timeout(Duration::from_millis(fast_timeout_ms), remote_future).await {
-            Ok(result) => result?,
-            Err(_) => creator_gate_timeout_fallback(
-                shared.config.as_ref(),
-                cached,
-                fast_timeout_ms,
-                true,
+    let (remote_started_at_ms, response_rx) = match maybe_spawn_creator_profile_refresh(
+        shared,
+        token.clone(),
+        api_key.to_string(),
+        None,
+        Some(task_spawned_at_ms),
+    )
+    .await?
+    {
+        CreatorRefreshLaunch::Started {
+            remote_started_at_ms,
+            response_rx,
+        } => (remote_started_at_ms, response_rx),
+        CreatorRefreshLaunch::Inflight => {
+            return Ok(creator_gate_provisional_pass(
+                "creator_cache_refresh_inflight".to_string(),
+                GATE2_CACHE_MISS_PENALTY_SCORE,
+                task_spawned_at_ms,
+                None,
+            ));
+        }
+        CreatorRefreshLaunch::Cooldown { retry_after_ms } => {
+            return Ok(creator_gate_provisional_pass(
+                format!("cache_miss_retry_cooldown({}ms)", retry_after_ms),
+                GATE2_CACHE_MISS_PENALTY_SCORE,
+                task_spawned_at_ms,
+                None,
+            ));
+        }
+        CreatorRefreshLaunch::Busy => {
+            set_creator_profile_retry_after(
+                shared,
+                &token.creator,
+                shared.config.creator_gate_cache_miss_retry_ms,
+            )
+            .await;
+            return Ok(creator_gate_provisional_pass(
+                format!(
+                    "creator_gate_remote_busy(concurrency={})",
+                    shared.config.creator_gate_remote_concurrency.max(1)
+                ),
+                GATE2_REMOTE_BUSY_PENALTY_SCORE,
+                task_spawned_at_ms,
+                None,
+            ));
+        }
+    };
+
+    match tokio::time::timeout(Duration::from_millis(fast_timeout_ms), response_rx).await {
+        Ok(Ok(Ok(result))) => apply_creator_entity_rules(shared, result).await,
+        Ok(Ok(Err(err))) => {
+            warn!(
+                "creator gate remote fast-path failed | creator={} | {}",
+                token.creator, err
+            );
+            Ok(creator_gate_provisional_pass(
+                format!("creator_gate_remote_error({})", err),
+                GATE2_FAST_TIMEOUT_PENALTY_SCORE,
                 task_spawned_at_ms,
                 Some(remote_started_at_ms),
-            ),
-        };
+            ))
+        }
+        Ok(Err(_)) => Ok(creator_gate_provisional_pass(
+            "creator_gate_remote_cancelled".to_string(),
+            GATE2_FAST_TIMEOUT_PENALTY_SCORE,
+            task_spawned_at_ms,
+            Some(remote_started_at_ms),
+        )),
+        Err(_) => Ok(creator_gate_timeout_fallback(
+            shared.config.as_ref(),
+            None,
+            fast_timeout_ms,
+            true,
+            task_spawned_at_ms,
+            Some(remote_started_at_ms),
+        )),
+    }
+}
 
-    result.task_spawned_at_ms = task_spawned_at_ms;
-    result.remote_started_at_ms = Some(remote_started_at_ms);
-    result.result_ready_at_ms = now_ms();
-    apply_creator_entity_rules(shared, result).await
+#[derive(Debug)]
+enum CreatorRefreshLaunch {
+    Started {
+        remote_started_at_ms: u64,
+        response_rx: oneshot::Receiver<Result<CreatorGateResult>>,
+    },
+    Inflight,
+    Cooldown {
+        retry_after_ms: u64,
+    },
+    Busy,
 }
 
 async fn apply_creator_entity_rules(
@@ -1659,6 +1799,13 @@ async fn creator_gate_remote(
     }
 
     shared.db.upsert_creator_profile(&profile).await?;
+    cache_creator_profile_memory(
+        shared,
+        &profile.address,
+        profile.clone(),
+        profile.fetched_at_ms,
+    )
+    .await;
     Ok(apply_creator_rules(shared.config.as_ref(), profile))
 }
 
@@ -1713,6 +1860,220 @@ fn creator_gate_timeout_fallback(
         result = finalize_creator_gate_result(result);
     }
     result
+}
+
+fn creator_gate_provisional_pass(
+    warning: String,
+    penalty_score: u32,
+    task_spawned_at_ms: u64,
+    remote_started_at_ms: Option<u64>,
+) -> CreatorGateResult {
+    finalize_creator_gate_result(CreatorGateResult {
+        passed: true,
+        reason: "gate2 provisional pass".to_string(),
+        profile: None,
+        penalty_score,
+        warning_tags: vec![warning],
+        task_spawned_at_ms,
+        remote_started_at_ms,
+        result_ready_at_ms: now_ms(),
+    })
+}
+
+async fn get_cached_creator_profile(
+    shared: &SharedState,
+    creator: &str,
+    max_age_ms: u64,
+) -> Option<CreatorProfile> {
+    let cache = shared.creator_profile_cache.read().await;
+    let entry = cache.get(creator)?;
+    if now_ms().saturating_sub(entry.fetched_at_ms) > max_age_ms {
+        return None;
+    }
+    Some(entry.profile.clone())
+}
+
+async fn get_persisted_creator_profile(
+    shared: &SharedState,
+    creator: &str,
+    max_age_ms: u64,
+) -> Option<CreatorProfile> {
+    let profile = shared
+        .db
+        .get_creator_profile(creator)
+        .await
+        .ok()
+        .flatten()?;
+    if now_ms().saturating_sub(profile.fetched_at_ms) > max_age_ms {
+        return None;
+    }
+    cache_creator_profile_memory(shared, creator, profile.clone(), profile.fetched_at_ms).await;
+    Some(profile)
+}
+
+async fn get_any_creator_profile(shared: &SharedState, creator: &str) -> Option<CreatorProfile> {
+    let cached = get_cached_creator_profile(shared, creator, u64::MAX).await;
+    let persisted = shared.db.get_creator_profile(creator).await.ok().flatten();
+    let freshest = match (cached, persisted) {
+        (Some(left), Some(right)) => {
+            if left.fetched_at_ms >= right.fetched_at_ms {
+                Some(left)
+            } else {
+                cache_creator_profile_memory(shared, creator, right.clone(), right.fetched_at_ms)
+                    .await;
+                Some(right)
+            }
+        }
+        (Some(left), None) => Some(left),
+        (None, Some(right)) => {
+            cache_creator_profile_memory(shared, creator, right.clone(), right.fetched_at_ms).await;
+            Some(right)
+        }
+        (None, None) => None,
+    };
+    freshest
+}
+
+async fn cache_creator_profile_memory(
+    shared: &SharedState,
+    creator: &str,
+    profile: CreatorProfile,
+    fetched_at_ms: u64,
+) {
+    let mut cache = shared.creator_profile_cache.write().await;
+    cache.insert(
+        creator.to_string(),
+        CachedCreatorProfile {
+            profile,
+            fetched_at_ms,
+        },
+    );
+}
+
+async fn creator_profile_retry_remaining_ms(shared: &SharedState, creator: &str) -> u64 {
+    let guard = shared.creator_profile_retry_after_ms.read().await;
+    guard
+        .get(creator)
+        .copied()
+        .unwrap_or_default()
+        .saturating_sub(now_ms())
+}
+
+async fn set_creator_profile_retry_after(shared: &SharedState, creator: &str, cooldown_ms: u64) {
+    let mut guard = shared.creator_profile_retry_after_ms.write().await;
+    guard.insert(creator.to_string(), now_ms().saturating_add(cooldown_ms));
+}
+
+async fn clear_creator_profile_retry_after(shared: &SharedState, creator: &str) {
+    let mut guard = shared.creator_profile_retry_after_ms.write().await;
+    guard.remove(creator);
+}
+
+async fn clear_creator_profile_refresh_inflight(shared: &SharedState, creator: &str) {
+    let mut guard = shared.creator_profile_refreshes.write().await;
+    guard.remove(creator);
+}
+
+async fn maybe_spawn_creator_profile_refresh(
+    shared: &SharedState,
+    token: NewToken,
+    api_key: String,
+    cached: Option<CreatorProfile>,
+    task_spawned_at_ms: Option<u64>,
+) -> Result<CreatorRefreshLaunch> {
+    let creator = token.creator.clone();
+    let retry_after_ms = creator_profile_retry_remaining_ms(shared, &creator).await;
+    if retry_after_ms > 0 {
+        return Ok(CreatorRefreshLaunch::Cooldown { retry_after_ms });
+    }
+
+    {
+        let refreshes = shared.creator_profile_refreshes.read().await;
+        if refreshes.contains(&creator) {
+            return Ok(CreatorRefreshLaunch::Inflight);
+        }
+    }
+
+    let permit = match shared
+        .creator_gate_remote_semaphore
+        .clone()
+        .try_acquire_owned()
+    {
+        Ok(permit) => permit,
+        Err(_) => return Ok(CreatorRefreshLaunch::Busy),
+    };
+
+    {
+        let mut refreshes = shared.creator_profile_refreshes.write().await;
+        if !refreshes.insert(creator.clone()) {
+            return Ok(CreatorRefreshLaunch::Inflight);
+        }
+    }
+
+    let (response_tx, response_rx) = oneshot::channel();
+    let remote_started_at_ms = now_ms();
+    spawn_creator_profile_refresh_task(
+        shared.clone(),
+        token,
+        api_key,
+        cached,
+        task_spawned_at_ms,
+        remote_started_at_ms,
+        permit,
+        response_tx,
+    );
+    Ok(CreatorRefreshLaunch::Started {
+        remote_started_at_ms,
+        response_rx,
+    })
+}
+
+fn spawn_creator_profile_refresh_task(
+    shared: SharedState,
+    token: NewToken,
+    api_key: String,
+    cached: Option<CreatorProfile>,
+    task_spawned_at_ms: Option<u64>,
+    remote_started_at_ms: u64,
+    permit: OwnedSemaphorePermit,
+    response_tx: oneshot::Sender<Result<CreatorGateResult>>,
+) {
+    tokio::spawn(async move {
+        let creator = token.creator.clone();
+        let _permit = permit;
+        let response = creator_gate_remote(&shared, &token, &api_key, cached).await;
+        match &response {
+            Ok(result) => {
+                if let Some(profile) = result.profile.as_ref() {
+                    cache_creator_profile_memory(
+                        &shared,
+                        &creator,
+                        profile.clone(),
+                        profile.fetched_at_ms,
+                    )
+                    .await;
+                }
+                clear_creator_profile_retry_after(&shared, &creator).await;
+            }
+            Err(_) => {
+                set_creator_profile_retry_after(
+                    &shared,
+                    &creator,
+                    shared.config.creator_gate_cache_miss_retry_ms,
+                )
+                .await;
+            }
+        }
+        clear_creator_profile_refresh_inflight(&shared, &creator).await;
+
+        let response = response.map(|mut result| {
+            result.task_spawned_at_ms = task_spawned_at_ms.unwrap_or_default();
+            result.remote_started_at_ms = Some(remote_started_at_ms);
+            result.result_ready_at_ms = now_ms();
+            result
+        });
+        let _ = response_tx.send(response);
+    });
 }
 
 fn apply_creator_rules_without_graduated(
@@ -4928,6 +5289,8 @@ mod tests {
             execution_feedback_refresh_secs: 15,
             creator_gate_timeout_ms: 1_500,
             creator_gate_sniper_fast_timeout_ms: 400,
+            creator_gate_remote_concurrency: 16,
+            creator_gate_cache_miss_retry_ms: 30_000,
             creator_min_wallet_age_days: 1,
             creator_fresh_wallet_token_limit: 2,
             execution_enabled: false,

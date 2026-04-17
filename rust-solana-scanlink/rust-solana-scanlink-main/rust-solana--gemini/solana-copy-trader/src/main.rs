@@ -449,7 +449,7 @@ async fn main() -> Result<()> {
 
     info!("Execution plan: {}", execution_plan.summary());
     info!(
-        "Gate3 windows: fast={}ms soft={}ms hard={}ms | thresholds: buyers_fast={} buyers_soft={} sol_fast={:.2} sol_soft={:.2} max_share={:.2} self_buy_max_sol={:.2} self_buy_max_share={:.2} self_buy_hard_sol={:.2} self_buy_hard_share={:.2} self_buy_min_external_buyers={} self_buy_min_external_sol={:.2} | gate4 fast_min={} soft_min={} global_min={} | smart_money_disabled={} | helius={} | creator_gate_timeout_ms={} sniper_fast_timeout_ms={} | hotlists: wallets={} funders={} blocked={}",
+        "Gate3 windows: fast={}ms soft={}ms hard={}ms | thresholds: buyers_fast={} buyers_soft={} sol_fast={:.2} sol_soft={:.2} max_share={:.2} self_buy_max_sol={:.2} self_buy_max_share={:.2} self_buy_hard_sol={:.2} self_buy_hard_share={:.2} self_buy_min_external_buyers={} self_buy_min_external_sol={:.2} | gate4 fast_min={} soft_min={} global_min={} | smart_money_disabled={} | helius={} | creator_gate_timeout_ms={} sniper_fast_timeout_ms={} creator_gate_remote_concurrency={} creator_gate_cache_miss_retry_ms={} | hotlists: wallets={} funders={} blocked={}",
         config.smart_money_fast_window_ms,
         config.smart_money_soft_window_ms,
         config.gate3_hard_reject_ms,
@@ -471,6 +471,8 @@ async fn main() -> Result<()> {
         config.helius_api_key.is_some(),
         config.creator_gate_timeout_ms,
         config.creator_gate_sniper_fast_timeout_ms,
+        config.creator_gate_remote_concurrency,
+        config.creator_gate_cache_miss_retry_ms,
         config.smart_money_file,
         config.smart_money_funder_file,
         config.blocked_buyers_file,
