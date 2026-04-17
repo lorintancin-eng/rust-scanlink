@@ -156,8 +156,12 @@ struct NarrativeKeywordMatch {
 #[derive(Debug, Clone, Default)]
 struct CandidateTrace {
     gate1_at_ms: Option<u64>,
+    gate1_result_applied_at_ms: Option<u64>,
     gate2_at_ms: Option<u64>,
     gate2_task_spawned_at_ms: Option<u64>,
+    creator_gate_entered_at_ms: Option<u64>,
+    cache_lookup_done_at_ms: Option<u64>,
+    refresh_launch_returned_at_ms: Option<u64>,
     gate2_remote_started_at_ms: Option<u64>,
     gate2_result_ready_at_ms: Option<u64>,
     gate2_result_applied_at_ms: Option<u64>,
@@ -265,6 +269,9 @@ struct CreatorGateResult {
     penalty_score: u32,
     warning_tags: Vec<String>,
     task_spawned_at_ms: u64,
+    creator_gate_entered_at_ms: Option<u64>,
+    cache_lookup_done_at_ms: Option<u64>,
+    refresh_launch_returned_at_ms: Option<u64>,
     remote_started_at_ms: Option<u64>,
     result_ready_at_ms: u64,
 }
@@ -741,6 +748,7 @@ async fn handle_gate1_result(
     candidates: &mut HashMap<String, Candidate>,
     result: Gate1Result,
 ) -> Result<()> {
+    let gate1_result_applied_at_ms = now_ms();
     let Gate1Result {
         token,
         decision,
@@ -761,6 +769,7 @@ async fn handle_gate1_result(
     if !gate1_passed {
         let trace = CandidateTrace {
             gate1_at_ms: Some(gate1_at_ms),
+            gate1_result_applied_at_ms: Some(gate1_result_applied_at_ms),
             ..Default::default()
         };
         record_token_outcome(
@@ -806,6 +815,7 @@ async fn handle_gate1_result(
             pending_buyer_profiles: HashSet::new(),
             trace: CandidateTrace {
                 gate1_at_ms: Some(gate1_at_ms),
+                gate1_result_applied_at_ms: Some(gate1_result_applied_at_ms),
                 gate2_task_spawned_at_ms: Some(gate2_task_spawned_at_ms),
                 ..Default::default()
             },
@@ -825,6 +835,9 @@ async fn handle_gate1_result(
                 penalty_score: 0,
                 warning_tags: Vec::new(),
                 task_spawned_at_ms: gate2_task_spawned_at_ms,
+                creator_gate_entered_at_ms: None,
+                cache_lookup_done_at_ms: None,
+                refresh_launch_returned_at_ms: None,
                 remote_started_at_ms: None,
                 result_ready_at_ms: now_ms(),
             });
@@ -854,6 +867,9 @@ async fn handle_creator_gate_resolution(
 
     let gate2_applied_at_ms = now_ms();
     candidate.trace.gate2_task_spawned_at_ms = Some(result.task_spawned_at_ms);
+    candidate.trace.creator_gate_entered_at_ms = result.creator_gate_entered_at_ms;
+    candidate.trace.cache_lookup_done_at_ms = result.cache_lookup_done_at_ms;
+    candidate.trace.refresh_launch_returned_at_ms = result.refresh_launch_returned_at_ms;
     candidate.trace.gate2_remote_started_at_ms = result.remote_started_at_ms;
     candidate.trace.gate2_result_ready_at_ms = Some(result.result_ready_at_ms);
     candidate.trace.gate2_result_applied_at_ms = Some(gate2_applied_at_ms);
@@ -1505,6 +1521,7 @@ async fn creator_gate(
     token: &NewToken,
     task_spawned_at_ms: u64,
 ) -> Result<CreatorGateResult> {
+    let creator_gate_entered_at_ms = now_ms();
     if let Some(profile) =
         get_cached_creator_profile(shared, &token.creator, CREATOR_CACHE_TTL_MS).await
     {
@@ -1513,6 +1530,9 @@ async fn creator_gate(
             apply_creator_rules(shared.config.as_ref(), profile),
         )
         .await?;
+        result.creator_gate_entered_at_ms = Some(creator_gate_entered_at_ms);
+        result.cache_lookup_done_at_ms = Some(now_ms());
+        result.refresh_launch_returned_at_ms = None;
         result.task_spawned_at_ms = task_spawned_at_ms;
         result.remote_started_at_ms = None;
         result.result_ready_at_ms = now_ms();
@@ -1527,6 +1547,9 @@ async fn creator_gate(
             apply_creator_rules(shared.config.as_ref(), profile),
         )
         .await?;
+        result.creator_gate_entered_at_ms = Some(creator_gate_entered_at_ms);
+        result.cache_lookup_done_at_ms = Some(now_ms());
+        result.refresh_launch_returned_at_ms = None;
         result.task_spawned_at_ms = task_spawned_at_ms;
         result.remote_started_at_ms = None;
         result.result_ready_at_ms = now_ms();
@@ -1544,6 +1567,9 @@ async fn creator_gate(
                 penalty_score: 0,
                 warning_tags: Vec::new(),
                 task_spawned_at_ms,
+                creator_gate_entered_at_ms: Some(creator_gate_entered_at_ms),
+                cache_lookup_done_at_ms: Some(now_ms()),
+                refresh_launch_returned_at_ms: None,
                 remote_started_at_ms: None,
                 result_ready_at_ms: 0,
             },
@@ -1554,6 +1580,7 @@ async fn creator_gate(
     };
 
     if let Some(profile) = cached.clone() {
+        let cache_lookup_done_at_ms = now_ms();
         let age_ms = now_ms().saturating_sub(profile.fetched_at_ms);
         let mut result = apply_creator_entity_rules(
             shared,
@@ -1565,6 +1592,8 @@ async fn creator_gate(
             format!("stale_creator_profile_cache(age_ms={})", age_ms),
             GATE2_STALE_CACHE_PENALTY_SCORE,
         );
+        result.creator_gate_entered_at_ms = Some(creator_gate_entered_at_ms);
+        result.cache_lookup_done_at_ms = Some(cache_lookup_done_at_ms);
         result.task_spawned_at_ms = task_spawned_at_ms;
         result.remote_started_at_ms = None;
         result.result_ready_at_ms = now_ms();
@@ -1576,15 +1605,20 @@ async fn creator_gate(
             None,
         )
         .await;
+        result.refresh_launch_returned_at_ms = Some(now_ms());
         return Ok(finalize_creator_gate_result(result));
     }
 
+    let cache_lookup_done_at_ms = now_ms();
     let retry_after_ms = creator_profile_retry_remaining_ms(shared, &token.creator).await;
     if retry_after_ms > 0 {
         return Ok(creator_gate_provisional_pass(
             format!("cache_miss_retry_cooldown({}ms)", retry_after_ms),
             GATE2_CACHE_MISS_PENALTY_SCORE,
             task_spawned_at_ms,
+            Some(creator_gate_entered_at_ms),
+            Some(cache_lookup_done_at_ms),
+            None,
             None,
         ));
     }
@@ -1595,15 +1629,16 @@ async fn creator_gate(
         .creator_gate_sniper_fast_timeout_ms
         .max(1)
         .min(normal_timeout_ms);
-    let (remote_started_at_ms, response_rx) = match maybe_spawn_creator_profile_refresh(
+    let refresh_launch = maybe_spawn_creator_profile_refresh(
         shared,
         token.clone(),
         api_key.to_string(),
         None,
         Some(task_spawned_at_ms),
     )
-    .await?
-    {
+    .await?;
+    let refresh_launch_returned_at_ms = now_ms();
+    let (remote_started_at_ms, response_rx) = match refresh_launch {
         CreatorRefreshLaunch::Started {
             remote_started_at_ms,
             response_rx,
@@ -1613,6 +1648,9 @@ async fn creator_gate(
                 "creator_cache_refresh_inflight".to_string(),
                 GATE2_CACHE_MISS_PENALTY_SCORE,
                 task_spawned_at_ms,
+                Some(creator_gate_entered_at_ms),
+                Some(cache_lookup_done_at_ms),
+                Some(refresh_launch_returned_at_ms),
                 None,
             ));
         }
@@ -1621,6 +1659,9 @@ async fn creator_gate(
                 format!("cache_miss_retry_cooldown({}ms)", retry_after_ms),
                 GATE2_CACHE_MISS_PENALTY_SCORE,
                 task_spawned_at_ms,
+                Some(creator_gate_entered_at_ms),
+                Some(cache_lookup_done_at_ms),
+                Some(refresh_launch_returned_at_ms),
                 None,
             ));
         }
@@ -1638,13 +1679,21 @@ async fn creator_gate(
                 ),
                 GATE2_REMOTE_BUSY_PENALTY_SCORE,
                 task_spawned_at_ms,
+                Some(creator_gate_entered_at_ms),
+                Some(cache_lookup_done_at_ms),
+                Some(refresh_launch_returned_at_ms),
                 None,
             ));
         }
     };
 
     match tokio::time::timeout(Duration::from_millis(fast_timeout_ms), response_rx).await {
-        Ok(Ok(Ok(result))) => apply_creator_entity_rules(shared, result).await,
+        Ok(Ok(Ok(mut result))) => {
+            result.creator_gate_entered_at_ms = Some(creator_gate_entered_at_ms);
+            result.cache_lookup_done_at_ms = Some(cache_lookup_done_at_ms);
+            result.refresh_launch_returned_at_ms = Some(refresh_launch_returned_at_ms);
+            apply_creator_entity_rules(shared, result).await
+        }
         Ok(Ok(Err(err))) => {
             warn!(
                 "creator gate remote fast-path failed | creator={} | {}",
@@ -1654,6 +1703,9 @@ async fn creator_gate(
                 format!("creator_gate_remote_error({})", err),
                 GATE2_FAST_TIMEOUT_PENALTY_SCORE,
                 task_spawned_at_ms,
+                Some(creator_gate_entered_at_ms),
+                Some(cache_lookup_done_at_ms),
+                Some(refresh_launch_returned_at_ms),
                 Some(remote_started_at_ms),
             ))
         }
@@ -1661,6 +1713,9 @@ async fn creator_gate(
             "creator_gate_remote_cancelled".to_string(),
             GATE2_FAST_TIMEOUT_PENALTY_SCORE,
             task_spawned_at_ms,
+            Some(creator_gate_entered_at_ms),
+            Some(cache_lookup_done_at_ms),
+            Some(refresh_launch_returned_at_ms),
             Some(remote_started_at_ms),
         )),
         Err(_) => Ok(creator_gate_timeout_fallback(
@@ -1669,6 +1724,9 @@ async fn creator_gate(
             fast_timeout_ms,
             true,
             task_spawned_at_ms,
+            Some(creator_gate_entered_at_ms),
+            Some(cache_lookup_done_at_ms),
+            Some(refresh_launch_returned_at_ms),
             Some(remote_started_at_ms),
         )),
     }
@@ -1815,6 +1873,9 @@ fn creator_gate_timeout_fallback(
     timeout_ms: u64,
     sniper_fast_timeout: bool,
     task_spawned_at_ms: u64,
+    creator_gate_entered_at_ms: Option<u64>,
+    cache_lookup_done_at_ms: Option<u64>,
+    refresh_launch_returned_at_ms: Option<u64>,
     remote_started_at_ms: Option<u64>,
 ) -> CreatorGateResult {
     if let Some(profile) = cached {
@@ -1824,6 +1885,9 @@ fn creator_gate_timeout_fallback(
             result.reason, timeout_ms, sniper_fast_timeout
         );
         result.task_spawned_at_ms = task_spawned_at_ms;
+        result.creator_gate_entered_at_ms = creator_gate_entered_at_ms;
+        result.cache_lookup_done_at_ms = cache_lookup_done_at_ms;
+        result.refresh_launch_returned_at_ms = refresh_launch_returned_at_ms;
         result.remote_started_at_ms = remote_started_at_ms;
         result.result_ready_at_ms = now_ms();
         return result;
@@ -1853,6 +1917,9 @@ fn creator_gate_timeout_fallback(
             Vec::new()
         },
         task_spawned_at_ms,
+        creator_gate_entered_at_ms,
+        cache_lookup_done_at_ms,
+        refresh_launch_returned_at_ms,
         remote_started_at_ms,
         result_ready_at_ms: now_ms(),
     };
@@ -1866,6 +1933,9 @@ fn creator_gate_provisional_pass(
     warning: String,
     penalty_score: u32,
     task_spawned_at_ms: u64,
+    creator_gate_entered_at_ms: Option<u64>,
+    cache_lookup_done_at_ms: Option<u64>,
+    refresh_launch_returned_at_ms: Option<u64>,
     remote_started_at_ms: Option<u64>,
 ) -> CreatorGateResult {
     finalize_creator_gate_result(CreatorGateResult {
@@ -1875,6 +1945,9 @@ fn creator_gate_provisional_pass(
         penalty_score,
         warning_tags: vec![warning],
         task_spawned_at_ms,
+        creator_gate_entered_at_ms,
+        cache_lookup_done_at_ms,
+        refresh_launch_returned_at_ms,
         remote_started_at_ms,
         result_ready_at_ms: now_ms(),
     })
@@ -2091,6 +2164,9 @@ fn apply_creator_rules_without_graduated(
             penalty_score: 0,
             warning_tags: Vec::new(),
             task_spawned_at_ms: 0,
+            creator_gate_entered_at_ms: None,
+            cache_lookup_done_at_ms: None,
+            refresh_launch_returned_at_ms: None,
             remote_started_at_ms: None,
             result_ready_at_ms: 0,
         });
@@ -2103,6 +2179,9 @@ fn apply_creator_rules_without_graduated(
             penalty_score: 0,
             warning_tags: Vec::new(),
             task_spawned_at_ms: 0,
+            creator_gate_entered_at_ms: None,
+            cache_lookup_done_at_ms: None,
+            refresh_launch_returned_at_ms: None,
             remote_started_at_ms: None,
             result_ready_at_ms: 0,
         });
@@ -2126,6 +2205,9 @@ fn apply_creator_rules(config: &AppConfig, profile: CreatorProfile) -> CreatorGa
             penalty_score: 0,
             warning_tags: Vec::new(),
             task_spawned_at_ms: 0,
+            creator_gate_entered_at_ms: None,
+            cache_lookup_done_at_ms: None,
+            refresh_launch_returned_at_ms: None,
             remote_started_at_ms: None,
             result_ready_at_ms: 0,
         };
@@ -2138,6 +2220,9 @@ fn apply_creator_rules(config: &AppConfig, profile: CreatorProfile) -> CreatorGa
             penalty_score: 0,
             warning_tags: Vec::new(),
             task_spawned_at_ms: 0,
+            creator_gate_entered_at_ms: None,
+            cache_lookup_done_at_ms: None,
+            refresh_launch_returned_at_ms: None,
             remote_started_at_ms: None,
             result_ready_at_ms: 0,
         };
@@ -2162,6 +2247,9 @@ fn apply_creator_rules(config: &AppConfig, profile: CreatorProfile) -> CreatorGa
         penalty_score: 0,
         warning_tags: Vec::new(),
         task_spawned_at_ms: 0,
+        creator_gate_entered_at_ms: None,
+        cache_lookup_done_at_ms: None,
+        refresh_launch_returned_at_ms: None,
         remote_started_at_ms: None,
         result_ready_at_ms: 0,
     };
@@ -4296,8 +4384,12 @@ async fn record_token_outcome(
         path: path.clone(),
         detected_at_ms: token.detected_at_ms,
         gate1_at_ms: trace.gate1_at_ms,
+        gate1_result_applied_at_ms: trace.gate1_result_applied_at_ms,
         gate2_at_ms: trace.gate2_at_ms,
         gate2_task_spawned_at_ms: trace.gate2_task_spawned_at_ms,
+        creator_gate_entered_at_ms: trace.creator_gate_entered_at_ms,
+        cache_lookup_done_at_ms: trace.cache_lookup_done_at_ms,
+        refresh_launch_returned_at_ms: trace.refresh_launch_returned_at_ms,
         gate2_remote_started_at_ms: trace.gate2_remote_started_at_ms,
         gate2_result_ready_at_ms: trace.gate2_result_ready_at_ms,
         gate2_result_applied_at_ms: trace.gate2_result_applied_at_ms,
@@ -4322,8 +4414,12 @@ async fn record_token_outcome(
             "path": &timing.path,
             "detected_at_ms": timing.detected_at_ms,
             "gate1_at_ms": timing.gate1_at_ms,
+            "gate1_result_applied_at_ms": timing.gate1_result_applied_at_ms,
             "gate2_at_ms": timing.gate2_at_ms,
             "gate2_task_spawned_at_ms": timing.gate2_task_spawned_at_ms,
+            "creator_gate_entered_at_ms": timing.creator_gate_entered_at_ms,
+            "cache_lookup_done_at_ms": timing.cache_lookup_done_at_ms,
+            "refresh_launch_returned_at_ms": timing.refresh_launch_returned_at_ms,
             "gate2_remote_started_at_ms": timing.gate2_remote_started_at_ms,
             "gate2_result_ready_at_ms": timing.gate2_result_ready_at_ms,
             "gate2_result_applied_at_ms": timing.gate2_result_applied_at_ms,
