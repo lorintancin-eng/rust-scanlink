@@ -83,6 +83,7 @@ const SUSPICIOUS_FUNDER_CLUSTER_PENALTY_SCORE: u32 = 6;
 const GATE2_FRESH_WALLET_PENALTY_SCORE: u32 = 4;
 const GATE2_NO_GRADUATED_PENALTY_SCORE: u32 = 6;
 const GATE2_LARGE_FUNDER_CLUSTER_PENALTY_SCORE: u32 = 4;
+const GATE2_FAST_TIMEOUT_PENALTY_SCORE: u32 = 4;
 const SAME_FUNDER_CLUSTER_PENALTY_MIN_BUYS: usize = 3;
 const SAME_FUNDER_CLUSTER_PENALTY_SHARE: f64 = 0.66;
 const SAME_FUNDER_CLUSTER_PENALTY_SCORE: u32 = 8;
@@ -153,6 +154,10 @@ struct NarrativeKeywordMatch {
 struct CandidateTrace {
     gate1_at_ms: Option<u64>,
     gate2_at_ms: Option<u64>,
+    gate2_task_spawned_at_ms: Option<u64>,
+    gate2_remote_started_at_ms: Option<u64>,
+    gate2_result_ready_at_ms: Option<u64>,
+    gate2_result_applied_at_ms: Option<u64>,
     gate3_open_at_ms: Option<u64>,
     gate3_trigger_at_ms: Option<u64>,
     gate4_at_ms: Option<u64>,
@@ -191,11 +196,6 @@ struct HotLists {
 
 #[derive(Debug)]
 enum InternalMessage {
-    CreatorGateResolved {
-        mint: String,
-        token: NewToken,
-        result: CreatorGateResult,
-    },
     BuyerProfileResolved {
         mint: String,
         address: String,
@@ -206,6 +206,13 @@ enum InternalMessage {
         decision: ScoreDecision,
         gate4_at_ms: Option<u64>,
     },
+}
+
+#[derive(Debug)]
+struct CreatorGateResolved {
+    mint: String,
+    token: NewToken,
+    result: CreatorGateResult,
 }
 
 #[derive(Debug)]
@@ -254,6 +261,9 @@ struct CreatorGateResult {
     profile: Option<CreatorProfile>,
     penalty_score: u32,
     warning_tags: Vec<String>,
+    task_spawned_at_ms: u64,
+    remote_started_at_ms: Option<u64>,
+    result_ready_at_ms: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -465,17 +475,24 @@ pub async fn run(
         creator_template_counts,
     );
 
+    let (creator_gate_result_tx, mut creator_gate_result_rx) =
+        mpsc::channel::<CreatorGateResolved>(SCANNER_NEW_TOKEN_CHANNEL_CAPACITY);
     let (internal_tx, mut internal_rx) = mpsc::unbounded_channel::<InternalMessage>();
     let mut candidates: HashMap<String, Candidate> = HashMap::new();
 
     let mut tick = tokio::time::interval(Duration::from_millis(200));
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut gate1_stream_open = true;
+    let mut creator_gate_stream_open = true;
     let mut buy_stream_open = true;
     let mut internal_stream_open = true;
 
     loop {
-        if !gate1_stream_open && !buy_stream_open && !internal_stream_open {
+        if !gate1_stream_open
+            && !creator_gate_stream_open
+            && !buy_stream_open
+            && !internal_stream_open
+        {
             break;
         }
         tokio::select! {
@@ -485,7 +502,26 @@ pub async fn run(
                     gate1_stream_open = false;
                     continue;
                 };
-                handle_gate1_result(&shared, &internal_tx, &mut candidates, result).await?;
+                handle_gate1_result(
+                    &shared,
+                    &creator_gate_result_tx,
+                    &mut candidates,
+                    result,
+                ).await?;
+            }
+            maybe_creator_gate = creator_gate_result_rx.recv(), if creator_gate_stream_open => {
+                let Some(msg) = maybe_creator_gate else {
+                    creator_gate_stream_open = false;
+                    continue;
+                };
+                handle_creator_gate_resolution(
+                    &shared,
+                    &internal_tx,
+                    &mut candidates,
+                    msg.mint,
+                    msg.token,
+                    msg.result,
+                ).await;
             }
             maybe_msg = internal_rx.recv(), if internal_stream_open => {
                 let Some(msg) = maybe_msg else {
@@ -493,9 +529,6 @@ pub async fn run(
                     continue;
                 };
                 match msg {
-                    InternalMessage::CreatorGateResolved { mint, token, result } => {
-                        handle_creator_gate_resolution(&shared, &internal_tx, &mut candidates, mint, token, result).await;
-                    }
                     InternalMessage::BuyerProfileResolved { mint, address, profile } => {
                         handle_buyer_profile_resolution(&shared, &internal_tx, &mut candidates, mint, address, profile).await;
                     }
@@ -685,7 +718,7 @@ struct Gate1Decision {
 
 async fn handle_gate1_result(
     shared: &SharedState,
-    internal_tx: &mpsc::UnboundedSender<InternalMessage>,
+    creator_gate_result_tx: &mpsc::Sender<CreatorGateResolved>,
     candidates: &mut HashMap<String, Candidate>,
     result: Gate1Result,
 ) -> Result<()> {
@@ -733,6 +766,7 @@ async fn handle_gate1_result(
         return Ok(());
     }
 
+    let gate2_task_spawned_at_ms = now_ms();
     candidates.insert(
         token.mint.clone(),
         Candidate {
@@ -753,15 +787,17 @@ async fn handle_gate1_result(
             pending_buyer_profiles: HashSet::new(),
             trace: CandidateTrace {
                 gate1_at_ms: Some(gate1_at_ms),
+                gate2_task_spawned_at_ms: Some(gate2_task_spawned_at_ms),
                 ..Default::default()
             },
         },
     );
 
+    let creator_gate_result_tx = creator_gate_result_tx.clone();
     let shared_clone = shared.clone();
-    let tx_clone = internal_tx.clone();
+    let token_clone = token.clone();
     tokio::spawn(async move {
-        let result = creator_gate(&shared_clone, &token)
+        let result = creator_gate(&shared_clone, &token_clone, gate2_task_spawned_at_ms)
             .await
             .unwrap_or_else(|err| CreatorGateResult {
                 passed: true,
@@ -769,12 +805,17 @@ async fn handle_gate1_result(
                 profile: None,
                 penalty_score: 0,
                 warning_tags: Vec::new(),
+                task_spawned_at_ms: gate2_task_spawned_at_ms,
+                remote_started_at_ms: None,
+                result_ready_at_ms: now_ms(),
             });
-        let _ = tx_clone.send(InternalMessage::CreatorGateResolved {
-            mint: token.mint.clone(),
-            token,
-            result,
-        });
+        let _ = creator_gate_result_tx
+            .send(CreatorGateResolved {
+                mint: token_clone.mint.clone(),
+                token: token_clone,
+                result,
+            })
+            .await;
     });
 
     Ok(())
@@ -792,7 +833,12 @@ async fn handle_creator_gate_resolution(
         return;
     };
 
-    candidate.trace.gate2_at_ms = Some(now_ms());
+    let gate2_applied_at_ms = now_ms();
+    candidate.trace.gate2_task_spawned_at_ms = Some(result.task_spawned_at_ms);
+    candidate.trace.gate2_remote_started_at_ms = result.remote_started_at_ms;
+    candidate.trace.gate2_result_ready_at_ms = Some(result.result_ready_at_ms);
+    candidate.trace.gate2_result_applied_at_ms = Some(gate2_applied_at_ms);
+    candidate.trace.gate2_at_ms = Some(gate2_applied_at_ms);
     if !result.passed {
         let candidate = candidates.remove(&mint).unwrap_or_else(|| unreachable!());
         record_candidate_outcome(
@@ -1435,20 +1481,28 @@ async fn gate1_check(
     )
 }
 
-async fn creator_gate(shared: &SharedState, token: &NewToken) -> Result<CreatorGateResult> {
+async fn creator_gate(
+    shared: &SharedState,
+    token: &NewToken,
+    task_spawned_at_ms: u64,
+) -> Result<CreatorGateResult> {
     let cached = shared.db.get_creator_profile(&token.creator).await?;
     if let Some(profile) = cached.as_ref() {
         if now_ms().saturating_sub(profile.fetched_at_ms) <= CREATOR_CACHE_TTL_MS {
-            return apply_creator_entity_rules(
+            let mut result = apply_creator_entity_rules(
                 shared,
                 apply_creator_rules(shared.config.as_ref(), profile.clone()),
             )
-            .await;
+            .await?;
+            result.task_spawned_at_ms = task_spawned_at_ms;
+            result.remote_started_at_ms = None;
+            result.result_ready_at_ms = now_ms();
+            return Ok(result);
         }
     }
 
     let Some(api_key) = shared.config.helius_api_key.as_deref() else {
-        return apply_creator_entity_rules(
+        let mut result = apply_creator_entity_rules(
             shared,
             CreatorGateResult {
                 passed: true,
@@ -1456,22 +1510,40 @@ async fn creator_gate(shared: &SharedState, token: &NewToken) -> Result<CreatorG
                 profile: cached,
                 penalty_score: 0,
                 warning_tags: Vec::new(),
+                task_spawned_at_ms,
+                remote_started_at_ms: None,
+                result_ready_at_ms: 0,
             },
         )
-        .await;
+        .await?;
+        result.result_ready_at_ms = now_ms();
+        return Ok(result);
     };
 
-    let timeout_ms = shared.config.creator_gate_timeout_ms.max(1);
-    let result = match tokio::time::timeout(
-        Duration::from_millis(timeout_ms),
-        creator_gate_remote(shared, token, api_key, cached.clone()),
-    )
-    .await
-    {
-        Ok(result) => result?,
-        Err(_) => creator_gate_timeout_fallback(shared.config.as_ref(), cached, timeout_ms),
-    };
+    let normal_timeout_ms = shared.config.creator_gate_timeout_ms.max(1);
+    let fast_timeout_ms = shared
+        .config
+        .creator_gate_sniper_fast_timeout_ms
+        .max(1)
+        .min(normal_timeout_ms);
+    let remote_started_at_ms = now_ms();
+    let remote_future = creator_gate_remote(shared, token, api_key, cached.clone());
+    let mut result =
+        match tokio::time::timeout(Duration::from_millis(fast_timeout_ms), remote_future).await {
+            Ok(result) => result?,
+            Err(_) => creator_gate_timeout_fallback(
+                shared.config.as_ref(),
+                cached,
+                fast_timeout_ms,
+                true,
+                task_spawned_at_ms,
+                Some(remote_started_at_ms),
+            ),
+        };
 
+    result.task_spawned_at_ms = task_spawned_at_ms;
+    result.remote_started_at_ms = Some(remote_started_at_ms);
+    result.result_ready_at_ms = now_ms();
     apply_creator_entity_rules(shared, result).await
 }
 
@@ -1594,23 +1666,53 @@ fn creator_gate_timeout_fallback(
     config: &AppConfig,
     cached: Option<CreatorProfile>,
     timeout_ms: u64,
+    sniper_fast_timeout: bool,
+    task_spawned_at_ms: u64,
+    remote_started_at_ms: Option<u64>,
 ) -> CreatorGateResult {
     if let Some(profile) = cached {
         let mut result = apply_creator_rules(config, profile);
         result.reason = format!(
-            "{} | gate2 cache fallback timeout={}ms",
-            result.reason, timeout_ms
+            "{} | gate2 cache fallback timeout={}ms sniper_fast_timeout={}",
+            result.reason, timeout_ms, sniper_fast_timeout
         );
+        result.task_spawned_at_ms = task_spawned_at_ms;
+        result.remote_started_at_ms = remote_started_at_ms;
+        result.result_ready_at_ms = now_ms();
         return result;
     }
 
-    CreatorGateResult {
+    let mut result = CreatorGateResult {
         passed: true,
-        reason: format!("gate2 soft-pass: timeout {}ms", timeout_ms),
+        reason: if sniper_fast_timeout {
+            format!(
+                "gate2 provisional pass: sniper timeout {}ms | gate2_penalty={} | gate2_warnings={}",
+                timeout_ms,
+                GATE2_FAST_TIMEOUT_PENALTY_SCORE,
+                "timeout_provisional_pass"
+            )
+        } else {
+            format!("gate2 soft-pass: timeout {}ms", timeout_ms)
+        },
         profile: None,
-        penalty_score: 0,
-        warning_tags: Vec::new(),
+        penalty_score: if sniper_fast_timeout {
+            GATE2_FAST_TIMEOUT_PENALTY_SCORE
+        } else {
+            0
+        },
+        warning_tags: if sniper_fast_timeout {
+            vec!["timeout_provisional_pass".to_string()]
+        } else {
+            Vec::new()
+        },
+        task_spawned_at_ms,
+        remote_started_at_ms,
+        result_ready_at_ms: now_ms(),
+    };
+    if !sniper_fast_timeout {
+        result = finalize_creator_gate_result(result);
     }
+    result
 }
 
 fn apply_creator_rules_without_graduated(
@@ -1627,6 +1729,9 @@ fn apply_creator_rules_without_graduated(
             profile: Some(profile.clone()),
             penalty_score: 0,
             warning_tags: Vec::new(),
+            task_spawned_at_ms: 0,
+            remote_started_at_ms: None,
+            result_ready_at_ms: 0,
         });
     }
     if profile.rug_count >= CREATOR_RUG_LIMIT {
@@ -1636,6 +1741,9 @@ fn apply_creator_rules_without_graduated(
             profile: Some(profile.clone()),
             penalty_score: 0,
             warning_tags: Vec::new(),
+            task_spawned_at_ms: 0,
+            remote_started_at_ms: None,
+            result_ready_at_ms: 0,
         });
     }
     None
@@ -1656,6 +1764,9 @@ fn apply_creator_rules(config: &AppConfig, profile: CreatorProfile) -> CreatorGa
             profile: Some(profile),
             penalty_score: 0,
             warning_tags: Vec::new(),
+            task_spawned_at_ms: 0,
+            remote_started_at_ms: None,
+            result_ready_at_ms: 0,
         };
     }
     if profile.rug_count >= CREATOR_RUG_LIMIT {
@@ -1665,6 +1776,9 @@ fn apply_creator_rules(config: &AppConfig, profile: CreatorProfile) -> CreatorGa
             profile: Some(profile),
             penalty_score: 0,
             warning_tags: Vec::new(),
+            task_spawned_at_ms: 0,
+            remote_started_at_ms: None,
+            result_ready_at_ms: 0,
         };
     }
 
@@ -1686,6 +1800,9 @@ fn apply_creator_rules(config: &AppConfig, profile: CreatorProfile) -> CreatorGa
         profile: Some(profile),
         penalty_score: 0,
         warning_tags: Vec::new(),
+        task_spawned_at_ms: 0,
+        remote_started_at_ms: None,
+        result_ready_at_ms: 0,
     };
 
     if wallet_age_days < config.creator_min_wallet_age_days as u32
@@ -3819,6 +3936,10 @@ async fn record_token_outcome(
         detected_at_ms: token.detected_at_ms,
         gate1_at_ms: trace.gate1_at_ms,
         gate2_at_ms: trace.gate2_at_ms,
+        gate2_task_spawned_at_ms: trace.gate2_task_spawned_at_ms,
+        gate2_remote_started_at_ms: trace.gate2_remote_started_at_ms,
+        gate2_result_ready_at_ms: trace.gate2_result_ready_at_ms,
+        gate2_result_applied_at_ms: trace.gate2_result_applied_at_ms,
         gate3_open_at_ms: trace.gate3_open_at_ms,
         gate3_trigger_at_ms: trace.gate3_trigger_at_ms,
         gate4_at_ms: trace.gate4_at_ms,
@@ -3841,6 +3962,10 @@ async fn record_token_outcome(
             "detected_at_ms": timing.detected_at_ms,
             "gate1_at_ms": timing.gate1_at_ms,
             "gate2_at_ms": timing.gate2_at_ms,
+            "gate2_task_spawned_at_ms": timing.gate2_task_spawned_at_ms,
+            "gate2_remote_started_at_ms": timing.gate2_remote_started_at_ms,
+            "gate2_result_ready_at_ms": timing.gate2_result_ready_at_ms,
+            "gate2_result_applied_at_ms": timing.gate2_result_applied_at_ms,
             "gate3_open_at_ms": timing.gate3_open_at_ms,
             "gate3_trigger_at_ms": timing.gate3_trigger_at_ms,
             "gate4_at_ms": timing.gate4_at_ms,
@@ -4802,6 +4927,7 @@ mod tests {
             execution_feedback_window_secs: 300,
             execution_feedback_refresh_secs: 15,
             creator_gate_timeout_ms: 1_500,
+            creator_gate_sniper_fast_timeout_ms: 400,
             creator_min_wallet_age_days: 1,
             creator_fresh_wallet_token_limit: 2,
             execution_enabled: false,

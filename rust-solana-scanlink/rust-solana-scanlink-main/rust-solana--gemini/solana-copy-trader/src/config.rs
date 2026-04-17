@@ -123,6 +123,7 @@ pub struct AppConfig {
     pub address_snapshot_helius_retry_limit: u32,
     pub address_snapshot_helius_retry_delay_ms: u64,
     pub creator_gate_timeout_ms: u64,
+    pub creator_gate_sniper_fast_timeout_ms: u64,
     pub creator_min_wallet_age_days: u64,
     pub creator_fresh_wallet_token_limit: u32,
     /// 临时停用买入/卖出，只保留扫描和过滤
@@ -433,6 +434,10 @@ impl AppConfig {
                 250,
             ),
             creator_gate_timeout_ms: env_parse("CREATOR_GATE_TIMEOUT_MS", 1_500),
+            creator_gate_sniper_fast_timeout_ms: env_parse(
+                "CREATOR_GATE_SNIPER_FAST_TIMEOUT_MS",
+                400,
+            ),
             creator_min_wallet_age_days: env_parse("CREATOR_MIN_WALLET_AGE_DAYS", 1),
             creator_fresh_wallet_token_limit: env_parse("CREATOR_FRESH_WALLET_TOKEN_LIMIT", 2),
             execution_enabled: env_parse("EXECUTION_ENABLED", false),
