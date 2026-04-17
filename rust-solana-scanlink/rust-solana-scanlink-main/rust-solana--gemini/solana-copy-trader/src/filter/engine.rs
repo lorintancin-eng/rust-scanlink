@@ -80,6 +80,9 @@ const CREATOR_FUNDER_CLUSTER_MAX_SHARE: f64 = 0.85;
 const SUSPICIOUS_FUNDER_CLUSTER_WARNING_WALLETS: u32 = 10;
 const SUSPICIOUS_FUNDER_CLUSTER_WARNING_RUG_EXPOSURE: u32 = 1;
 const SUSPICIOUS_FUNDER_CLUSTER_PENALTY_SCORE: u32 = 6;
+const GATE2_FRESH_WALLET_PENALTY_SCORE: u32 = 4;
+const GATE2_NO_GRADUATED_PENALTY_SCORE: u32 = 6;
+const GATE2_LARGE_FUNDER_CLUSTER_PENALTY_SCORE: u32 = 4;
 const SAME_FUNDER_CLUSTER_PENALTY_MIN_BUYS: usize = 3;
 const SAME_FUNDER_CLUSTER_PENALTY_SHARE: f64 = 0.66;
 const SAME_FUNDER_CLUSTER_PENALTY_SCORE: u32 = 8;
@@ -166,6 +169,8 @@ struct Candidate {
     narrative_keywords: Vec<String>,
     dynamic_narrative_keywords: Vec<String>,
     narrative_keyword_matches: Vec<NarrativeKeywordMatch>,
+    gate2_penalty_score: u32,
+    gate2_warning_tags: Vec<String>,
     early_buys: Vec<PumpBuyEvent>,
     buy_signatures: HashSet<String>,
     creator_profile: Option<CreatorProfile>,
@@ -247,6 +252,8 @@ struct CreatorGateResult {
     passed: bool,
     reason: String,
     profile: Option<CreatorProfile>,
+    penalty_score: u32,
+    warning_tags: Vec<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -368,6 +375,8 @@ struct ScoringContext {
     buyer_quality_score: u32,
     dynamic_narrative_bonus: u32,
     narrative: NarrativeAdjustment,
+    gate2_penalty_score: u32,
+    gate2_warning_tags: Vec<String>,
     funder_diversity_penalty: u32,
     runtime_risk: RuntimeRiskProfile,
     cluster: ClusterAdjustment,
@@ -735,6 +744,8 @@ async fn handle_gate1_result(
             narrative_keywords: gate1_narrative_keywords,
             dynamic_narrative_keywords: gate1_dynamic_keywords,
             narrative_keyword_matches,
+            gate2_penalty_score: 0,
+            gate2_warning_tags: Vec::new(),
             early_buys: Vec::new(),
             buy_signatures: HashSet::new(),
             creator_profile: None,
@@ -756,6 +767,8 @@ async fn handle_gate1_result(
                 passed: true,
                 reason: format!("gate2 fallback pass: {}", err),
                 profile: None,
+                penalty_score: 0,
+                warning_tags: Vec::new(),
             });
         let _ = tx_clone.send(InternalMessage::CreatorGateResolved {
             mint: token.mint.clone(),
@@ -808,6 +821,8 @@ async fn handle_creator_gate_resolution(
 
     candidate.status = CandidateStatus::Active;
     candidate.creator_profile = result.profile;
+    candidate.gate2_penalty_score = result.penalty_score;
+    candidate.gate2_warning_tags = result.warning_tags;
     if let Some(profile) = candidate.creator_profile.as_ref() {
         enqueue_persist_task(
             shared,
@@ -1439,6 +1454,8 @@ async fn creator_gate(shared: &SharedState, token: &NewToken) -> Result<CreatorG
                 passed: true,
                 reason: "gate2 pass: HELIUS_API_KEY not configured".to_string(),
                 profile: cached,
+                penalty_score: 0,
+                warning_tags: Vec::new(),
             },
         )
         .await;
@@ -1467,10 +1484,10 @@ async fn apply_creator_entity_rules(
     }
 
     let Some(profile) = result.profile.clone() else {
-        return Ok(result);
+        return Ok(finalize_creator_gate_result(result));
     };
     let Some(funder) = profile.first_funder.as_deref() else {
-        return Ok(result);
+        return Ok(finalize_creator_gate_result(result));
     };
 
     if let Some(reason) = shared.db.get_funder_blacklist_reason(funder).await? {
@@ -1495,12 +1512,14 @@ async fn apply_creator_entity_rules(
     if funder_profile.wallet_count >= FUNDER_WALLET_CLUSTER_LIMIT
         && profile.total_tokens >= shared.config.creator_fresh_wallet_token_limit
     {
-        result.passed = false;
-        result.reason = format!(
-            "gate2 reject: funder {} funded {} wallets",
-            funder, funder_profile.wallet_count
+        push_creator_gate_warning(
+            &mut result,
+            format!(
+                "large_funder_cluster(funder={},wallets={})",
+                funder, funder_profile.wallet_count
+            ),
+            GATE2_LARGE_FUNDER_CLUSTER_PENALTY_SCORE,
         );
-        return Ok(result);
     }
 
     result.reason = format!(
@@ -1511,7 +1530,26 @@ async fn apply_creator_entity_rules(
         funder_profile.wallet_count >= SUSPICIOUS_FUNDER_CLUSTER_WARNING_WALLETS
             || funder_profile.rug_exposure >= SUSPICIOUS_FUNDER_CLUSTER_WARNING_RUG_EXPOSURE
     );
-    Ok(result)
+    Ok(finalize_creator_gate_result(result))
+}
+
+fn push_creator_gate_warning(result: &mut CreatorGateResult, warning: String, penalty_score: u32) {
+    if !result.warning_tags.iter().any(|item| item == &warning) {
+        result.warning_tags.push(warning);
+    }
+    result.penalty_score = result.penalty_score.saturating_add(penalty_score);
+}
+
+fn finalize_creator_gate_result(mut result: CreatorGateResult) -> CreatorGateResult {
+    if result.passed && (!result.warning_tags.is_empty() || result.penalty_score > 0) {
+        result.reason = format!(
+            "{} | gate2_penalty={} | gate2_warnings={}",
+            result.reason,
+            result.penalty_score,
+            result.warning_tags.join(",")
+        );
+    }
+    result
 }
 
 async fn creator_gate_remote(
@@ -1570,11 +1608,13 @@ fn creator_gate_timeout_fallback(
         passed: true,
         reason: format!("gate2 soft-pass: timeout {}ms", timeout_ms),
         profile: None,
+        penalty_score: 0,
+        warning_tags: Vec::new(),
     }
 }
 
 fn apply_creator_rules_without_graduated(
-    config: &AppConfig,
+    _config: &AppConfig,
     profile: &CreatorProfile,
 ) -> Option<CreatorGateResult> {
     if profile.total_tokens > CREATOR_TOTAL_TOKEN_LIMIT {
@@ -1585,6 +1625,8 @@ fn apply_creator_rules_without_graduated(
                 profile.total_tokens
             ),
             profile: Some(profile.clone()),
+            penalty_score: 0,
+            warning_tags: Vec::new(),
         });
     }
     if profile.rug_count >= CREATOR_RUG_LIMIT {
@@ -1592,18 +1634,8 @@ fn apply_creator_rules_without_graduated(
             passed: false,
             reason: format!("gate2 reject: creator rug count {}", profile.rug_count),
             profile: Some(profile.clone()),
-        });
-    }
-    if profile.wallet_age_days < config.creator_min_wallet_age_days as u32
-        && profile.total_tokens >= config.creator_fresh_wallet_token_limit
-    {
-        return Some(CreatorGateResult {
-            passed: false,
-            reason: format!(
-                "gate2 reject: fresh wallet age={}d launches={}",
-                profile.wallet_age_days, profile.total_tokens
-            ),
-            profile: Some(profile.clone()),
+            penalty_score: 0,
+            warning_tags: Vec::new(),
         });
     }
     None
@@ -1622,6 +1654,8 @@ fn apply_creator_rules(config: &AppConfig, profile: CreatorProfile) -> CreatorGa
                 profile.total_tokens
             ),
             profile: Some(profile),
+            penalty_score: 0,
+            warning_tags: Vec::new(),
         };
     }
     if profile.rug_count >= CREATOR_RUG_LIMIT {
@@ -1629,43 +1663,52 @@ fn apply_creator_rules(config: &AppConfig, profile: CreatorProfile) -> CreatorGa
             passed: false,
             reason: format!("gate2 reject: creator rug count {}", profile.rug_count),
             profile: Some(profile),
-        };
-    }
-    if profile.wallet_age_days < config.creator_min_wallet_age_days as u32
-        && profile.total_tokens >= config.creator_fresh_wallet_token_limit
-    {
-        return CreatorGateResult {
-            passed: false,
-            reason: format!(
-                "gate2 reject: fresh wallet age={}d launches={}",
-                profile.wallet_age_days, profile.total_tokens
-            ),
-            profile: Some(profile),
-        };
-    }
-    if profile.total_tokens >= config.creator_fresh_wallet_token_limit && profile.graduated == 0 {
-        return CreatorGateResult {
-            passed: false,
-            reason: format!(
-                "gate2 reject: launches={} but graduated=0",
-                profile.total_tokens
-            ),
-            profile: Some(profile),
+            penalty_score: 0,
+            warning_tags: Vec::new(),
         };
     }
 
-    CreatorGateResult {
+    let wallet_age_days = profile.wallet_age_days;
+    let total_tokens = profile.total_tokens;
+    let graduated = profile.graduated;
+    let address = profile.address.clone();
+    let first_funder = profile.first_funder.clone();
+    let mut result = CreatorGateResult {
         passed: true,
         reason: format!(
             "gate2 pass: creator={} launches={} graduated={} age_days={} first_funder={}",
-            profile.address,
-            profile.total_tokens,
-            profile.graduated,
-            profile.wallet_age_days,
-            profile.first_funder.as_deref().unwrap_or("-"),
+            address,
+            total_tokens,
+            graduated,
+            wallet_age_days,
+            first_funder.as_deref().unwrap_or("-"),
         ),
         profile: Some(profile),
+        penalty_score: 0,
+        warning_tags: Vec::new(),
+    };
+
+    if wallet_age_days < config.creator_min_wallet_age_days as u32
+        && total_tokens >= config.creator_fresh_wallet_token_limit
+    {
+        push_creator_gate_warning(
+            &mut result,
+            format!(
+                "fresh_wallet(age_days={},launches={})",
+                wallet_age_days, total_tokens
+            ),
+            GATE2_FRESH_WALLET_PENALTY_SCORE,
+        );
     }
+    if total_tokens >= config.creator_fresh_wallet_token_limit && graduated == 0 {
+        push_creator_gate_warning(
+            &mut result,
+            format!("unproven_creator(launches={},graduated=0)", total_tokens),
+            GATE2_NO_GRADUATED_PENALTY_SCORE,
+        );
+    }
+
+    result
 }
 
 fn effective_soft_threshold(config: &AppConfig, mode: SmartMoneyMode) -> usize {
@@ -2300,6 +2343,8 @@ async fn build_scoring_context(
         .saturating_add(narrative.base_bonus)
         .saturating_add(narrative.confirmed_bonus)
         .min(shared.config.dynamic_narrative_bonus_cap);
+    let gate2_penalty_score = candidate.gate2_penalty_score;
+    let gate2_warning_tags = candidate.gate2_warning_tags.clone();
     let funder_diversity_penalty = if stats.eligible_buyers >= GATE3_MIN_UNIQUE_FUNDERS
         && stats.unique_funders < GATE3_MIN_UNIQUE_FUNDERS
     {
@@ -2326,7 +2371,8 @@ async fn build_scoring_context(
         + curve_score
         + buyer_quality_score
         + cluster.quality_cluster_bonus;
-    let total_quality_penalty = funder_diversity_penalty
+    let total_quality_penalty = gate2_penalty_score
+        .saturating_add(funder_diversity_penalty)
         .saturating_add(runtime_risk.penalty_score)
         .saturating_add(cluster.suspicious_funder_penalty)
         .saturating_add(cluster.same_cluster_first_buy_penalty)
@@ -2356,6 +2402,8 @@ async fn build_scoring_context(
         buyer_quality_score,
         dynamic_narrative_bonus,
         narrative,
+        gate2_penalty_score,
+        gate2_warning_tags,
         funder_diversity_penalty,
         runtime_risk,
         cluster,
@@ -2406,8 +2454,13 @@ async fn score_candidate(shared: &SharedState, mut candidate: Candidate) -> Scor
     candidate.trace.path = Some(gate3_path_label(trigger.path).to_string());
 
     let scoring = build_scoring_context(shared, &candidate, &stats, trigger.path).await;
+    let gate2_warnings = if scoring.gate2_warning_tags.is_empty() {
+        "-".to_string()
+    } else {
+        scoring.gate2_warning_tags.join("|")
+    };
     let reason = format!(
-        "mode={} path={} participants={} capital={} momentum={} curve={} buyer_quality={} narrative_bonus={} preheat_hits={} base_hits={} confirmed_hits={} risk_penalty={} suspicious_cluster_penalty={} same_cluster_penalty={} cluster_bonus={} fast_relief={} narrative_fast_relief={} total={} required={} | matched={} eligible={} unique_funders={} sol={:.2} fastest={}ms largest_cluster={}/{}({:.2}) hot_funders={} narrative={}",
+        "mode={} path={} participants={} capital={} momentum={} curve={} buyer_quality={} narrative_bonus={} preheat_hits={} base_hits={} confirmed_hits={} gate2_penalty={} risk_penalty={} suspicious_cluster_penalty={} same_cluster_penalty={} cluster_bonus={} fast_relief={} narrative_fast_relief={} total={} required={} | matched={} eligible={} unique_funders={} sol={:.2} fastest={}ms largest_cluster={}/{}({:.2}) hot_funders={} gate2_warnings={} narrative={}",
         smart_money_mode_label(stats.mode),
         gate3_path_label(trigger.path),
         scoring.participants_score,
@@ -2419,6 +2472,7 @@ async fn score_candidate(shared: &SharedState, mut candidate: Candidate) -> Scor
         scoring.narrative.preheat_hits,
         scoring.narrative.base_hits,
         scoring.narrative.confirmed_hits,
+        scoring.gate2_penalty_score,
         scoring.runtime_risk.penalty_score,
         scoring.cluster.suspicious_funder_penalty,
         scoring.cluster.same_cluster_first_buy_penalty,
@@ -2436,6 +2490,7 @@ async fn score_candidate(shared: &SharedState, mut candidate: Candidate) -> Scor
         stats.eligible_buyers.max(1),
         scoring.cluster.largest_funder_cluster_share,
         scoring.cluster.hotlist_funder_diversity,
+        gate2_warnings,
         if candidate.narrative_keywords.is_empty() {
             "-".to_string()
         } else {
@@ -4368,6 +4423,8 @@ async fn persist_candidate_analytics(
             "momentum_score": scoring.momentum_score,
             "curve_score": scoring.curve_score,
             "buyer_quality_score": scoring.buyer_quality_score,
+            "gate2_penalty_score": scoring.gate2_penalty_score,
+            "gate2_warning_tags": scoring.gate2_warning_tags,
             "funder_diversity_penalty": scoring.funder_diversity_penalty,
             "risk_penalty": scoring.runtime_risk.penalty_score,
             "risk_signals": scoring.runtime_risk
@@ -4981,6 +5038,8 @@ mod tests {
             narrative_keywords: Vec::new(),
             dynamic_narrative_keywords: Vec::new(),
             narrative_keyword_matches: Vec::new(),
+            gate2_penalty_score: 0,
+            gate2_warning_tags: Vec::new(),
             early_buys: Vec::new(),
             buy_signatures: HashSet::new(),
             creator_profile: None,
@@ -5044,6 +5103,8 @@ mod tests {
             narrative_keywords: Vec::new(),
             dynamic_narrative_keywords: Vec::new(),
             narrative_keyword_matches: Vec::new(),
+            gate2_penalty_score: 0,
+            gate2_warning_tags: Vec::new(),
             early_buys: Vec::new(),
             buy_signatures: HashSet::new(),
             creator_profile: None,
@@ -5107,6 +5168,8 @@ mod tests {
             narrative_keywords: Vec::new(),
             dynamic_narrative_keywords: Vec::new(),
             narrative_keyword_matches: Vec::new(),
+            gate2_penalty_score: 0,
+            gate2_warning_tags: Vec::new(),
             early_buys: Vec::new(),
             buy_signatures: HashSet::new(),
             creator_profile: None,
@@ -5183,6 +5246,8 @@ mod tests {
             narrative_keywords: Vec::new(),
             dynamic_narrative_keywords: Vec::new(),
             narrative_keyword_matches: Vec::new(),
+            gate2_penalty_score: 0,
+            gate2_warning_tags: Vec::new(),
             early_buys: Vec::new(),
             buy_signatures: HashSet::new(),
             creator_profile: Some(CreatorProfile {
@@ -5264,6 +5329,75 @@ mod tests {
         assert!(matches
             .iter()
             .any(|item| item.keyword == "full" && item.tier == NarrativeTier::Confirmed));
+    }
+
+    #[test]
+    fn creator_rules_downgrade_fresh_wallet_to_penalty() {
+        let cfg = base_config();
+        let result = apply_creator_rules(
+            &cfg,
+            CreatorProfile {
+                address: "creator".to_string(),
+                total_tokens: cfg.creator_fresh_wallet_token_limit,
+                graduated: 1,
+                rug_count: 0,
+                oldest_tx_ms: 0,
+                wallet_age_days: 0,
+                first_funder: Some("funder".to_string()),
+                fetched_at_ms: 0,
+            },
+        );
+        assert!(result.passed);
+        assert_eq!(result.penalty_score, GATE2_FRESH_WALLET_PENALTY_SCORE);
+        assert!(result
+            .warning_tags
+            .iter()
+            .any(|item| item.contains("fresh_wallet")));
+    }
+
+    #[test]
+    fn creator_rules_downgrade_unproven_history_to_penalty() {
+        let cfg = base_config();
+        let result = apply_creator_rules(
+            &cfg,
+            CreatorProfile {
+                address: "creator".to_string(),
+                total_tokens: cfg.creator_fresh_wallet_token_limit + 1,
+                graduated: 0,
+                rug_count: 0,
+                oldest_tx_ms: 0,
+                wallet_age_days: cfg.creator_min_wallet_age_days as u32,
+                first_funder: Some("funder".to_string()),
+                fetched_at_ms: 0,
+            },
+        );
+        assert!(result.passed);
+        assert_eq!(result.penalty_score, GATE2_NO_GRADUATED_PENALTY_SCORE);
+        assert!(result
+            .warning_tags
+            .iter()
+            .any(|item| item.contains("unproven_creator")));
+    }
+
+    #[test]
+    fn creator_rules_keep_rug_history_as_hard_reject() {
+        let cfg = base_config();
+        let result = apply_creator_rules(
+            &cfg,
+            CreatorProfile {
+                address: "creator".to_string(),
+                total_tokens: 4,
+                graduated: 0,
+                rug_count: CREATOR_RUG_LIMIT,
+                oldest_tx_ms: 0,
+                wallet_age_days: 30,
+                first_funder: Some("funder".to_string()),
+                fetched_at_ms: 0,
+            },
+        );
+        assert!(!result.passed);
+        assert!(result.reason.contains("creator rug count"));
+        assert_eq!(result.penalty_score, 0);
     }
 
     #[test]
