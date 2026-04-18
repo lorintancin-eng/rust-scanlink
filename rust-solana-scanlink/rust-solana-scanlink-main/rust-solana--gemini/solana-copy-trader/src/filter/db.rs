@@ -522,9 +522,251 @@ impl FilterDb {
         let record = record.clone();
         self.with_conn(move |conn| {
             conn.execute(
-                "INSERT OR REPLACE INTO filter_results(
+                "INSERT INTO filter_results(
                     mint, creator, symbol, passed, reject_gate, score, reason, ts
-                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+                 ON CONFLICT(mint) DO UPDATE SET
+                    creator = CASE
+                        WHEN
+                            (CASE
+                                WHEN excluded.passed = 1 THEN 5
+                                WHEN excluded.reject_gate = 'gate4' THEN 4
+                                WHEN excluded.reject_gate = 'gate3' THEN 3
+                                WHEN excluded.reject_gate = 'gate2' THEN 2
+                                WHEN excluded.reject_gate = 'gate1' THEN 1
+                                ELSE 0
+                             END) >
+                            (CASE
+                                WHEN filter_results.passed = 1 THEN 5
+                                WHEN filter_results.reject_gate = 'gate4' THEN 4
+                                WHEN filter_results.reject_gate = 'gate3' THEN 3
+                                WHEN filter_results.reject_gate = 'gate2' THEN 2
+                                WHEN filter_results.reject_gate = 'gate1' THEN 1
+                                ELSE 0
+                             END)
+                            OR (
+                                (CASE
+                                    WHEN excluded.passed = 1 THEN 5
+                                    WHEN excluded.reject_gate = 'gate4' THEN 4
+                                    WHEN excluded.reject_gate = 'gate3' THEN 3
+                                    WHEN excluded.reject_gate = 'gate2' THEN 2
+                                    WHEN excluded.reject_gate = 'gate1' THEN 1
+                                    ELSE 0
+                                 END) =
+                                (CASE
+                                    WHEN filter_results.passed = 1 THEN 5
+                                    WHEN filter_results.reject_gate = 'gate4' THEN 4
+                                    WHEN filter_results.reject_gate = 'gate3' THEN 3
+                                    WHEN filter_results.reject_gate = 'gate2' THEN 2
+                                    WHEN filter_results.reject_gate = 'gate1' THEN 1
+                                    ELSE 0
+                                 END)
+                                AND excluded.ts >= filter_results.ts
+                            )
+                        THEN excluded.creator
+                        ELSE filter_results.creator
+                    END,
+                    symbol = CASE
+                        WHEN
+                            (CASE
+                                WHEN excluded.passed = 1 THEN 5
+                                WHEN excluded.reject_gate = 'gate4' THEN 4
+                                WHEN excluded.reject_gate = 'gate3' THEN 3
+                                WHEN excluded.reject_gate = 'gate2' THEN 2
+                                WHEN excluded.reject_gate = 'gate1' THEN 1
+                                ELSE 0
+                             END) >
+                            (CASE
+                                WHEN filter_results.passed = 1 THEN 5
+                                WHEN filter_results.reject_gate = 'gate4' THEN 4
+                                WHEN filter_results.reject_gate = 'gate3' THEN 3
+                                WHEN filter_results.reject_gate = 'gate2' THEN 2
+                                WHEN filter_results.reject_gate = 'gate1' THEN 1
+                                ELSE 0
+                             END)
+                            OR (
+                                (CASE
+                                    WHEN excluded.passed = 1 THEN 5
+                                    WHEN excluded.reject_gate = 'gate4' THEN 4
+                                    WHEN excluded.reject_gate = 'gate3' THEN 3
+                                    WHEN excluded.reject_gate = 'gate2' THEN 2
+                                    WHEN excluded.reject_gate = 'gate1' THEN 1
+                                    ELSE 0
+                                 END) =
+                                (CASE
+                                    WHEN filter_results.passed = 1 THEN 5
+                                    WHEN filter_results.reject_gate = 'gate4' THEN 4
+                                    WHEN filter_results.reject_gate = 'gate3' THEN 3
+                                    WHEN filter_results.reject_gate = 'gate2' THEN 2
+                                    WHEN filter_results.reject_gate = 'gate1' THEN 1
+                                    ELSE 0
+                                 END)
+                                AND excluded.ts >= filter_results.ts
+                            )
+                        THEN excluded.symbol
+                        ELSE filter_results.symbol
+                    END,
+                    passed = CASE
+                        WHEN
+                            (CASE
+                                WHEN excluded.passed = 1 THEN 5
+                                WHEN excluded.reject_gate = 'gate4' THEN 4
+                                WHEN excluded.reject_gate = 'gate3' THEN 3
+                                WHEN excluded.reject_gate = 'gate2' THEN 2
+                                WHEN excluded.reject_gate = 'gate1' THEN 1
+                                ELSE 0
+                             END) >
+                            (CASE
+                                WHEN filter_results.passed = 1 THEN 5
+                                WHEN filter_results.reject_gate = 'gate4' THEN 4
+                                WHEN filter_results.reject_gate = 'gate3' THEN 3
+                                WHEN filter_results.reject_gate = 'gate2' THEN 2
+                                WHEN filter_results.reject_gate = 'gate1' THEN 1
+                                ELSE 0
+                             END)
+                            OR (
+                                (CASE
+                                    WHEN excluded.passed = 1 THEN 5
+                                    WHEN excluded.reject_gate = 'gate4' THEN 4
+                                    WHEN excluded.reject_gate = 'gate3' THEN 3
+                                    WHEN excluded.reject_gate = 'gate2' THEN 2
+                                    WHEN excluded.reject_gate = 'gate1' THEN 1
+                                    ELSE 0
+                                 END) =
+                                (CASE
+                                    WHEN filter_results.passed = 1 THEN 5
+                                    WHEN filter_results.reject_gate = 'gate4' THEN 4
+                                    WHEN filter_results.reject_gate = 'gate3' THEN 3
+                                    WHEN filter_results.reject_gate = 'gate2' THEN 2
+                                    WHEN filter_results.reject_gate = 'gate1' THEN 1
+                                    ELSE 0
+                                 END)
+                                AND excluded.ts >= filter_results.ts
+                            )
+                        THEN excluded.passed
+                        ELSE filter_results.passed
+                    END,
+                    reject_gate = CASE
+                        WHEN
+                            (CASE
+                                WHEN excluded.passed = 1 THEN 5
+                                WHEN excluded.reject_gate = 'gate4' THEN 4
+                                WHEN excluded.reject_gate = 'gate3' THEN 3
+                                WHEN excluded.reject_gate = 'gate2' THEN 2
+                                WHEN excluded.reject_gate = 'gate1' THEN 1
+                                ELSE 0
+                             END) >
+                            (CASE
+                                WHEN filter_results.passed = 1 THEN 5
+                                WHEN filter_results.reject_gate = 'gate4' THEN 4
+                                WHEN filter_results.reject_gate = 'gate3' THEN 3
+                                WHEN filter_results.reject_gate = 'gate2' THEN 2
+                                WHEN filter_results.reject_gate = 'gate1' THEN 1
+                                ELSE 0
+                             END)
+                            OR (
+                                (CASE
+                                    WHEN excluded.passed = 1 THEN 5
+                                    WHEN excluded.reject_gate = 'gate4' THEN 4
+                                    WHEN excluded.reject_gate = 'gate3' THEN 3
+                                    WHEN excluded.reject_gate = 'gate2' THEN 2
+                                    WHEN excluded.reject_gate = 'gate1' THEN 1
+                                    ELSE 0
+                                 END) =
+                                (CASE
+                                    WHEN filter_results.passed = 1 THEN 5
+                                    WHEN filter_results.reject_gate = 'gate4' THEN 4
+                                    WHEN filter_results.reject_gate = 'gate3' THEN 3
+                                    WHEN filter_results.reject_gate = 'gate2' THEN 2
+                                    WHEN filter_results.reject_gate = 'gate1' THEN 1
+                                    ELSE 0
+                                 END)
+                                AND excluded.ts >= filter_results.ts
+                            )
+                        THEN excluded.reject_gate
+                        ELSE filter_results.reject_gate
+                    END,
+                    score = CASE
+                        WHEN
+                            (CASE
+                                WHEN excluded.passed = 1 THEN 5
+                                WHEN excluded.reject_gate = 'gate4' THEN 4
+                                WHEN excluded.reject_gate = 'gate3' THEN 3
+                                WHEN excluded.reject_gate = 'gate2' THEN 2
+                                WHEN excluded.reject_gate = 'gate1' THEN 1
+                                ELSE 0
+                             END) >
+                            (CASE
+                                WHEN filter_results.passed = 1 THEN 5
+                                WHEN filter_results.reject_gate = 'gate4' THEN 4
+                                WHEN filter_results.reject_gate = 'gate3' THEN 3
+                                WHEN filter_results.reject_gate = 'gate2' THEN 2
+                                WHEN filter_results.reject_gate = 'gate1' THEN 1
+                                ELSE 0
+                             END)
+                            OR (
+                                (CASE
+                                    WHEN excluded.passed = 1 THEN 5
+                                    WHEN excluded.reject_gate = 'gate4' THEN 4
+                                    WHEN excluded.reject_gate = 'gate3' THEN 3
+                                    WHEN excluded.reject_gate = 'gate2' THEN 2
+                                    WHEN excluded.reject_gate = 'gate1' THEN 1
+                                    ELSE 0
+                                 END) =
+                                (CASE
+                                    WHEN filter_results.passed = 1 THEN 5
+                                    WHEN filter_results.reject_gate = 'gate4' THEN 4
+                                    WHEN filter_results.reject_gate = 'gate3' THEN 3
+                                    WHEN filter_results.reject_gate = 'gate2' THEN 2
+                                    WHEN filter_results.reject_gate = 'gate1' THEN 1
+                                    ELSE 0
+                                 END)
+                                AND excluded.ts >= filter_results.ts
+                            )
+                        THEN excluded.score
+                        ELSE filter_results.score
+                    END,
+                    reason = CASE
+                        WHEN
+                            (CASE
+                                WHEN excluded.passed = 1 THEN 5
+                                WHEN excluded.reject_gate = 'gate4' THEN 4
+                                WHEN excluded.reject_gate = 'gate3' THEN 3
+                                WHEN excluded.reject_gate = 'gate2' THEN 2
+                                WHEN excluded.reject_gate = 'gate1' THEN 1
+                                ELSE 0
+                             END) >
+                            (CASE
+                                WHEN filter_results.passed = 1 THEN 5
+                                WHEN filter_results.reject_gate = 'gate4' THEN 4
+                                WHEN filter_results.reject_gate = 'gate3' THEN 3
+                                WHEN filter_results.reject_gate = 'gate2' THEN 2
+                                WHEN filter_results.reject_gate = 'gate1' THEN 1
+                                ELSE 0
+                             END)
+                            OR (
+                                (CASE
+                                    WHEN excluded.passed = 1 THEN 5
+                                    WHEN excluded.reject_gate = 'gate4' THEN 4
+                                    WHEN excluded.reject_gate = 'gate3' THEN 3
+                                    WHEN excluded.reject_gate = 'gate2' THEN 2
+                                    WHEN excluded.reject_gate = 'gate1' THEN 1
+                                    ELSE 0
+                                 END) =
+                                (CASE
+                                    WHEN filter_results.passed = 1 THEN 5
+                                    WHEN filter_results.reject_gate = 'gate4' THEN 4
+                                    WHEN filter_results.reject_gate = 'gate3' THEN 3
+                                    WHEN filter_results.reject_gate = 'gate2' THEN 2
+                                    WHEN filter_results.reject_gate = 'gate1' THEN 1
+                                    ELSE 0
+                                 END)
+                                AND excluded.ts >= filter_results.ts
+                            )
+                        THEN excluded.reason
+                        ELSE filter_results.reason
+                    END,
+                    ts = MAX(filter_results.ts, excluded.ts)",
                 params![
                     record.mint,
                     record.creator,
@@ -545,13 +787,263 @@ impl FilterDb {
         let record = record.clone();
         self.with_conn(move |conn| {
             conn.execute(
-                "INSERT OR REPLACE INTO filter_timelines(
+                "INSERT INTO filter_timelines(
                     mint, decision, mode, path, detected_at_ms, gate1_at_ms, gate1_result_applied_at_ms,
                     gate2_at_ms, gate2_task_spawned_at_ms, gate2_branch_tag, creator_gate_entered_at_ms,
                     cache_lookup_done_at_ms, refresh_launch_returned_at_ms, gate2_remote_started_at_ms,
                     gate2_result_ready_at_ms, gate2_result_applied_at_ms, gate3_open_at_ms,
                     gate3_trigger_at_ms, gate4_at_ms, final_at_ms, latency_ms, early_buy_count, matched_buyers
-                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23)",
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23)
+                 ON CONFLICT(mint) DO UPDATE SET
+                    decision = CASE
+                        WHEN
+                            (CASE
+                                WHEN excluded.gate4_at_ms IS NOT NULL THEN 4
+                                WHEN excluded.gate3_trigger_at_ms IS NOT NULL THEN 3
+                                WHEN excluded.gate2_at_ms IS NOT NULL THEN 2
+                                WHEN excluded.gate1_at_ms IS NOT NULL THEN 1
+                                ELSE 0
+                             END) >
+                            (CASE
+                                WHEN filter_timelines.gate4_at_ms IS NOT NULL THEN 4
+                                WHEN filter_timelines.gate3_trigger_at_ms IS NOT NULL THEN 3
+                                WHEN filter_timelines.gate2_at_ms IS NOT NULL THEN 2
+                                WHEN filter_timelines.gate1_at_ms IS NOT NULL THEN 1
+                                ELSE 0
+                             END)
+                            OR (
+                                (CASE
+                                    WHEN excluded.gate4_at_ms IS NOT NULL THEN 4
+                                    WHEN excluded.gate3_trigger_at_ms IS NOT NULL THEN 3
+                                    WHEN excluded.gate2_at_ms IS NOT NULL THEN 2
+                                    WHEN excluded.gate1_at_ms IS NOT NULL THEN 1
+                                    ELSE 0
+                                 END) =
+                                (CASE
+                                    WHEN filter_timelines.gate4_at_ms IS NOT NULL THEN 4
+                                    WHEN filter_timelines.gate3_trigger_at_ms IS NOT NULL THEN 3
+                                    WHEN filter_timelines.gate2_at_ms IS NOT NULL THEN 2
+                                    WHEN filter_timelines.gate1_at_ms IS NOT NULL THEN 1
+                                    ELSE 0
+                                 END)
+                                AND excluded.final_at_ms >= filter_timelines.final_at_ms
+                            )
+                        THEN excluded.decision
+                        ELSE filter_timelines.decision
+                    END,
+                    mode = CASE
+                        WHEN
+                            (CASE
+                                WHEN excluded.gate4_at_ms IS NOT NULL THEN 4
+                                WHEN excluded.gate3_trigger_at_ms IS NOT NULL THEN 3
+                                WHEN excluded.gate2_at_ms IS NOT NULL THEN 2
+                                WHEN excluded.gate1_at_ms IS NOT NULL THEN 1
+                                ELSE 0
+                             END) >
+                            (CASE
+                                WHEN filter_timelines.gate4_at_ms IS NOT NULL THEN 4
+                                WHEN filter_timelines.gate3_trigger_at_ms IS NOT NULL THEN 3
+                                WHEN filter_timelines.gate2_at_ms IS NOT NULL THEN 2
+                                WHEN filter_timelines.gate1_at_ms IS NOT NULL THEN 1
+                                ELSE 0
+                             END)
+                            OR (
+                                (CASE
+                                    WHEN excluded.gate4_at_ms IS NOT NULL THEN 4
+                                    WHEN excluded.gate3_trigger_at_ms IS NOT NULL THEN 3
+                                    WHEN excluded.gate2_at_ms IS NOT NULL THEN 2
+                                    WHEN excluded.gate1_at_ms IS NOT NULL THEN 1
+                                    ELSE 0
+                                 END) =
+                                (CASE
+                                    WHEN filter_timelines.gate4_at_ms IS NOT NULL THEN 4
+                                    WHEN filter_timelines.gate3_trigger_at_ms IS NOT NULL THEN 3
+                                    WHEN filter_timelines.gate2_at_ms IS NOT NULL THEN 2
+                                    WHEN filter_timelines.gate1_at_ms IS NOT NULL THEN 1
+                                    ELSE 0
+                                 END)
+                                AND excluded.final_at_ms >= filter_timelines.final_at_ms
+                            )
+                        THEN excluded.mode
+                        ELSE filter_timelines.mode
+                    END,
+                    path = CASE
+                        WHEN
+                            (CASE
+                                WHEN excluded.gate4_at_ms IS NOT NULL THEN 4
+                                WHEN excluded.gate3_trigger_at_ms IS NOT NULL THEN 3
+                                WHEN excluded.gate2_at_ms IS NOT NULL THEN 2
+                                WHEN excluded.gate1_at_ms IS NOT NULL THEN 1
+                                ELSE 0
+                             END) >
+                            (CASE
+                                WHEN filter_timelines.gate4_at_ms IS NOT NULL THEN 4
+                                WHEN filter_timelines.gate3_trigger_at_ms IS NOT NULL THEN 3
+                                WHEN filter_timelines.gate2_at_ms IS NOT NULL THEN 2
+                                WHEN filter_timelines.gate1_at_ms IS NOT NULL THEN 1
+                                ELSE 0
+                             END)
+                            OR (
+                                (CASE
+                                    WHEN excluded.gate4_at_ms IS NOT NULL THEN 4
+                                    WHEN excluded.gate3_trigger_at_ms IS NOT NULL THEN 3
+                                    WHEN excluded.gate2_at_ms IS NOT NULL THEN 2
+                                    WHEN excluded.gate1_at_ms IS NOT NULL THEN 1
+                                    ELSE 0
+                                 END) =
+                                (CASE
+                                    WHEN filter_timelines.gate4_at_ms IS NOT NULL THEN 4
+                                    WHEN filter_timelines.gate3_trigger_at_ms IS NOT NULL THEN 3
+                                    WHEN filter_timelines.gate2_at_ms IS NOT NULL THEN 2
+                                    WHEN filter_timelines.gate1_at_ms IS NOT NULL THEN 1
+                                    ELSE 0
+                                 END)
+                                AND excluded.final_at_ms >= filter_timelines.final_at_ms
+                            )
+                        THEN excluded.path
+                        ELSE filter_timelines.path
+                    END,
+                    detected_at_ms = MIN(filter_timelines.detected_at_ms, excluded.detected_at_ms),
+                    gate1_at_ms = CASE
+                        WHEN filter_timelines.gate1_at_ms IS NULL THEN excluded.gate1_at_ms
+                        WHEN excluded.gate1_at_ms IS NULL THEN filter_timelines.gate1_at_ms
+                        ELSE MIN(filter_timelines.gate1_at_ms, excluded.gate1_at_ms)
+                    END,
+                    gate1_result_applied_at_ms = CASE
+                        WHEN filter_timelines.gate1_result_applied_at_ms IS NULL THEN excluded.gate1_result_applied_at_ms
+                        WHEN excluded.gate1_result_applied_at_ms IS NULL THEN filter_timelines.gate1_result_applied_at_ms
+                        ELSE MIN(filter_timelines.gate1_result_applied_at_ms, excluded.gate1_result_applied_at_ms)
+                    END,
+                    gate2_at_ms = CASE
+                        WHEN filter_timelines.gate2_at_ms IS NULL THEN excluded.gate2_at_ms
+                        WHEN excluded.gate2_at_ms IS NULL THEN filter_timelines.gate2_at_ms
+                        ELSE MIN(filter_timelines.gate2_at_ms, excluded.gate2_at_ms)
+                    END,
+                    gate2_task_spawned_at_ms = CASE
+                        WHEN filter_timelines.gate2_task_spawned_at_ms IS NULL THEN excluded.gate2_task_spawned_at_ms
+                        WHEN excluded.gate2_task_spawned_at_ms IS NULL THEN filter_timelines.gate2_task_spawned_at_ms
+                        ELSE MIN(filter_timelines.gate2_task_spawned_at_ms, excluded.gate2_task_spawned_at_ms)
+                    END,
+                    gate2_branch_tag = COALESCE(filter_timelines.gate2_branch_tag, excluded.gate2_branch_tag),
+                    creator_gate_entered_at_ms = CASE
+                        WHEN filter_timelines.creator_gate_entered_at_ms IS NULL THEN excluded.creator_gate_entered_at_ms
+                        WHEN excluded.creator_gate_entered_at_ms IS NULL THEN filter_timelines.creator_gate_entered_at_ms
+                        ELSE MIN(filter_timelines.creator_gate_entered_at_ms, excluded.creator_gate_entered_at_ms)
+                    END,
+                    cache_lookup_done_at_ms = CASE
+                        WHEN filter_timelines.cache_lookup_done_at_ms IS NULL THEN excluded.cache_lookup_done_at_ms
+                        WHEN excluded.cache_lookup_done_at_ms IS NULL THEN filter_timelines.cache_lookup_done_at_ms
+                        ELSE MIN(filter_timelines.cache_lookup_done_at_ms, excluded.cache_lookup_done_at_ms)
+                    END,
+                    refresh_launch_returned_at_ms = CASE
+                        WHEN filter_timelines.refresh_launch_returned_at_ms IS NULL THEN excluded.refresh_launch_returned_at_ms
+                        WHEN excluded.refresh_launch_returned_at_ms IS NULL THEN filter_timelines.refresh_launch_returned_at_ms
+                        ELSE MIN(filter_timelines.refresh_launch_returned_at_ms, excluded.refresh_launch_returned_at_ms)
+                    END,
+                    gate2_remote_started_at_ms = CASE
+                        WHEN filter_timelines.gate2_remote_started_at_ms IS NULL THEN excluded.gate2_remote_started_at_ms
+                        WHEN excluded.gate2_remote_started_at_ms IS NULL THEN filter_timelines.gate2_remote_started_at_ms
+                        ELSE MIN(filter_timelines.gate2_remote_started_at_ms, excluded.gate2_remote_started_at_ms)
+                    END,
+                    gate2_result_ready_at_ms = CASE
+                        WHEN filter_timelines.gate2_result_ready_at_ms IS NULL THEN excluded.gate2_result_ready_at_ms
+                        WHEN excluded.gate2_result_ready_at_ms IS NULL THEN filter_timelines.gate2_result_ready_at_ms
+                        ELSE MIN(filter_timelines.gate2_result_ready_at_ms, excluded.gate2_result_ready_at_ms)
+                    END,
+                    gate2_result_applied_at_ms = CASE
+                        WHEN filter_timelines.gate2_result_applied_at_ms IS NULL THEN excluded.gate2_result_applied_at_ms
+                        WHEN excluded.gate2_result_applied_at_ms IS NULL THEN filter_timelines.gate2_result_applied_at_ms
+                        ELSE MIN(filter_timelines.gate2_result_applied_at_ms, excluded.gate2_result_applied_at_ms)
+                    END,
+                    gate3_open_at_ms = CASE
+                        WHEN filter_timelines.gate3_open_at_ms IS NULL THEN excluded.gate3_open_at_ms
+                        WHEN excluded.gate3_open_at_ms IS NULL THEN filter_timelines.gate3_open_at_ms
+                        ELSE MIN(filter_timelines.gate3_open_at_ms, excluded.gate3_open_at_ms)
+                    END,
+                    gate3_trigger_at_ms = CASE
+                        WHEN filter_timelines.gate3_trigger_at_ms IS NULL THEN excluded.gate3_trigger_at_ms
+                        WHEN excluded.gate3_trigger_at_ms IS NULL THEN filter_timelines.gate3_trigger_at_ms
+                        ELSE MIN(filter_timelines.gate3_trigger_at_ms, excluded.gate3_trigger_at_ms)
+                    END,
+                    gate4_at_ms = CASE
+                        WHEN filter_timelines.gate4_at_ms IS NULL THEN excluded.gate4_at_ms
+                        WHEN excluded.gate4_at_ms IS NULL THEN filter_timelines.gate4_at_ms
+                        ELSE MIN(filter_timelines.gate4_at_ms, excluded.gate4_at_ms)
+                    END,
+                    final_at_ms = CASE
+                        WHEN
+                            (CASE
+                                WHEN excluded.gate4_at_ms IS NOT NULL THEN 4
+                                WHEN excluded.gate3_trigger_at_ms IS NOT NULL THEN 3
+                                WHEN excluded.gate2_at_ms IS NOT NULL THEN 2
+                                WHEN excluded.gate1_at_ms IS NOT NULL THEN 1
+                                ELSE 0
+                             END) >
+                            (CASE
+                                WHEN filter_timelines.gate4_at_ms IS NOT NULL THEN 4
+                                WHEN filter_timelines.gate3_trigger_at_ms IS NOT NULL THEN 3
+                                WHEN filter_timelines.gate2_at_ms IS NOT NULL THEN 2
+                                WHEN filter_timelines.gate1_at_ms IS NOT NULL THEN 1
+                                ELSE 0
+                             END)
+                            OR (
+                                (CASE
+                                    WHEN excluded.gate4_at_ms IS NOT NULL THEN 4
+                                    WHEN excluded.gate3_trigger_at_ms IS NOT NULL THEN 3
+                                    WHEN excluded.gate2_at_ms IS NOT NULL THEN 2
+                                    WHEN excluded.gate1_at_ms IS NOT NULL THEN 1
+                                    ELSE 0
+                                 END) =
+                                (CASE
+                                    WHEN filter_timelines.gate4_at_ms IS NOT NULL THEN 4
+                                    WHEN filter_timelines.gate3_trigger_at_ms IS NOT NULL THEN 3
+                                    WHEN filter_timelines.gate2_at_ms IS NOT NULL THEN 2
+                                    WHEN filter_timelines.gate1_at_ms IS NOT NULL THEN 1
+                                    ELSE 0
+                                 END)
+                                AND excluded.final_at_ms >= filter_timelines.final_at_ms
+                            )
+                        THEN excluded.final_at_ms
+                        ELSE filter_timelines.final_at_ms
+                    END,
+                    latency_ms = CASE
+                        WHEN
+                            (CASE
+                                WHEN excluded.gate4_at_ms IS NOT NULL THEN 4
+                                WHEN excluded.gate3_trigger_at_ms IS NOT NULL THEN 3
+                                WHEN excluded.gate2_at_ms IS NOT NULL THEN 2
+                                WHEN excluded.gate1_at_ms IS NOT NULL THEN 1
+                                ELSE 0
+                             END) >
+                            (CASE
+                                WHEN filter_timelines.gate4_at_ms IS NOT NULL THEN 4
+                                WHEN filter_timelines.gate3_trigger_at_ms IS NOT NULL THEN 3
+                                WHEN filter_timelines.gate2_at_ms IS NOT NULL THEN 2
+                                WHEN filter_timelines.gate1_at_ms IS NOT NULL THEN 1
+                                ELSE 0
+                             END)
+                            OR (
+                                (CASE
+                                    WHEN excluded.gate4_at_ms IS NOT NULL THEN 4
+                                    WHEN excluded.gate3_trigger_at_ms IS NOT NULL THEN 3
+                                    WHEN excluded.gate2_at_ms IS NOT NULL THEN 2
+                                    WHEN excluded.gate1_at_ms IS NOT NULL THEN 1
+                                    ELSE 0
+                                 END) =
+                                (CASE
+                                    WHEN filter_timelines.gate4_at_ms IS NOT NULL THEN 4
+                                    WHEN filter_timelines.gate3_trigger_at_ms IS NOT NULL THEN 3
+                                    WHEN filter_timelines.gate2_at_ms IS NOT NULL THEN 2
+                                    WHEN filter_timelines.gate1_at_ms IS NOT NULL THEN 1
+                                    ELSE 0
+                                 END)
+                                AND excluded.final_at_ms >= filter_timelines.final_at_ms
+                            )
+                        THEN excluded.latency_ms
+                        ELSE filter_timelines.latency_ms
+                    END,
+                    early_buy_count = MAX(filter_timelines.early_buy_count, excluded.early_buy_count),
+                    matched_buyers = MAX(filter_timelines.matched_buyers, excluded.matched_buyers)",
                 params![
                     record.mint,
                     record.decision,
@@ -725,10 +1217,208 @@ impl FilterDb {
         let record = record.clone();
         self.with_conn(move |conn| {
             conn.execute(
-                "INSERT OR REPLACE INTO scoring_breakdowns(
+                "INSERT INTO scoring_breakdowns(
                     mint, path, quality_score, urgency_score, execution_confidence, total_score,
                     required_score, details_json, recorded_at_ms
-                 ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                 ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+                 ON CONFLICT(mint) DO UPDATE SET
+                    path = CASE
+                        WHEN
+                            (CASE
+                                WHEN excluded.path IN ('fast', 'soft') THEN 4
+                                WHEN excluded.path IN ('creator_self_buy', 'timeout', 'max_buys', 'concentration', 'insufficient') THEN 3
+                                ELSE 0
+                             END) >
+                            (CASE
+                                WHEN scoring_breakdowns.path IN ('fast', 'soft') THEN 4
+                                WHEN scoring_breakdowns.path IN ('creator_self_buy', 'timeout', 'max_buys', 'concentration', 'insufficient') THEN 3
+                                ELSE 0
+                             END)
+                            OR (
+                                (CASE
+                                    WHEN excluded.path IN ('fast', 'soft') THEN 4
+                                    WHEN excluded.path IN ('creator_self_buy', 'timeout', 'max_buys', 'concentration', 'insufficient') THEN 3
+                                    ELSE 0
+                                 END) =
+                                (CASE
+                                    WHEN scoring_breakdowns.path IN ('fast', 'soft') THEN 4
+                                    WHEN scoring_breakdowns.path IN ('creator_self_buy', 'timeout', 'max_buys', 'concentration', 'insufficient') THEN 3
+                                    ELSE 0
+                                 END)
+                                AND excluded.recorded_at_ms >= scoring_breakdowns.recorded_at_ms
+                            )
+                        THEN excluded.path
+                        ELSE scoring_breakdowns.path
+                    END,
+                    quality_score = CASE
+                        WHEN
+                            (CASE
+                                WHEN excluded.path IN ('fast', 'soft') THEN 4
+                                WHEN excluded.path IN ('creator_self_buy', 'timeout', 'max_buys', 'concentration', 'insufficient') THEN 3
+                                ELSE 0
+                             END) >
+                            (CASE
+                                WHEN scoring_breakdowns.path IN ('fast', 'soft') THEN 4
+                                WHEN scoring_breakdowns.path IN ('creator_self_buy', 'timeout', 'max_buys', 'concentration', 'insufficient') THEN 3
+                                ELSE 0
+                             END)
+                            OR (
+                                (CASE
+                                    WHEN excluded.path IN ('fast', 'soft') THEN 4
+                                    WHEN excluded.path IN ('creator_self_buy', 'timeout', 'max_buys', 'concentration', 'insufficient') THEN 3
+                                    ELSE 0
+                                 END) =
+                                (CASE
+                                    WHEN scoring_breakdowns.path IN ('fast', 'soft') THEN 4
+                                    WHEN scoring_breakdowns.path IN ('creator_self_buy', 'timeout', 'max_buys', 'concentration', 'insufficient') THEN 3
+                                    ELSE 0
+                                 END)
+                                AND excluded.recorded_at_ms >= scoring_breakdowns.recorded_at_ms
+                            )
+                        THEN excluded.quality_score
+                        ELSE scoring_breakdowns.quality_score
+                    END,
+                    urgency_score = CASE
+                        WHEN
+                            (CASE
+                                WHEN excluded.path IN ('fast', 'soft') THEN 4
+                                WHEN excluded.path IN ('creator_self_buy', 'timeout', 'max_buys', 'concentration', 'insufficient') THEN 3
+                                ELSE 0
+                             END) >
+                            (CASE
+                                WHEN scoring_breakdowns.path IN ('fast', 'soft') THEN 4
+                                WHEN scoring_breakdowns.path IN ('creator_self_buy', 'timeout', 'max_buys', 'concentration', 'insufficient') THEN 3
+                                ELSE 0
+                             END)
+                            OR (
+                                (CASE
+                                    WHEN excluded.path IN ('fast', 'soft') THEN 4
+                                    WHEN excluded.path IN ('creator_self_buy', 'timeout', 'max_buys', 'concentration', 'insufficient') THEN 3
+                                    ELSE 0
+                                 END) =
+                                (CASE
+                                    WHEN scoring_breakdowns.path IN ('fast', 'soft') THEN 4
+                                    WHEN scoring_breakdowns.path IN ('creator_self_buy', 'timeout', 'max_buys', 'concentration', 'insufficient') THEN 3
+                                    ELSE 0
+                                 END)
+                                AND excluded.recorded_at_ms >= scoring_breakdowns.recorded_at_ms
+                            )
+                        THEN excluded.urgency_score
+                        ELSE scoring_breakdowns.urgency_score
+                    END,
+                    execution_confidence = CASE
+                        WHEN
+                            (CASE
+                                WHEN excluded.path IN ('fast', 'soft') THEN 4
+                                WHEN excluded.path IN ('creator_self_buy', 'timeout', 'max_buys', 'concentration', 'insufficient') THEN 3
+                                ELSE 0
+                             END) >
+                            (CASE
+                                WHEN scoring_breakdowns.path IN ('fast', 'soft') THEN 4
+                                WHEN scoring_breakdowns.path IN ('creator_self_buy', 'timeout', 'max_buys', 'concentration', 'insufficient') THEN 3
+                                ELSE 0
+                             END)
+                            OR (
+                                (CASE
+                                    WHEN excluded.path IN ('fast', 'soft') THEN 4
+                                    WHEN excluded.path IN ('creator_self_buy', 'timeout', 'max_buys', 'concentration', 'insufficient') THEN 3
+                                    ELSE 0
+                                 END) =
+                                (CASE
+                                    WHEN scoring_breakdowns.path IN ('fast', 'soft') THEN 4
+                                    WHEN scoring_breakdowns.path IN ('creator_self_buy', 'timeout', 'max_buys', 'concentration', 'insufficient') THEN 3
+                                    ELSE 0
+                                 END)
+                                AND excluded.recorded_at_ms >= scoring_breakdowns.recorded_at_ms
+                            )
+                        THEN excluded.execution_confidence
+                        ELSE scoring_breakdowns.execution_confidence
+                    END,
+                    total_score = CASE
+                        WHEN
+                            (CASE
+                                WHEN excluded.path IN ('fast', 'soft') THEN 4
+                                WHEN excluded.path IN ('creator_self_buy', 'timeout', 'max_buys', 'concentration', 'insufficient') THEN 3
+                                ELSE 0
+                             END) >
+                            (CASE
+                                WHEN scoring_breakdowns.path IN ('fast', 'soft') THEN 4
+                                WHEN scoring_breakdowns.path IN ('creator_self_buy', 'timeout', 'max_buys', 'concentration', 'insufficient') THEN 3
+                                ELSE 0
+                             END)
+                            OR (
+                                (CASE
+                                    WHEN excluded.path IN ('fast', 'soft') THEN 4
+                                    WHEN excluded.path IN ('creator_self_buy', 'timeout', 'max_buys', 'concentration', 'insufficient') THEN 3
+                                    ELSE 0
+                                 END) =
+                                (CASE
+                                    WHEN scoring_breakdowns.path IN ('fast', 'soft') THEN 4
+                                    WHEN scoring_breakdowns.path IN ('creator_self_buy', 'timeout', 'max_buys', 'concentration', 'insufficient') THEN 3
+                                    ELSE 0
+                                 END)
+                                AND excluded.recorded_at_ms >= scoring_breakdowns.recorded_at_ms
+                            )
+                        THEN excluded.total_score
+                        ELSE scoring_breakdowns.total_score
+                    END,
+                    required_score = CASE
+                        WHEN
+                            (CASE
+                                WHEN excluded.path IN ('fast', 'soft') THEN 4
+                                WHEN excluded.path IN ('creator_self_buy', 'timeout', 'max_buys', 'concentration', 'insufficient') THEN 3
+                                ELSE 0
+                             END) >
+                            (CASE
+                                WHEN scoring_breakdowns.path IN ('fast', 'soft') THEN 4
+                                WHEN scoring_breakdowns.path IN ('creator_self_buy', 'timeout', 'max_buys', 'concentration', 'insufficient') THEN 3
+                                ELSE 0
+                             END)
+                            OR (
+                                (CASE
+                                    WHEN excluded.path IN ('fast', 'soft') THEN 4
+                                    WHEN excluded.path IN ('creator_self_buy', 'timeout', 'max_buys', 'concentration', 'insufficient') THEN 3
+                                    ELSE 0
+                                 END) =
+                                (CASE
+                                    WHEN scoring_breakdowns.path IN ('fast', 'soft') THEN 4
+                                    WHEN scoring_breakdowns.path IN ('creator_self_buy', 'timeout', 'max_buys', 'concentration', 'insufficient') THEN 3
+                                    ELSE 0
+                                 END)
+                                AND excluded.recorded_at_ms >= scoring_breakdowns.recorded_at_ms
+                            )
+                        THEN excluded.required_score
+                        ELSE scoring_breakdowns.required_score
+                    END,
+                    details_json = CASE
+                        WHEN
+                            (CASE
+                                WHEN excluded.path IN ('fast', 'soft') THEN 4
+                                WHEN excluded.path IN ('creator_self_buy', 'timeout', 'max_buys', 'concentration', 'insufficient') THEN 3
+                                ELSE 0
+                             END) >
+                            (CASE
+                                WHEN scoring_breakdowns.path IN ('fast', 'soft') THEN 4
+                                WHEN scoring_breakdowns.path IN ('creator_self_buy', 'timeout', 'max_buys', 'concentration', 'insufficient') THEN 3
+                                ELSE 0
+                             END)
+                            OR (
+                                (CASE
+                                    WHEN excluded.path IN ('fast', 'soft') THEN 4
+                                    WHEN excluded.path IN ('creator_self_buy', 'timeout', 'max_buys', 'concentration', 'insufficient') THEN 3
+                                    ELSE 0
+                                 END) =
+                                (CASE
+                                    WHEN scoring_breakdowns.path IN ('fast', 'soft') THEN 4
+                                    WHEN scoring_breakdowns.path IN ('creator_self_buy', 'timeout', 'max_buys', 'concentration', 'insufficient') THEN 3
+                                    ELSE 0
+                                 END)
+                                AND excluded.recorded_at_ms >= scoring_breakdowns.recorded_at_ms
+                            )
+                        THEN excluded.details_json
+                        ELSE scoring_breakdowns.details_json
+                    END,
+                    recorded_at_ms = MAX(scoring_breakdowns.recorded_at_ms, excluded.recorded_at_ms)",
                 params![
                     record.mint,
                     record.path,
