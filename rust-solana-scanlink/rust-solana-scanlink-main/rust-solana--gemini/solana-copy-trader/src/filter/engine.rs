@@ -159,6 +159,7 @@ struct CandidateTrace {
     gate1_result_applied_at_ms: Option<u64>,
     gate2_at_ms: Option<u64>,
     gate2_task_spawned_at_ms: Option<u64>,
+    gate2_branch_tag: Option<String>,
     creator_gate_entered_at_ms: Option<u64>,
     cache_lookup_done_at_ms: Option<u64>,
     refresh_launch_returned_at_ms: Option<u64>,
@@ -269,6 +270,7 @@ struct CreatorGateResult {
     penalty_score: u32,
     warning_tags: Vec<String>,
     task_spawned_at_ms: u64,
+    branch_tag: Option<String>,
     creator_gate_entered_at_ms: Option<u64>,
     cache_lookup_done_at_ms: Option<u64>,
     refresh_launch_returned_at_ms: Option<u64>,
@@ -835,6 +837,7 @@ async fn handle_gate1_result(
                 penalty_score: 0,
                 warning_tags: Vec::new(),
                 task_spawned_at_ms: gate2_task_spawned_at_ms,
+                branch_tag: Some("creator_gate_task_error_fallback".to_string()),
                 creator_gate_entered_at_ms: None,
                 cache_lookup_done_at_ms: None,
                 refresh_launch_returned_at_ms: None,
@@ -867,6 +870,7 @@ async fn handle_creator_gate_resolution(
 
     let gate2_applied_at_ms = now_ms();
     candidate.trace.gate2_task_spawned_at_ms = Some(result.task_spawned_at_ms);
+    candidate.trace.gate2_branch_tag = result.branch_tag.clone();
     candidate.trace.creator_gate_entered_at_ms = result.creator_gate_entered_at_ms;
     candidate.trace.cache_lookup_done_at_ms = result.cache_lookup_done_at_ms;
     candidate.trace.refresh_launch_returned_at_ms = result.refresh_launch_returned_at_ms;
@@ -1530,6 +1534,7 @@ async fn creator_gate(
             apply_creator_rules(shared.config.as_ref(), profile),
         )
         .await?;
+        result.branch_tag = Some("fresh_cache_hit".to_string());
         result.creator_gate_entered_at_ms = Some(creator_gate_entered_at_ms);
         result.cache_lookup_done_at_ms = Some(now_ms());
         result.refresh_launch_returned_at_ms = None;
@@ -1547,6 +1552,7 @@ async fn creator_gate(
             apply_creator_rules(shared.config.as_ref(), profile),
         )
         .await?;
+        result.branch_tag = Some("persisted_cache_hit".to_string());
         result.creator_gate_entered_at_ms = Some(creator_gate_entered_at_ms);
         result.cache_lookup_done_at_ms = Some(now_ms());
         result.refresh_launch_returned_at_ms = None;
@@ -1567,6 +1573,7 @@ async fn creator_gate(
                 penalty_score: 0,
                 warning_tags: Vec::new(),
                 task_spawned_at_ms,
+                branch_tag: Some("no_api_key_soft_pass".to_string()),
                 creator_gate_entered_at_ms: Some(creator_gate_entered_at_ms),
                 cache_lookup_done_at_ms: Some(now_ms()),
                 refresh_launch_returned_at_ms: None,
@@ -1592,6 +1599,7 @@ async fn creator_gate(
             format!("stale_creator_profile_cache(age_ms={})", age_ms),
             GATE2_STALE_CACHE_PENALTY_SCORE,
         );
+        result.branch_tag = Some("stale_cache_provisional".to_string());
         result.creator_gate_entered_at_ms = Some(creator_gate_entered_at_ms);
         result.cache_lookup_done_at_ms = Some(cache_lookup_done_at_ms);
         result.task_spawned_at_ms = task_spawned_at_ms;
@@ -1613,6 +1621,7 @@ async fn creator_gate(
     let retry_after_ms = creator_profile_retry_remaining_ms(shared, &token.creator).await;
     if retry_after_ms > 0 {
         return Ok(creator_gate_provisional_pass(
+            "cache_miss_cooldown",
             format!("cache_miss_retry_cooldown({}ms)", retry_after_ms),
             GATE2_CACHE_MISS_PENALTY_SCORE,
             task_spawned_at_ms,
@@ -1645,6 +1654,7 @@ async fn creator_gate(
         } => (remote_started_at_ms, response_rx),
         CreatorRefreshLaunch::Inflight => {
             return Ok(creator_gate_provisional_pass(
+                "stale_cache_provisional",
                 "creator_cache_refresh_inflight".to_string(),
                 GATE2_CACHE_MISS_PENALTY_SCORE,
                 task_spawned_at_ms,
@@ -1656,6 +1666,7 @@ async fn creator_gate(
         }
         CreatorRefreshLaunch::Cooldown { retry_after_ms } => {
             return Ok(creator_gate_provisional_pass(
+                "cache_miss_cooldown",
                 format!("cache_miss_retry_cooldown({}ms)", retry_after_ms),
                 GATE2_CACHE_MISS_PENALTY_SCORE,
                 task_spawned_at_ms,
@@ -1673,6 +1684,7 @@ async fn creator_gate(
             )
             .await;
             return Ok(creator_gate_provisional_pass(
+                "remote_busy_provisional",
                 format!(
                     "creator_gate_remote_busy(concurrency={})",
                     shared.config.creator_gate_remote_concurrency.max(1)
@@ -1689,6 +1701,7 @@ async fn creator_gate(
 
     match tokio::time::timeout(Duration::from_millis(fast_timeout_ms), response_rx).await {
         Ok(Ok(Ok(mut result))) => {
+            result.branch_tag = Some("remote_success".to_string());
             result.creator_gate_entered_at_ms = Some(creator_gate_entered_at_ms);
             result.cache_lookup_done_at_ms = Some(cache_lookup_done_at_ms);
             result.refresh_launch_returned_at_ms = Some(refresh_launch_returned_at_ms);
@@ -1700,6 +1713,7 @@ async fn creator_gate(
                 token.creator, err
             );
             Ok(creator_gate_provisional_pass(
+                "remote_error_provisional",
                 format!("creator_gate_remote_error({})", err),
                 GATE2_FAST_TIMEOUT_PENALTY_SCORE,
                 task_spawned_at_ms,
@@ -1710,6 +1724,7 @@ async fn creator_gate(
             ))
         }
         Ok(Err(_)) => Ok(creator_gate_provisional_pass(
+            "remote_cancelled_provisional",
             "creator_gate_remote_cancelled".to_string(),
             GATE2_FAST_TIMEOUT_PENALTY_SCORE,
             task_spawned_at_ms,
@@ -1811,6 +1826,9 @@ fn push_creator_gate_warning(result: &mut CreatorGateResult, warning: String, pe
 }
 
 fn finalize_creator_gate_result(mut result: CreatorGateResult) -> CreatorGateResult {
+    if result.result_ready_at_ms == 0 {
+        result.result_ready_at_ms = now_ms();
+    }
     if result.passed && (!result.warning_tags.is_empty() || result.penalty_score > 0) {
         result.reason = format!(
             "{} | gate2_penalty={} | gate2_warnings={}",
@@ -1880,6 +1898,7 @@ fn creator_gate_timeout_fallback(
 ) -> CreatorGateResult {
     if let Some(profile) = cached {
         let mut result = apply_creator_rules(config, profile);
+        result.branch_tag = Some("stale_cache_provisional".to_string());
         result.reason = format!(
             "{} | gate2 cache fallback timeout={}ms sniper_fast_timeout={}",
             result.reason, timeout_ms, sniper_fast_timeout
@@ -1911,6 +1930,11 @@ fn creator_gate_timeout_fallback(
         } else {
             0
         },
+        branch_tag: Some(if sniper_fast_timeout {
+            "remote_timeout_provisional".to_string()
+        } else {
+            "remote_timeout_soft_pass".to_string()
+        }),
         warning_tags: if sniper_fast_timeout {
             vec!["timeout_provisional_pass".to_string()]
         } else {
@@ -1930,6 +1954,7 @@ fn creator_gate_timeout_fallback(
 }
 
 fn creator_gate_provisional_pass(
+    branch_tag: &str,
     warning: String,
     penalty_score: u32,
     task_spawned_at_ms: u64,
@@ -1943,6 +1968,7 @@ fn creator_gate_provisional_pass(
         reason: "gate2 provisional pass".to_string(),
         profile: None,
         penalty_score,
+        branch_tag: Some(branch_tag.to_string()),
         warning_tags: vec![warning],
         task_spawned_at_ms,
         creator_gate_entered_at_ms,
@@ -2164,6 +2190,7 @@ fn apply_creator_rules_without_graduated(
             penalty_score: 0,
             warning_tags: Vec::new(),
             task_spawned_at_ms: 0,
+            branch_tag: None,
             creator_gate_entered_at_ms: None,
             cache_lookup_done_at_ms: None,
             refresh_launch_returned_at_ms: None,
@@ -2179,6 +2206,7 @@ fn apply_creator_rules_without_graduated(
             penalty_score: 0,
             warning_tags: Vec::new(),
             task_spawned_at_ms: 0,
+            branch_tag: None,
             creator_gate_entered_at_ms: None,
             cache_lookup_done_at_ms: None,
             refresh_launch_returned_at_ms: None,
@@ -2205,6 +2233,7 @@ fn apply_creator_rules(config: &AppConfig, profile: CreatorProfile) -> CreatorGa
             penalty_score: 0,
             warning_tags: Vec::new(),
             task_spawned_at_ms: 0,
+            branch_tag: None,
             creator_gate_entered_at_ms: None,
             cache_lookup_done_at_ms: None,
             refresh_launch_returned_at_ms: None,
@@ -2220,6 +2249,7 @@ fn apply_creator_rules(config: &AppConfig, profile: CreatorProfile) -> CreatorGa
             penalty_score: 0,
             warning_tags: Vec::new(),
             task_spawned_at_ms: 0,
+            branch_tag: None,
             creator_gate_entered_at_ms: None,
             cache_lookup_done_at_ms: None,
             refresh_launch_returned_at_ms: None,
@@ -2247,6 +2277,7 @@ fn apply_creator_rules(config: &AppConfig, profile: CreatorProfile) -> CreatorGa
         penalty_score: 0,
         warning_tags: Vec::new(),
         task_spawned_at_ms: 0,
+        branch_tag: None,
         creator_gate_entered_at_ms: None,
         cache_lookup_done_at_ms: None,
         refresh_launch_returned_at_ms: None,
@@ -4387,6 +4418,7 @@ async fn record_token_outcome(
         gate1_result_applied_at_ms: trace.gate1_result_applied_at_ms,
         gate2_at_ms: trace.gate2_at_ms,
         gate2_task_spawned_at_ms: trace.gate2_task_spawned_at_ms,
+        gate2_branch_tag: trace.gate2_branch_tag.clone(),
         creator_gate_entered_at_ms: trace.creator_gate_entered_at_ms,
         cache_lookup_done_at_ms: trace.cache_lookup_done_at_ms,
         refresh_launch_returned_at_ms: trace.refresh_launch_returned_at_ms,
@@ -4417,6 +4449,7 @@ async fn record_token_outcome(
             "gate1_result_applied_at_ms": timing.gate1_result_applied_at_ms,
             "gate2_at_ms": timing.gate2_at_ms,
             "gate2_task_spawned_at_ms": timing.gate2_task_spawned_at_ms,
+            "gate2_branch_tag": timing.gate2_branch_tag.clone(),
             "creator_gate_entered_at_ms": timing.creator_gate_entered_at_ms,
             "cache_lookup_done_at_ms": timing.cache_lookup_done_at_ms,
             "refresh_launch_returned_at_ms": timing.refresh_launch_returned_at_ms,

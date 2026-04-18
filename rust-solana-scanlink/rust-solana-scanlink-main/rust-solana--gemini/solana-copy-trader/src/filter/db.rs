@@ -68,6 +68,7 @@ pub struct FilterTimingRecord {
     pub gate1_result_applied_at_ms: Option<u64>,
     pub gate2_at_ms: Option<u64>,
     pub gate2_task_spawned_at_ms: Option<u64>,
+    pub gate2_branch_tag: Option<String>,
     pub creator_gate_entered_at_ms: Option<u64>,
     pub cache_lookup_done_at_ms: Option<u64>,
     pub refresh_launch_returned_at_ms: Option<u64>,
@@ -546,11 +547,11 @@ impl FilterDb {
             conn.execute(
                 "INSERT OR REPLACE INTO filter_timelines(
                     mint, decision, mode, path, detected_at_ms, gate1_at_ms, gate1_result_applied_at_ms,
-                    gate2_at_ms, gate2_task_spawned_at_ms, creator_gate_entered_at_ms, cache_lookup_done_at_ms,
-                    refresh_launch_returned_at_ms, gate2_remote_started_at_ms, gate2_result_ready_at_ms,
-                    gate2_result_applied_at_ms, gate3_open_at_ms, gate3_trigger_at_ms, gate4_at_ms,
-                    final_at_ms, latency_ms, early_buy_count, matched_buyers
-                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22)",
+                    gate2_at_ms, gate2_task_spawned_at_ms, gate2_branch_tag, creator_gate_entered_at_ms,
+                    cache_lookup_done_at_ms, refresh_launch_returned_at_ms, gate2_remote_started_at_ms,
+                    gate2_result_ready_at_ms, gate2_result_applied_at_ms, gate3_open_at_ms,
+                    gate3_trigger_at_ms, gate4_at_ms, final_at_ms, latency_ms, early_buy_count, matched_buyers
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23)",
                 params![
                     record.mint,
                     record.decision,
@@ -561,6 +562,7 @@ impl FilterDb {
                     record.gate1_result_applied_at_ms,
                     record.gate2_at_ms,
                     record.gate2_task_spawned_at_ms,
+                    record.gate2_branch_tag.clone(),
                     record.creator_gate_entered_at_ms,
                     record.cache_lookup_done_at_ms,
                     record.refresh_launch_returned_at_ms,
@@ -1107,10 +1109,11 @@ impl FilterDb {
             let conn = open_conn(path.as_path())?;
             let mut stmt = conn.prepare(
                 "SELECT mint, decision, mode, path, detected_at_ms, gate1_at_ms, gate2_at_ms,
-                        gate1_result_applied_at_ms, gate2_task_spawned_at_ms, creator_gate_entered_at_ms,
-                        cache_lookup_done_at_ms, refresh_launch_returned_at_ms, gate2_remote_started_at_ms,
-                        gate2_result_ready_at_ms, gate2_result_applied_at_ms, gate3_open_at_ms,
-                        gate3_trigger_at_ms, gate4_at_ms, final_at_ms, latency_ms, early_buy_count, matched_buyers
+                        gate1_result_applied_at_ms, gate2_task_spawned_at_ms, gate2_branch_tag,
+                        creator_gate_entered_at_ms, cache_lookup_done_at_ms, refresh_launch_returned_at_ms,
+                        gate2_remote_started_at_ms, gate2_result_ready_at_ms, gate2_result_applied_at_ms,
+                        gate3_open_at_ms, gate3_trigger_at_ms, gate4_at_ms, final_at_ms, latency_ms,
+                        early_buy_count, matched_buyers
                  FROM filter_timelines
                  WHERE final_at_ms BETWEEN ?1 AND ?2
                  ORDER BY final_at_ms ASC",
@@ -1126,19 +1129,20 @@ impl FilterDb {
                     gate1_result_applied_at_ms: row.get(6)?,
                     gate2_at_ms: row.get(7)?,
                     gate2_task_spawned_at_ms: row.get(8)?,
-                    creator_gate_entered_at_ms: row.get(9)?,
-                    cache_lookup_done_at_ms: row.get(10)?,
-                    refresh_launch_returned_at_ms: row.get(11)?,
-                    gate2_remote_started_at_ms: row.get(12)?,
-                    gate2_result_ready_at_ms: row.get(13)?,
-                    gate2_result_applied_at_ms: row.get(14)?,
-                    gate3_open_at_ms: row.get(15)?,
-                    gate3_trigger_at_ms: row.get(16)?,
-                    gate4_at_ms: row.get(17)?,
-                    final_at_ms: row.get(18)?,
-                    latency_ms: row.get(19)?,
-                    early_buy_count: row.get::<_, u64>(20)? as usize,
-                    matched_buyers: row.get::<_, u64>(21)? as usize,
+                    gate2_branch_tag: row.get(9)?,
+                    creator_gate_entered_at_ms: row.get(10)?,
+                    cache_lookup_done_at_ms: row.get(11)?,
+                    refresh_launch_returned_at_ms: row.get(12)?,
+                    gate2_remote_started_at_ms: row.get(13)?,
+                    gate2_result_ready_at_ms: row.get(14)?,
+                    gate2_result_applied_at_ms: row.get(15)?,
+                    gate3_open_at_ms: row.get(16)?,
+                    gate3_trigger_at_ms: row.get(17)?,
+                    gate4_at_ms: row.get(18)?,
+                    final_at_ms: row.get(19)?,
+                    latency_ms: row.get(20)?,
+                    early_buy_count: row.get::<_, u64>(21)? as usize,
+                    matched_buyers: row.get::<_, u64>(22)? as usize,
                 })
             })?;
             rows.collect::<std::result::Result<Vec<_>, _>>()
@@ -1729,6 +1733,7 @@ fn init_db(path: &Path) -> Result<()> {
             gate1_result_applied_at_ms INTEGER,
             gate2_at_ms INTEGER,
             gate2_task_spawned_at_ms INTEGER,
+            gate2_branch_tag TEXT,
             creator_gate_entered_at_ms INTEGER,
             cache_lookup_done_at_ms INTEGER,
             refresh_launch_returned_at_ms INTEGER,
@@ -1940,6 +1945,12 @@ fn init_db(path: &Path) -> Result<()> {
         "filter_timelines",
         "gate2_task_spawned_at_ms",
         "ALTER TABLE filter_timelines ADD COLUMN gate2_task_spawned_at_ms INTEGER",
+    )?;
+    ensure_column(
+        &conn,
+        "filter_timelines",
+        "gate2_branch_tag",
+        "ALTER TABLE filter_timelines ADD COLUMN gate2_branch_tag TEXT",
     )?;
     ensure_column(
         &conn,
