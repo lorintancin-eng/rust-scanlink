@@ -243,6 +243,19 @@ struct Gate1PersistArtifacts {
 #[derive(Debug, Clone)]
 enum FilterPersistTask {
     Gate1Artifacts(Gate1PersistArtifacts),
+    TokenOutcome {
+        token: NewToken,
+        trace: CandidateTrace,
+        passed: bool,
+        reject_gate: Option<String>,
+        score: Option<u32>,
+        reason: String,
+        mode: String,
+        path: String,
+        early_buy_count: usize,
+        matched_buyers: usize,
+        risk_signals: Option<Vec<RiskSignalRecord>>,
+    },
     CreatorLinks {
         token: NewToken,
         profile: CreatorProfile,
@@ -774,25 +787,24 @@ async fn handle_gate1_result(
             gate1_result_applied_at_ms: Some(gate1_result_applied_at_ms),
             ..Default::default()
         };
-        record_token_outcome(
+        let risk_signals =
+            risk_signal_records_from_seeds(&token.mint, &gate1_risk.signals, now_ms());
+        enqueue_persist_task(
             shared,
-            &token,
-            &trace,
-            false,
-            Some("gate1".to_string()),
-            None,
-            gate1_reason,
-            "gate1".to_string(),
-            "immediate".to_string(),
-            0,
-            0,
-            Some(risk_signal_records_from_seeds(
-                &token.mint,
-                &gate1_risk.signals,
-                now_ms(),
-            )),
-        )
-        .await;
+            FilterPersistTask::TokenOutcome {
+                token,
+                trace,
+                passed: false,
+                reject_gate: Some("gate1".to_string()),
+                score: None,
+                reason: gate1_reason,
+                mode: "gate1".to_string(),
+                path: "immediate".to_string(),
+                early_buy_count: 0,
+                matched_buyers: 0,
+                risk_signals: Some(risk_signals),
+            },
+        );
         return Ok(());
     }
 
@@ -4620,6 +4632,35 @@ fn spawn_filter_persist_worker(
                             );
                         }
                     }
+                }
+                FilterPersistTask::TokenOutcome {
+                    token,
+                    trace,
+                    passed,
+                    reject_gate,
+                    score,
+                    reason,
+                    mode,
+                    path,
+                    early_buy_count,
+                    matched_buyers,
+                    risk_signals,
+                } => {
+                    record_token_outcome(
+                        &shared,
+                        &token,
+                        &trace,
+                        passed,
+                        reject_gate,
+                        score,
+                        reason,
+                        mode,
+                        path,
+                        early_buy_count,
+                        matched_buyers,
+                        risk_signals,
+                    )
+                    .await;
                 }
                 FilterPersistTask::CreatorLinks { token, profile } => {
                     persist_entity_links_for_creator(&shared, &token, &profile).await;
