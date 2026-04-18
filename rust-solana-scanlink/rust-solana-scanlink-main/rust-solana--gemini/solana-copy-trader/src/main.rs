@@ -410,7 +410,7 @@ async fn main() -> Result<()> {
         "   Solana Pump.fun Scanner System v{}",
         env!("CARGO_PKG_VERSION")
     );
-    info!("   Yellowstone Scanner + 四层过滤 + 现有执行层");
+    info!("   Yellowstone Scanner + 鍥涘眰杩囨护 + 鐜版湁鎵ц灞?);
     info!("==============================================");
 
     */
@@ -441,9 +441,9 @@ async fn main() -> Result<()> {
         );
     }
 
-    info!("交易钱包: {}", config.pubkey);
+    info!("浜ゆ槗閽卞寘: {}", config.pubkey);
     info!(
-        "扫链节点: {} | SmartMoney 阈值: {} | 打分阈值: {}",
+        "鎵摼鑺傜偣: {} | SmartMoney 闃堝€? {} | 鎵撳垎闃堝€? {}",
         config.scanner_grpc_url, config.smart_money_threshold, config.filter_min_score,
     );
 
@@ -454,7 +454,7 @@ async fn main() -> Result<()> {
         config.smart_money_soft_window_ms,
         config.gate3_hard_reject_ms,
         config.smart_money_fast_threshold,
-        config.smart_money_threshold.max(2),
+        config.smart_money_threshold,
         config.gate3_fast_min_sol,
         config.gate3_soft_min_sol,
         config.gate3_max_single_buyer_share,
@@ -717,8 +717,8 @@ async fn main() -> Result<()> {
                     .subscribe(account_update_tx_task.clone())
                     .await
                 {
-                    Ok(()) => warn!("账户订阅流关闭，准备重连"),
-                    Err(err) => error!("账户订阅流异常: {}", err),
+                    Ok(()) => warn!("璐︽埛璁㈤槄娴佸叧闂紝鍑嗗閲嶈繛"),
+                    Err(err) => error!("璐︽埛璁㈤槄娴佸紓甯? {}", err),
                 }
                 tokio::time::sleep(Duration::from_secs(2)).await;
             }
@@ -745,7 +745,7 @@ async fn main() -> Result<()> {
         )
         .await
         {
-            error!("扫链层退出: {}", err);
+            error!("鎵摼灞傞€€鍑? {}", err);
         }
     });
 
@@ -763,11 +763,11 @@ async fn main() -> Result<()> {
         )
         .await
         {
-            error!("过滤层退出: {}", err);
+            error!("杩囨护灞傞€€鍑? {}", err);
         }
     });
 
-    info!("主流程已启动，等待扫描事件与 BuySignal");
+    info!("涓绘祦绋嬪凡鍚姩锛岀瓑寰呮壂鎻忎簨浠朵笌 BuySignal");
 
     while let Some(signal) = buy_signal_rx.recv().await {
         let feedback = execution_feedback.read().await.clone();
@@ -779,7 +779,7 @@ async fn main() -> Result<()> {
             &feedback,
         );
         let Ok(token_mint) = Pubkey::from_str(&signal.token.mint) else {
-            warn!("执行层：mint 无效，跳过 {}", signal.token.mint);
+            warn!("鎵ц灞傦細mint 鏃犳晥锛岃烦杩?{}", signal.token.mint);
             continue;
         };
 
@@ -823,7 +823,7 @@ async fn main() -> Result<()> {
         tg_stats.buy_attempts.fetch_add(1, Ordering::Relaxed);
 
         info!(
-            "执行层：收到 BuySignal | mint={} | symbol={} | score={} | sm={} | sol={:.2} | latency={}ms",
+            "鎵ц灞傦細鏀跺埌 BuySignal | mint={} | symbol={} | score={} | sm={} | sol={:.2} | latency={}ms",
             signal.token.mint,
             signal.token.symbol,
             signal.score,
