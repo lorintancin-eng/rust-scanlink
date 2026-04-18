@@ -66,7 +66,6 @@ const CURVE_INITIAL_VIRTUAL_SOL: u64 = 30_000_000_000;
 const OLD_WALLET_DAYS: u64 = 7;
 const HELIUS_PAGE_LIMIT: usize = 100;
 const HELIUS_MAX_PAGES: usize = 5;
-const FALLBACK_SM_THRESHOLD: usize = 2;
 const DAY_MS: u64 = 24 * 60 * 60 * 1000;
 const ADDRESS_SNAPSHOT_CACHE_TTL_MS: u64 = 15 * 60 * 1000;
 const FUNDER_WALLET_CLUSTER_LIMIT: u32 = 24;
@@ -2378,16 +2377,14 @@ fn apply_creator_rules(config: &AppConfig, profile: CreatorProfile) -> CreatorGa
 
 fn effective_soft_threshold(config: &AppConfig, mode: SmartMoneyMode) -> usize {
     match mode {
-        SmartMoneyMode::Hotlist => config.smart_money_threshold.max(1),
-        SmartMoneyMode::EarlyBuyerFallback => {
-            config.smart_money_threshold.max(FALLBACK_SM_THRESHOLD)
-        }
+        SmartMoneyMode::Hotlist => config.smart_money_threshold,
+        SmartMoneyMode::EarlyBuyerFallback => config.smart_money_threshold,
     }
 }
 
 fn effective_fast_threshold(config: &AppConfig, mode: SmartMoneyMode) -> usize {
     let soft = effective_soft_threshold(config, mode);
-    config.smart_money_fast_threshold.max(1).min(soft)
+    config.smart_money_fast_threshold.min(soft)
 }
 
 fn effective_soft_window_ms(config: &AppConfig) -> u64 {
@@ -2472,10 +2469,10 @@ fn gate3_trigger_from_stats(config: &AppConfig, stats: &WindowStats) -> Option<G
 }
 
 fn gate3_fast_threshold(stats: &WindowStats) -> usize {
-    if gate3_quality_cluster(stats) && stats.fast_threshold > 1 {
+    if gate3_quality_cluster(stats) && stats.fast_threshold > 0 {
         stats.fast_threshold - 1
     } else {
-        stats.fast_threshold.max(1)
+        stats.fast_threshold
     }
 }
 
@@ -2501,14 +2498,11 @@ fn gate3_quality_cluster(stats: &WindowStats) -> bool {
 }
 
 fn gate3_fast_ready(config: &AppConfig, stats: &WindowStats) -> bool {
-    !gate3_same_cluster_pressure(stats)
-        && stats.unique_sm_wallets.len() >= gate3_fast_threshold(stats)
-        && stats.sm_sol_total >= gate3_fast_min_sol(config, stats)
+    !gate3_same_cluster_pressure(stats) && stats.sm_sol_total >= gate3_fast_min_sol(config, stats)
 }
 
 fn gate3_soft_ready(config: &AppConfig, stats: &WindowStats) -> bool {
-    stats.unique_sm_wallets.len() >= stats.soft_threshold
-        && stats.sm_sol_total >= config.gate3_soft_min_sol
+    stats.sm_sol_total >= config.gate3_soft_min_sol
 }
 
 fn gate3_reject_path(reason: &str) -> &'static str {
@@ -2742,11 +2736,6 @@ async fn smart_money_stats(candidate: &Candidate, shared: &SharedState) -> Windo
             && hotlist_funders.len() >= QUALITY_CLUSTER_MIN_HOT_FUNDERS
             && creator_funder_match_count == 0
             && current_largest_funder_cluster_share <= QUALITY_CLUSTER_MAX_SHARE;
-        let current_fast_threshold = if current_quality_cluster && fast_threshold > 1 {
-            fast_threshold - 1
-        } else {
-            fast_threshold.max(1)
-        };
         let current_fast_min_sol = if current_quality_cluster {
             (shared.config.gate3_fast_min_sol * 0.85).max(0.05)
         } else {
@@ -2762,15 +2751,11 @@ async fn smart_money_stats(candidate: &Candidate, shared: &SharedState) -> Windo
         });
         if fast_reached_at_ms.is_none()
             && !current_same_cluster_pressure
-            && unique_sm_wallets.len() >= current_fast_threshold
             && sm_sol_total >= current_fast_min_sol
         {
             fast_reached_at_ms = Some(elapsed_ms);
         }
-        if soft_reached_at_ms.is_none()
-            && unique_sm_wallets.len() >= soft_threshold
-            && sm_sol_total >= shared.config.gate3_soft_min_sol
-        {
+        if soft_reached_at_ms.is_none() && sm_sol_total >= shared.config.gate3_soft_min_sol {
             soft_reached_at_ms = Some(elapsed_ms);
         }
     }
@@ -5503,8 +5488,8 @@ mod tests {
             smart_money_fast_window_ms: 300,
             smart_money_soft_window_ms: 800,
             gate3_hard_reject_ms: 1_000,
-            smart_money_fast_threshold: 1,
-            smart_money_threshold: 2,
+            smart_money_fast_threshold: 0,
+            smart_money_threshold: 0,
             smart_money_max_buys: 20,
             gate3_fast_min_sol: 0.20,
             gate3_soft_min_sol: 0.70,
@@ -5614,6 +5599,39 @@ mod tests {
         let trigger = gate3_trigger_from_stats(&cfg, &stats).expect("fast trigger");
         assert_eq!(trigger.path, Gate3Path::Fast);
         assert_eq!(trigger.threshold, 2);
+    }
+
+    #[test]
+    fn gate3_allows_single_buyer_fast_path_when_sol_ready() {
+        let cfg = base_config();
+        let stats = WindowStats {
+            mode: SmartMoneyMode::EarlyBuyerFallback,
+            fast_threshold: 0,
+            soft_threshold: 0,
+            unique_sm_wallets: ["a".to_string()].into_iter().collect(),
+            sm_sol_total: 0.25,
+            total_eligible_sol: 0.25,
+            fastest_sm_ms: Some(40),
+            fast_reached_at_ms: Some(80),
+            soft_reached_at_ms: None,
+            buy_count: 1,
+            eligible_buyers: 1,
+            unique_funders: 1,
+            creator_funder_match_count: 0,
+            creator_funder_match_sol: 0.0,
+            max_single_buyer_share: 1.0,
+            max_single_buyer: Some("a".to_string()),
+            creator_buy_count: 0,
+            creator_buy_sol: 0.0,
+            largest_funder_cluster_size: 1,
+            largest_funder_cluster_share: 1.0,
+            hotlist_funder_hits: 0,
+            hotlist_funder_diversity: 0,
+            elapsed_ms: 80,
+        };
+        let trigger = gate3_trigger_from_stats(&cfg, &stats).expect("single buyer fast trigger");
+        assert_eq!(trigger.path, Gate3Path::Fast);
+        assert_eq!(trigger.threshold, 0);
     }
 
     #[test]
