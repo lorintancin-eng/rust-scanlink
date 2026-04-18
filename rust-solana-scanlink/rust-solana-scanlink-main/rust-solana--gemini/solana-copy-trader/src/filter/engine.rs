@@ -870,7 +870,25 @@ async fn handle_creator_gate_resolution(
 
     let gate2_applied_at_ms = now_ms();
     candidate.trace.gate2_task_spawned_at_ms = Some(result.task_spawned_at_ms);
-    candidate.trace.gate2_branch_tag = result.branch_tag.clone();
+    let gate2_branch_tag = result
+        .branch_tag
+        .clone()
+        .or_else(|| inferred_gate2_branch_tag_from_result(&result));
+    if gate2_branch_tag.is_none() {
+        warn!(
+            "gate2 branch tag missing at apply | mint={} | task_spawned_at_ms={} | creator_gate_entered_at_ms={:?} | cache_lookup_done_at_ms={:?} | refresh_launch_returned_at_ms={:?} | remote_started_at_ms={:?} | result_ready_at_ms={} | passed={} | reason={}",
+            mint,
+            result.task_spawned_at_ms,
+            result.creator_gate_entered_at_ms,
+            result.cache_lookup_done_at_ms,
+            result.refresh_launch_returned_at_ms,
+            result.remote_started_at_ms,
+            result.result_ready_at_ms,
+            result.passed,
+            result.reason
+        );
+    }
+    candidate.trace.gate2_branch_tag = gate2_branch_tag;
     candidate.trace.creator_gate_entered_at_ms = result.creator_gate_entered_at_ms;
     candidate.trace.cache_lookup_done_at_ms = result.cache_lookup_done_at_ms;
     candidate.trace.refresh_launch_returned_at_ms = result.refresh_launch_returned_at_ms;
@@ -1838,6 +1856,44 @@ fn finalize_creator_gate_result(mut result: CreatorGateResult) -> CreatorGateRes
         );
     }
     result
+}
+
+fn inferred_gate2_branch_tag_from_result(result: &CreatorGateResult) -> Option<String> {
+    if let Some(branch_tag) = result.branch_tag.clone() {
+        return Some(branch_tag);
+    }
+    if result.remote_started_at_ms.is_some() {
+        return Some("remote_result_unlabeled".to_string());
+    }
+    if result.refresh_launch_returned_at_ms.is_some() {
+        return Some("refresh_launch_unlabeled".to_string());
+    }
+    if result.cache_lookup_done_at_ms.is_some() {
+        return Some("cache_path_unlabeled".to_string());
+    }
+    if result.creator_gate_entered_at_ms.is_some() {
+        return Some("creator_gate_unlabeled".to_string());
+    }
+    None
+}
+
+fn inferred_gate2_branch_tag_from_trace(trace: &CandidateTrace) -> Option<String> {
+    if let Some(branch_tag) = trace.gate2_branch_tag.clone() {
+        return Some(branch_tag);
+    }
+    if trace.gate2_remote_started_at_ms.is_some() {
+        return Some("remote_result_unlabeled".to_string());
+    }
+    if trace.refresh_launch_returned_at_ms.is_some() {
+        return Some("refresh_launch_unlabeled".to_string());
+    }
+    if trace.cache_lookup_done_at_ms.is_some() {
+        return Some("cache_path_unlabeled".to_string());
+    }
+    if trace.creator_gate_entered_at_ms.is_some() {
+        return Some("creator_gate_unlabeled".to_string());
+    }
+    None
 }
 
 async fn creator_gate_remote(
@@ -4389,6 +4445,34 @@ async fn record_token_outcome(
 ) {
     let final_at_ms = now_ms();
     let latency_ms = final_at_ms.saturating_sub(token.detected_at_ms);
+    let gate2_branch_tag = inferred_gate2_branch_tag_from_trace(trace);
+    let gate2_total_ms = trace
+        .gate2_at_ms
+        .map(|gate2_at_ms| gate2_at_ms.saturating_sub(token.detected_at_ms));
+
+    if let Some(gate2_total_ms) = gate2_total_ms {
+        if gate2_total_ms > 5_000 {
+            warn!(
+                "gate2 long tail | mint={} | gate2_total_ms={} | branch_tag={:?} | decision={} | mode={} | path={} | detected_at_ms={} | gate1_at_ms={:?} | gate1_result_applied_at_ms={:?} | gate2_task_spawned_at_ms={:?} | creator_gate_entered_at_ms={:?} | cache_lookup_done_at_ms={:?} | refresh_launch_returned_at_ms={:?} | gate2_remote_started_at_ms={:?} | gate2_result_ready_at_ms={:?} | gate2_result_applied_at_ms={:?}",
+                token.mint,
+                gate2_total_ms,
+                gate2_branch_tag,
+                if passed { "pass" } else { reject_gate.as_deref().unwrap_or("reject") },
+                mode,
+                path,
+                token.detected_at_ms,
+                trace.gate1_at_ms,
+                trace.gate1_result_applied_at_ms,
+                trace.gate2_task_spawned_at_ms,
+                trace.creator_gate_entered_at_ms,
+                trace.cache_lookup_done_at_ms,
+                trace.refresh_launch_returned_at_ms,
+                trace.gate2_remote_started_at_ms,
+                trace.gate2_result_ready_at_ms,
+                trace.gate2_result_applied_at_ms,
+            );
+        }
+    }
 
     let record = FilterResultRecord {
         mint: token.mint.clone(),
@@ -4418,7 +4502,7 @@ async fn record_token_outcome(
         gate1_result_applied_at_ms: trace.gate1_result_applied_at_ms,
         gate2_at_ms: trace.gate2_at_ms,
         gate2_task_spawned_at_ms: trace.gate2_task_spawned_at_ms,
-        gate2_branch_tag: trace.gate2_branch_tag.clone(),
+        gate2_branch_tag: gate2_branch_tag.clone(),
         creator_gate_entered_at_ms: trace.creator_gate_entered_at_ms,
         cache_lookup_done_at_ms: trace.cache_lookup_done_at_ms,
         refresh_launch_returned_at_ms: trace.refresh_launch_returned_at_ms,
@@ -4450,6 +4534,7 @@ async fn record_token_outcome(
             "gate2_at_ms": timing.gate2_at_ms,
             "gate2_task_spawned_at_ms": timing.gate2_task_spawned_at_ms,
             "gate2_branch_tag": timing.gate2_branch_tag.clone(),
+            "gate2_total_ms": gate2_total_ms,
             "creator_gate_entered_at_ms": timing.creator_gate_entered_at_ms,
             "cache_lookup_done_at_ms": timing.cache_lookup_done_at_ms,
             "refresh_launch_returned_at_ms": timing.refresh_launch_returned_at_ms,

@@ -4275,7 +4275,7 @@ dependencies = [
 
 [[package]]
 name = "solana-copy-trader"
-version = "1.8.14"
+version = "1.8.15"
 dependencies = [
  "anyhow",
  "async-trait",
