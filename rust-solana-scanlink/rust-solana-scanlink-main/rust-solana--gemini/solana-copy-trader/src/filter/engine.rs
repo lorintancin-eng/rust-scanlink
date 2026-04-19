@@ -3278,41 +3278,10 @@ async fn score_candidate(shared: &SharedState, mut candidate: Candidate) -> Scor
         }
     );
 
-    if scoring.total_score < scoring.required_score {
-        return ScoreDecision {
-            passed: false,
-            gate: "gate4".to_string(),
-            score: scoring.total_score,
-            quality_score: scoring.quality_score,
-            urgency_score: scoring.urgency_score,
-            execution_confidence: scoring.execution_confidence,
-            reason,
-            signal: None,
-            mode: smart_money_mode_label(stats.mode).to_string(),
-            path: gate3_path_label(trigger.path).to_string(),
-            matched_buyers: stats.unique_sm_wallets.len(),
-            early_buy_count: stats.buy_count,
-            gate4_at_ms: candidate.trace.gate4_at_ms,
-        };
-    }
-
-    let Some(trigger_trade) = select_trigger_trade(&candidate, shared).await else {
-        return ScoreDecision {
-            passed: false,
-            gate: "gate4".to_string(),
-            score: scoring.total_score,
-            quality_score: scoring.quality_score,
-            urgency_score: scoring.urgency_score,
-            execution_confidence: scoring.execution_confidence,
-            reason: format!("{} | missing trigger buy context", reason),
-            signal: None,
-            mode: smart_money_mode_label(stats.mode).to_string(),
-            path: gate3_path_label(trigger.path).to_string(),
-            matched_buyers: stats.unique_sm_wallets.len(),
-            early_buy_count: stats.buy_count,
-            gate4_at_ms: candidate.trace.gate4_at_ms,
-        };
-    };
+    // Sniper mode bypass: once Gate3 triggers, do not let Gate4 score veto execution.
+    let trigger_trade = select_trigger_trade(&candidate, shared)
+        .await
+        .or_else(|| candidate.early_buys.first().cloned());
 
     let latency_ms = now_ms().saturating_sub(candidate.detected_at_ms);
     ScoreDecision {
@@ -3330,11 +3299,11 @@ async fn score_candidate(shared: &SharedState, mut candidate: Candidate) -> Scor
             urgency_score: scoring.urgency_score,
             execution_confidence: scoring.execution_confidence,
             path: gate3_path_label(trigger.path).to_string(),
-            reason,
+            reason: format!("{} | gate4 score bypass enabled", reason),
             sm_count: stats.unique_sm_wallets.len(),
             sm_sol_total: stats.sm_sol_total,
             latency_ms,
-            trigger_trade,
+            trigger_trade: trigger_trade.expect("gate3 triggered without early buy context"),
         }),
         mode: smart_money_mode_label(stats.mode).to_string(),
         path: gate3_path_label(trigger.path).to_string(),
