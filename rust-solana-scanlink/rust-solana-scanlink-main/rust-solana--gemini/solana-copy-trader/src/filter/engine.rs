@@ -580,18 +580,27 @@ pub async fn run(
                     } => {
                         if let Some(mut candidate) = candidates.remove(&mint) {
                             candidate.trace.gate4_at_ms = gate4_at_ms;
-                            record_candidate_outcome(
+                            enqueue_candidate_outcome_task(
                                 &shared,
-                                &candidate,
+                                candidate,
                                 decision.passed,
-                                if decision.passed { None } else { Some(decision.gate.clone()) },
-                                if decision.score > 0 { Some(decision.score) } else { None },
+                                if decision.passed {
+                                    None
+                                } else {
+                                    Some(decision.gate.clone())
+                                },
+                                if decision.score > 0 {
+                                    Some(decision.score)
+                                } else {
+                                    None
+                                },
                                 decision.reason.clone(),
                                 decision.mode,
                                 decision.path,
                                 decision.early_buy_count,
                                 decision.matched_buyers,
-                            ).await;
+                                None,
+                            );
                         }
 
                         if let Some(signal) = decision.signal {
@@ -650,9 +659,9 @@ pub async fn run(
 
                 for (mint, reason, mode, path, buy_count, matched_buyers) in expired {
                     if let Some(candidate) = candidates.remove(&mint) {
-                        record_candidate_outcome(
+                        enqueue_candidate_outcome_task(
                             &shared,
-                            &candidate,
+                            candidate,
                             false,
                             Some("gate3".to_string()),
                             None,
@@ -661,7 +670,8 @@ pub async fn run(
                             path,
                             buy_count,
                             matched_buyers,
-                        ).await;
+                            None,
+                        );
                     }
                 }
             }
@@ -995,19 +1005,20 @@ async fn handle_creator_gate_resolution(
     candidate.trace.gate2_at_ms = Some(result.result_ready_at_ms);
     if !result.passed {
         let candidate = candidates.remove(&mint).unwrap_or_else(|| unreachable!());
-        record_candidate_outcome(
+        let early_buy_count = candidate.early_buys.len();
+        enqueue_candidate_outcome_task(
             shared,
-            &candidate,
+            candidate,
             false,
             Some("gate2".to_string()),
             None,
             result.reason,
             "creator_profile".to_string(),
             "creator_gate".to_string(),
-            candidate.early_buys.len(),
+            early_buy_count,
             0,
-        )
-        .await;
+            None,
+        );
         return;
     }
 
@@ -1129,9 +1140,9 @@ async fn handle_buy_event(
 
     if let Some((mint, reason, mode, path, buy_count, matched_buyers)) = reject_now {
         if let Some(candidate) = candidates.remove(&mint) {
-            record_candidate_outcome(
+            enqueue_candidate_outcome_task(
                 shared,
-                &candidate,
+                candidate,
                 false,
                 Some("gate3".to_string()),
                 None,
@@ -1140,8 +1151,8 @@ async fn handle_buy_event(
                 path,
                 buy_count,
                 matched_buyers,
-            )
-            .await;
+                None,
+            );
         }
     }
 }
@@ -4513,6 +4524,37 @@ async fn record_candidate_outcome(
             score_ref.unwrap_or_default(),
         );
     }
+}
+
+fn enqueue_candidate_outcome_task(
+    shared: &SharedState,
+    candidate: Candidate,
+    passed: bool,
+    reject_gate: Option<String>,
+    score: Option<u32>,
+    reason: String,
+    mode: String,
+    path: String,
+    early_buy_count: usize,
+    matched_buyers: usize,
+    risk_signals: Option<Vec<RiskSignalRecord>>,
+) {
+    enqueue_persist_task(
+        shared,
+        FilterPersistTask::TokenOutcome {
+            token: candidate.token,
+            trace: candidate.trace,
+            passed,
+            reject_gate,
+            score,
+            reason,
+            mode,
+            path,
+            early_buy_count,
+            matched_buyers,
+            risk_signals,
+        },
+    );
 }
 
 async fn record_token_outcome(
