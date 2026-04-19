@@ -1,0 +1,10 @@
+[Unit]
+Description=Rust Scanlink Analytics Janitor
+After=network-online.target
+
+[Service]
+Type=oneshot
+User=ubuntu
+WorkingDirectory=/home/ubuntu/rust-scanlink
+EnvironmentFile=-/home/ubuntu/rust-scanlink/.env
+ExecStart=/usr/bin/python3 /home/ubuntu/rust-scanlink/ops/analytics_janitor.py --db /home/ubuntu/rust-scanlink/data/analytics.sqlite3

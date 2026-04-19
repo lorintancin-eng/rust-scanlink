@@ -8,8 +8,8 @@ use crate::scanner::failover::{
 use crate::scanner::feed::{FeedEndpoint, FeedKind};
 use crate::scanner::raw_event::raw_event_to_scanner_event;
 use crate::scanner::{
-    decoder, NewToken, PumpBuyEvent, ScannerEvent, PUMP_PROGRAM_ID,
-    SCANNER_BUY_CHANNEL_CAPACITY, SCANNER_NEW_TOKEN_CHANNEL_CAPACITY,
+    decoder, NewToken, PumpBuyEvent, ScannerEvent, PUMP_PROGRAM_ID, SCANNER_BUY_CHANNEL_CAPACITY,
+    SCANNER_NEW_TOKEN_CHANNEL_CAPACITY,
 };
 use anyhow::{Context, Result};
 use futures::{Sink, SinkExt, StreamExt};
@@ -61,7 +61,8 @@ struct LiveDispatchMetrics {
 
 pub async fn start(
     cfg: Arc<AppConfig>,
-    _db: Option<FilterDb>,
+    _runtime_db: Option<FilterDb>,
+    _analytics_db: Option<FilterDb>,
     new_token_tx: mpsc::Sender<NewToken>,
     buy_tx: mpsc::Sender<PumpBuyEvent>,
 ) -> Result<()> {
@@ -536,8 +537,7 @@ async fn warn_if_feed_first_hit_write_failed(db: &FilterDb, record: FeedFirstHit
     if let Err(err) = db.upsert_feed_first_hit(&record).await {
         warn!(
             "scanner: feed_first_hit write failed | event_key={} | {}",
-            record.event_key,
-            err
+            record.event_key, err
         );
     }
 }
@@ -636,8 +636,12 @@ async fn run_processed_stream_fast(
         .subscribe_with_request(Some(build_subscribe_request()))
         .await
         .context("scanner subscribe request failed")?;
-    let keepalive_task =
-        spawn_keepalive_task(endpoint.label.clone(), "processed", subscribe_tx, build_ping_request);
+    let keepalive_task = spawn_keepalive_task(
+        endpoint.label.clone(),
+        "processed",
+        subscribe_tx,
+        build_ping_request,
+    );
 
     info!(
         "scanner: fast processed subscription ready | feed={} | program={} | idle_timeout_secs={}",
@@ -665,14 +669,8 @@ async fn run_processed_stream_fast(
                                 if !should_forward {
                                     continue;
                                 }
-                                if !dispatch_live_event(
-                                    cfg,
-                                    event,
-                                    new_token_tx,
-                                    buy_tx,
-                                    metrics,
-                                )
-                                .await?
+                                if !dispatch_live_event(cfg, event, new_token_tx, buy_tx, metrics)
+                                    .await?
                                 {
                                     break 'stream Ok(());
                                 }
@@ -813,8 +811,12 @@ async fn run_processed_stream(
         .subscribe_with_request(Some(build_subscribe_request()))
         .await
         .context("scanner subscribe request failed")?;
-    let keepalive_task =
-        spawn_keepalive_task(endpoint.label.clone(), "processed", subscribe_tx, build_ping_request);
+    let keepalive_task = spawn_keepalive_task(
+        endpoint.label.clone(),
+        "processed",
+        subscribe_tx,
+        build_ping_request,
+    );
 
     record_feed_health(
         db,
@@ -835,12 +837,7 @@ async fn run_processed_stream(
         endpoint.label, PUMP_PROGRAM_ID
     );
     if let Some(db) = db {
-        spawn_catchup_replay(
-            cfg,
-            db,
-            tx,
-            format!("processed_ready:{}", endpoint.label),
-        );
+        spawn_catchup_replay(cfg, db, tx, format!("processed_ready:{}", endpoint.label));
     }
 
     let mut last_message_at = Instant::now();
@@ -960,9 +957,7 @@ where
             if let Err(err) = sink.send(build_request(ping_id)).await {
                 warn!(
                     "scanner: {} keepalive send failed | feed={} | {}",
-                    feed_kind,
-                    feed_label,
-                    err
+                    feed_kind, feed_label, err
                 );
                 break;
             }
@@ -1171,7 +1166,10 @@ fn spawn_catchup_replay(
     let tx = tx.clone();
     tokio::spawn(async move {
         if let Err(err) = replay_pending_raw_events(&cfg, &db, &tx, &reason).await {
-            warn!("scanner: catchup replay failed | reason={} | {}", reason, err);
+            warn!(
+                "scanner: catchup replay failed | reason={} | {}",
+                reason, err
+            );
         }
     });
 }
@@ -1185,9 +1183,8 @@ async fn feed_runtime_snapshot_loop(
         return;
     }
 
-    let mut tick = tokio::time::interval(Duration::from_secs(
-        cfg.scanner_health_snapshot_secs.max(5),
-    ));
+    let mut tick =
+        tokio::time::interval(Duration::from_secs(cfg.scanner_health_snapshot_secs.max(5)));
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     tick.tick().await;
 

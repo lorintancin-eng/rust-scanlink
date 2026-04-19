@@ -434,7 +434,8 @@ struct SharedState {
     config: Arc<AppConfig>,
     rpc_client: Arc<RpcClient>,
     http: reqwest::Client,
-    db: FilterDb,
+    runtime_db: FilterDb,
+    analytics_db: FilterDb,
     persist_tx: mpsc::UnboundedSender<FilterPersistTask>,
     raw_new_token_persist_tx: mpsc::Sender<NewToken>,
     raw_buy_persist_tx: mpsc::Sender<PumpBuyEvent>,
@@ -450,7 +451,8 @@ struct SharedState {
 
 pub async fn run(
     config: Arc<AppConfig>,
-    db: FilterDb,
+    runtime_db: FilterDb,
+    analytics_db: FilterDb,
     rpc_client: Arc<RpcClient>,
     new_token_rx: mpsc::Receiver<NewToken>,
     mut buy_rx: mpsc::Receiver<PumpBuyEvent>,
@@ -468,7 +470,8 @@ pub async fn run(
             .timeout(Duration::from_secs(8))
             .build()
             .context("filter http client init failed")?,
-        db,
+        runtime_db,
+        analytics_db,
         persist_tx,
         raw_new_token_persist_tx,
         raw_buy_persist_tx,
@@ -492,10 +495,10 @@ pub async fn run(
         }
     }
     reload_hotlists(&shared).await?;
-    if let Err(err) = shared.db.backfill_entity_graph().await {
+    if let Err(err) = shared.runtime_db.backfill_entity_graph().await {
         warn!("entity graph backfill failed during startup: {}", err);
     }
-    let creator_template_counts = match shared.db.list_creator_template_counts().await {
+    let creator_template_counts = match shared.runtime_db.list_creator_template_counts().await {
         Ok(counts) => counts,
         Err(err) => {
             warn!(
@@ -1435,7 +1438,10 @@ async fn fetch_onchain_confirmed_keywords(shared: &SharedState) -> Result<Vec<(S
             .narrative_onchain_confirm_window_secs
             .saturating_mul(1000),
     );
-    let rows = shared.db.list_raw_events_window(from_ms, now).await?;
+    let rows = shared
+        .analytics_db
+        .list_raw_events_window(from_ms, now)
+        .await?;
     let mut mints_by_keyword: HashMap<String, HashSet<String>> = HashMap::new();
 
     for row in rows {
@@ -1904,13 +1910,17 @@ async fn apply_creator_entity_rules(
         return Ok(finalize_creator_gate_result(result));
     };
 
-    if let Some(reason) = shared.db.get_funder_blacklist_reason(funder).await? {
+    if let Some(reason) = shared
+        .runtime_db
+        .get_funder_blacklist_reason(funder)
+        .await?
+    {
         result.passed = false;
         result.reason = format!("gate2 reject: funder blacklist hit {} ({})", funder, reason);
         return Ok(result);
     }
 
-    let Some(funder_profile) = shared.db.get_funder_profile(funder).await? else {
+    let Some(funder_profile) = shared.runtime_db.get_funder_profile(funder).await? else {
         return Ok(result);
     };
 
@@ -2033,7 +2043,7 @@ async fn creator_gate_remote(
 
     if let Some(decision) = apply_creator_rules_without_graduated(shared.config.as_ref(), &profile)
     {
-        shared.db.upsert_creator_profile(&profile).await?;
+        shared.runtime_db.upsert_creator_profile(&profile).await?;
         return Ok(decision);
     }
 
@@ -2041,7 +2051,7 @@ async fn creator_gate_remote(
         profile.graduated = fetch_graduated_count(shared, &mints).await?;
     }
 
-    shared.db.upsert_creator_profile(&profile).await?;
+    shared.runtime_db.upsert_creator_profile(&profile).await?;
     cache_creator_profile_memory(
         shared,
         &profile.address,
@@ -2165,7 +2175,7 @@ async fn get_persisted_creator_profile(
     max_age_ms: u64,
 ) -> Option<CreatorProfile> {
     let profile = shared
-        .db
+        .runtime_db
         .get_creator_profile(creator)
         .await
         .ok()
@@ -2179,7 +2189,12 @@ async fn get_persisted_creator_profile(
 
 async fn get_any_creator_profile(shared: &SharedState, creator: &str) -> Option<CreatorProfile> {
     let cached = get_cached_creator_profile(shared, creator, u64::MAX).await;
-    let persisted = shared.db.get_creator_profile(creator).await.ok().flatten();
+    let persisted = shared
+        .runtime_db
+        .get_creator_profile(creator)
+        .await
+        .ok()
+        .flatten();
     let freshest = match (cached, persisted) {
         (Some(left), Some(right)) => {
             if left.fetched_at_ms >= right.fetched_at_ms {
@@ -2934,7 +2949,7 @@ async fn load_creator_cluster_profile(
     };
 
     let snapshot = shared
-        .db
+        .runtime_db
         .get_funder_profile(&funder)
         .await
         .ok()
@@ -3562,7 +3577,7 @@ async fn fetch_buyer_profile(
     api_key: &str,
     address: &str,
 ) -> Result<BuyerProfile> {
-    let cached = shared.db.get_buyer_profile(address).await?;
+    let cached = shared.runtime_db.get_buyer_profile(address).await?;
     if let Some(profile) = cached.as_ref() {
         if now_ms().saturating_sub(profile.fetched_at_ms) <= BUYER_CACHE_TTL_MS {
             return Ok(profile.clone());
@@ -3577,7 +3592,7 @@ async fn fetch_buyer_profile(
         first_funder: snapshot.first_funder,
         fetched_at_ms: now_ms(),
     };
-    shared.db.upsert_buyer_profile(&profile).await?;
+    shared.runtime_db.upsert_buyer_profile(&profile).await?;
     Ok(profile)
 }
 
@@ -3853,7 +3868,7 @@ async fn get_persisted_address_snapshot(
     max_age_ms: u64,
 ) -> Option<AddressSnapshot> {
     let record = shared
-        .db
+        .runtime_db
         .get_address_snapshot(address)
         .await
         .ok()
@@ -3881,7 +3896,7 @@ async fn cache_address_snapshot(
     let fetched_at_ms = now_ms();
     cache_address_snapshot_memory(shared, address, snapshot.clone(), fetched_at_ms).await;
     if let Err(err) = shared
-        .db
+        .runtime_db
         .upsert_address_snapshot(&AddressSnapshotRecord {
             address: address.to_string(),
             oldest_tx_ms: snapshot.oldest_tx_ms,
@@ -4067,12 +4082,15 @@ async fn refresh_dynamic_hot_keywords(shared: &SharedState) -> Result<()> {
     ];
 
     shared
-        .db
+        .runtime_db
         .replace_dynamic_keywords("dynamic_hot_refresh", &[])
         .await?;
     let mut merged = HashMap::new();
     for (source, records) in &source_records {
-        shared.db.replace_dynamic_keywords(source, records).await?;
+        shared
+            .runtime_db
+            .replace_dynamic_keywords(source, records)
+            .await?;
         for record in records {
             merge_narrative_keyword_record(&mut merged, record);
         }
@@ -4361,7 +4379,7 @@ async fn reload_hotlists(shared: &SharedState) -> Result<()> {
     let smart_money_funders = load_plaintext_set(&shared.config.smart_money_funder_file).await?;
     let blocked_buyers = load_plaintext_set(&shared.config.blocked_buyers_file).await?;
     let dynamic_hot_keywords = load_plaintext_set(&shared.config.dynamic_hot_keywords_file).await?;
-    let active_dynamic_keywords = shared.db.list_active_dynamic_keywords(now).await?;
+    let active_dynamic_keywords = shared.runtime_db.list_active_dynamic_keywords(now).await?;
     let mut narrative_terms = HashMap::new();
     for record in &active_dynamic_keywords {
         merge_narrative_keyword_record(&mut narrative_terms, record);
@@ -4387,8 +4405,8 @@ async fn reload_hotlists(shared: &SharedState) -> Result<()> {
         hotlists.dynamic_hot_keywords = narrative_terms.keys().cloned().collect();
         hotlists.narrative_terms = narrative_terms.clone();
     }
-    shared.db.sync_blacklist(&blacklist).await?;
-    shared.db.sync_smart_money(&smart_money).await?;
+    shared.runtime_db.sync_blacklist(&blacklist).await?;
+    shared.runtime_db.sync_smart_money(&smart_money).await?;
     info!(
         "Filter hotlists loaded | blacklist={} | smart_money={} | smart_money_funders={} | blocked_buyers={} | dynamic_hot_keywords={} | narrative_terms={}",
         blacklist.len(),
@@ -4611,7 +4629,7 @@ async fn record_token_outcome(
         reason: reason.clone(),
         ts: final_at_ms,
     };
-    if let Err(err) = shared.db.insert_filter_result(&record).await {
+    if let Err(err) = shared.runtime_db.insert_filter_result(&record).await {
         error!("filter: insert filter_results failed: {}", err);
     }
 
@@ -4644,7 +4662,7 @@ async fn record_token_outcome(
         early_buy_count,
         matched_buyers,
     };
-    if let Err(err) = shared.db.insert_filter_timing(&timing).await {
+    if let Err(err) = shared.runtime_db.insert_filter_timing(&timing).await {
         error!("filter: insert filter_timelines failed: {}", err);
     }
 
@@ -4686,7 +4704,7 @@ async fn record_token_outcome(
     if let Some(risk_signals) = risk_signals {
         if !risk_signals.is_empty() {
             if let Err(err) = shared
-                .db
+                .analytics_db
                 .replace_risk_signals(&token.mint, &risk_signals)
                 .await
             {
@@ -4724,7 +4742,7 @@ fn spawn_filter_persist_worker(
             match task {
                 FilterPersistTask::Gate1Artifacts(artifacts) => {
                     if let Err(err) = shared
-                        .db
+                        .runtime_db
                         .upsert_creator_template_count(
                             &artifacts.creator,
                             &artifacts.template_hash,
@@ -4740,7 +4758,7 @@ fn spawn_filter_persist_worker(
                         );
                     }
                     if let Some(record) = artifacts.uri_pattern_record.as_ref() {
-                        if let Err(err) = shared.db.upsert_uri_pattern(record).await {
+                        if let Err(err) = shared.runtime_db.upsert_uri_pattern(record).await {
                             warn!(
                                 "upsert uri pattern failed | mint={} | {}",
                                 artifacts.mint, err
@@ -4854,7 +4872,7 @@ fn spawn_post_trade_outcome_tracking(
             drawdown_metric,
             recorded_at_ms: now_ms(),
         };
-        if let Err(err) = shared.db.upsert_post_trade_outcome(&record).await {
+        if let Err(err) = shared.analytics_db.upsert_post_trade_outcome(&record).await {
             warn!(
                 "post-trade outcome persist failed | mint={} | {}",
                 token.mint, err
@@ -4894,7 +4912,7 @@ async fn persist_raw_new_token_event(shared: &SharedState, token: &NewToken) {
         recorded_at_ms: token.detected_at_ms,
         payload_json: payload.to_string(),
     };
-    if let Err(err) = shared.db.insert_raw_event(&record).await {
+    if let Err(err) = shared.analytics_db.insert_raw_event(&record).await {
         warn!("raw new_token insert failed: {}", err);
     }
 }
@@ -4993,7 +5011,7 @@ async fn persist_raw_buy_event(shared: &SharedState, buy: &PumpBuyEvent) {
         recorded_at_ms: buy.detected_at_ms,
         payload_json: payload.to_string(),
     };
-    if let Err(err) = shared.db.insert_raw_event(&record).await {
+    if let Err(err) = shared.analytics_db.insert_raw_event(&record).await {
         warn!("raw buy insert failed: {}", err);
     }
 }
@@ -5012,7 +5030,11 @@ async fn persist_entity_links_for_creator(
         rug_exposure: profile.rug_count,
         last_seen_ms: profile.fetched_at_ms,
     };
-    if let Err(err) = shared.db.upsert_funder_profile(&funder_profile).await {
+    if let Err(err) = shared
+        .runtime_db
+        .upsert_funder_profile(&funder_profile)
+        .await
+    {
         warn!("upsert funder profile failed | funder={} | {}", funder, err);
     }
     let cluster_id = cluster_id_for_funder(&funder);
@@ -5022,7 +5044,7 @@ async fn persist_entity_links_for_creator(
         cluster_type: "creator_funder".to_string(),
         score: 100,
     };
-    if let Err(err) = shared.db.upsert_cluster_member(&member).await {
+    if let Err(err) = shared.runtime_db.upsert_cluster_member(&member).await {
         warn!("upsert creator cluster member failed | {}", err);
     }
     let edge = ClusterEdgeRecord {
@@ -5031,7 +5053,7 @@ async fn persist_entity_links_for_creator(
         edge_type: "funds_creator".to_string(),
         weight: profile.total_tokens.max(1) as i32,
     };
-    if let Err(err) = shared.db.upsert_cluster_edge(&edge).await {
+    if let Err(err) = shared.runtime_db.upsert_cluster_edge(&edge).await {
         warn!("upsert creator cluster edge failed | {}", err);
     }
 }
@@ -5041,7 +5063,7 @@ async fn persist_entity_links_for_buyer(shared: &SharedState, mint: &str, profil
         return;
     };
     let current = shared
-        .db
+        .runtime_db
         .get_funder_profile(&funder)
         .await
         .ok()
@@ -5053,7 +5075,11 @@ async fn persist_entity_links_for_buyer(shared: &SharedState, mint: &str, profil
         rug_exposure: current.rug_exposure,
         last_seen_ms: profile.fetched_at_ms.max(current.last_seen_ms),
     };
-    if let Err(err) = shared.db.upsert_funder_profile(&funder_profile).await {
+    if let Err(err) = shared
+        .runtime_db
+        .upsert_funder_profile(&funder_profile)
+        .await
+    {
         warn!(
             "upsert buyer funder profile failed | funder={} | {}",
             funder, err
@@ -5066,7 +5092,7 @@ async fn persist_entity_links_for_buyer(shared: &SharedState, mint: &str, profil
         cluster_type: "buyer_funder".to_string(),
         score: 50,
     };
-    if let Err(err) = shared.db.upsert_cluster_member(&member).await {
+    if let Err(err) = shared.runtime_db.upsert_cluster_member(&member).await {
         warn!("upsert buyer cluster member failed | {}", err);
     }
     let edge = ClusterEdgeRecord {
@@ -5075,7 +5101,7 @@ async fn persist_entity_links_for_buyer(shared: &SharedState, mint: &str, profil
         edge_type: format!("funds_buyer:{}", mint),
         weight: 1,
     };
-    if let Err(err) = shared.db.upsert_cluster_edge(&edge).await {
+    if let Err(err) = shared.runtime_db.upsert_cluster_edge(&edge).await {
         warn!("upsert buyer cluster edge failed | {}", err);
     }
 }
@@ -5122,7 +5148,7 @@ async fn persist_launch_participation_edges(shared: &SharedState, candidate: &Ca
             edge_type: format!("launch_participation:{}", candidate.token.mint),
             weight: (shared.config.smart_money_max_buys.saturating_sub(*idx)).max(1) as i32,
         };
-        if let Err(err) = shared.db.upsert_cluster_edge(&launch_edge).await {
+        if let Err(err) = shared.runtime_db.upsert_cluster_edge(&launch_edge).await {
             warn!("upsert launch participation edge failed | {}", err);
         }
 
@@ -5137,7 +5163,7 @@ async fn persist_launch_participation_edges(shared: &SharedState, candidate: &Ca
                 cluster_type: "creator_launch_peer".to_string(),
                 score: 70,
             };
-            if let Err(err) = shared.db.upsert_cluster_member(&member).await {
+            if let Err(err) = shared.runtime_db.upsert_cluster_member(&member).await {
                 warn!("upsert creator launch cluster member failed | {}", err);
             }
         }
@@ -5152,7 +5178,7 @@ async fn persist_launch_participation_edges(shared: &SharedState, candidate: &Ca
                 edge_type: format!("launch_peer:{}", candidate.token.mint),
                 weight: 1,
             };
-            if let Err(err) = shared.db.upsert_cluster_edge(&peer_edge).await {
+            if let Err(err) = shared.runtime_db.upsert_cluster_edge(&peer_edge).await {
                 warn!("upsert launch peer edge failed | {}", err);
             }
 
@@ -5170,7 +5196,7 @@ async fn persist_launch_participation_edges(shared: &SharedState, candidate: &Ca
                         edge_type: format!("launch_funder_peer:{}", candidate.token.mint),
                         weight: 1,
                     };
-                    if let Err(err) = shared.db.upsert_cluster_edge(&peer_edge).await {
+                    if let Err(err) = shared.runtime_db.upsert_cluster_edge(&peer_edge).await {
                         warn!("upsert launch funder peer edge failed | {}", err);
                     }
                 }
@@ -5218,7 +5244,7 @@ async fn persist_candidate_analytics(
         threshold_hit_ms,
         recorded_at_ms: now_ms(),
     };
-    if let Err(err) = shared.db.insert_gate3_snapshot(&snapshot).await {
+    if let Err(err) = shared.analytics_db.insert_gate3_snapshot(&snapshot).await {
         warn!(
             "insert gate3 snapshot failed | mint={} | {}",
             candidate.token.mint, err
@@ -5250,7 +5276,7 @@ async fn persist_candidate_analytics(
             })
             .collect();
         if let Err(err) = shared
-            .db
+            .analytics_db
             .replace_gate3_sequences(&candidate.token.mint, &sequences)
             .await
         {
@@ -5345,7 +5371,11 @@ async fn persist_candidate_analytics(
             details_json: details.to_string(),
             recorded_at_ms: now_ms(),
         };
-        if let Err(err) = shared.db.insert_scoring_breakdown(&breakdown).await {
+        if let Err(err) = shared
+            .analytics_db
+            .insert_scoring_breakdown(&breakdown)
+            .await
+        {
             warn!(
                 "insert scoring breakdown failed | mint={} | {}",
                 candidate.token.mint, err
@@ -5362,7 +5392,7 @@ async fn persist_candidate_analytics(
     );
     if !risk_signals.is_empty() {
         if let Err(err) = shared
-            .db
+            .analytics_db
             .replace_risk_signals(&candidate.token.mint, &risk_signals)
             .await
         {
@@ -5375,7 +5405,11 @@ async fn persist_candidate_analytics(
 
     if shared.config.persist_label_suggestions {
         for suggestion in build_label_suggestions(candidate, passed, reject_gate, score, reason) {
-            if let Err(err) = shared.db.insert_label_suggestion(&suggestion).await {
+            if let Err(err) = shared
+                .analytics_db
+                .insert_label_suggestion(&suggestion)
+                .await
+            {
                 warn!(
                     "insert label suggestion failed | subject={} | {}",
                     suggestion.subject, err
@@ -5579,6 +5613,7 @@ mod tests {
             helius_api_key: None,
             coingecko_api_key: None,
             filter_db_path: String::new(),
+            analytics_db_path: String::new(),
             replay_db_path: String::new(),
             replay_mode_enabled: false,
             replay_pipeline_enabled: false,
@@ -5614,6 +5649,9 @@ mod tests {
             persist_scoring_breakdowns: true,
             persist_label_suggestions: true,
             persist_feed_health: true,
+            analytics_raw_event_retention_secs: 3_600,
+            analytics_metrics_retention_secs: 86_400,
+            analytics_execution_retention_secs: 604_800,
             smart_money_window_secs: 60,
             smart_money_fast_window_ms: 300,
             smart_money_soft_window_ms: 800,

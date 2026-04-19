@@ -1,0 +1,10 @@
+[Unit]
+Description=Run Rust Scanlink healthcheck every minute
+
+[Timer]
+OnBootSec=1min
+OnUnitActiveSec=1min
+Unit=rust-scanlink-healthcheck.service
+
+[Install]
+WantedBy=timers.target

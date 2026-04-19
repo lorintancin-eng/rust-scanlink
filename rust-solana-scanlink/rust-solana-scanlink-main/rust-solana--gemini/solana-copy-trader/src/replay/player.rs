@@ -34,20 +34,17 @@ pub async fn run_pipeline(
 ) -> Result<ReplayPipelineSummary> {
     prepare_replay_db(config).await?;
 
-    let source_db_path = if config.filter_db_path == config.replay_db_path {
-        &config.filter_db_path
+    let source_analytics_db_path = if config.analytics_db_path == config.replay_db_path {
+        &config.analytics_db_path
     } else {
         &config.replay_db_path
     };
-    let source_db = FilterDb::new(source_db_path).await?;
+    let source_db = FilterDb::new(source_analytics_db_path).await?;
     let raw_events = source_db.list_raw_events_window(from_ms, to_ms).await?;
     let source_event_count = raw_events.len();
     info!(
         "Replay pipeline source prepared | raw_events={} | source_db={} | from_ms={} | to_ms={}",
-        source_event_count,
-        source_db_path,
-        from_ms,
-        to_ms,
+        source_event_count, source_analytics_db_path, from_ms, to_ms,
     );
 
     let mut replayed_events = Vec::with_capacity(raw_events.len());
@@ -60,6 +57,7 @@ pub async fn run_pipeline(
 
     let mut replay_config = config.clone();
     replay_config.filter_db_path = config.replay_db_path.clone();
+    replay_config.analytics_db_path = config.replay_db_path.clone();
     replay_config.execution_enabled = false;
     replay_config.auto_sell_enabled = false;
     replay_config.replay_mode_enabled = false;
@@ -70,21 +68,23 @@ pub async fn run_pipeline(
         CommitmentConfig::confirmed(),
     ));
 
-    let (new_token_tx, new_token_rx) = mpsc::channel::<NewToken>(SCANNER_NEW_TOKEN_CHANNEL_CAPACITY);
+    let (new_token_tx, new_token_rx) =
+        mpsc::channel::<NewToken>(SCANNER_NEW_TOKEN_CHANNEL_CAPACITY);
     let (scanner_buy_tx, scanner_buy_rx) =
         mpsc::channel::<PumpBuyEvent>(SCANNER_BUY_CHANNEL_CAPACITY);
     let (buy_tx, mut buy_rx) = mpsc::channel(512);
-    let replay_filter_db = FilterDb::new(&replay_config.filter_db_path).await?;
+    let replay_runtime_db = FilterDb::new(&replay_config.filter_db_path).await?;
+    let replay_analytics_db = FilterDb::new(&replay_config.analytics_db_path).await?;
     let replay_config = Arc::new(replay_config);
-    let filter_task =
-        tokio::spawn(filter::run(
-            replay_config,
-            replay_filter_db,
-            rpc_client,
-            new_token_rx,
-            scanner_buy_rx,
-            buy_tx,
-        ));
+    let filter_task = tokio::spawn(filter::run(
+        replay_config,
+        replay_runtime_db,
+        replay_analytics_db,
+        rpc_client,
+        new_token_rx,
+        scanner_buy_rx,
+        buy_tx,
+    ));
     let buy_counter = tokio::spawn(async move {
         let mut count = 0usize;
         while buy_rx.recv().await.is_some() {
@@ -144,7 +144,7 @@ pub async fn run_pipeline(
 }
 
 async fn prepare_replay_db(config: &AppConfig) -> Result<()> {
-    let source = Path::new(&config.filter_db_path);
+    let source = Path::new(&config.analytics_db_path);
     let target = Path::new(&config.replay_db_path);
     if source == target {
         return Ok(());
@@ -169,7 +169,10 @@ fn snapshot_sqlite_db(source: &Path, target: &Path) -> Result<()> {
     let temp_target = replay_temp_path(target);
     if temp_target.exists() {
         std::fs::remove_file(&temp_target).with_context(|| {
-            format!("remove stale replay temp db failed: {}", temp_target.display())
+            format!(
+                "remove stale replay temp db failed: {}",
+                temp_target.display()
+            )
         })?;
     }
 

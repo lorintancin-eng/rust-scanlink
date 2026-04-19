@@ -30,8 +30,14 @@ pub async fn run(config: &AppConfig) -> Result<ReplayReport> {
     } else {
         &config.filter_db_path
     };
-    let db = FilterDb::new(report_db_path).await?;
-    let report = build_replay_report(&db, from_ms, report_to_ms).await?;
+    let runtime_db = FilterDb::new(report_db_path).await?;
+    let analytics_report_db_path = if config.replay_pipeline_enabled {
+        &config.replay_db_path
+    } else {
+        &config.analytics_db_path
+    };
+    let analytics_db = FilterDb::new(analytics_report_db_path).await?;
+    let report = build_replay_report(&runtime_db, &analytics_db, from_ms, report_to_ms).await?;
     write_report(&config.replay_report_file, &report).await?;
     log_report_summary(&report);
     info!(

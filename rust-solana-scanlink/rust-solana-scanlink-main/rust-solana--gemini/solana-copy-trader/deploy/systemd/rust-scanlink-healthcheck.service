@@ -1,0 +1,10 @@
+[Unit]
+Description=Rust Scanlink healthcheck and self-recovery
+After=network-online.target
+
+[Service]
+Type=oneshot
+User=ubuntu
+WorkingDirectory=/home/ubuntu/rust-scanlink
+EnvironmentFile=-/home/ubuntu/rust-scanlink/.env
+ExecStart=/usr/bin/bash /home/ubuntu/rust-scanlink/ops/scanner_healthcheck.sh

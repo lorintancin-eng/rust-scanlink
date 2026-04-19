@@ -55,19 +55,32 @@ pub struct FeedStatusSummary {
 }
 
 pub async fn build_runtime_report(
-    db: &FilterDb,
+    runtime_db: &FilterDb,
+    analytics_db: &FilterDb,
     config: &AppConfig,
     from_ms: u64,
     to_ms: u64,
 ) -> Result<RuntimeReport> {
-    let raw_events = db.list_raw_events_window(from_ms, to_ms).await?;
-    let raw_event_source_stats = db.list_raw_event_source_stats_window(from_ms, to_ms).await?;
-    let filter_results = db.list_filter_results_window(from_ms, to_ms).await?;
-    let filter_timings = db.list_filter_timings_window(from_ms, to_ms).await?;
-    let feed_health = db.list_feed_health_window(from_ms, to_ms).await?;
-    let feed_first_hits = db.list_feed_first_hits_window(from_ms, to_ms).await?;
-    let feed_latency_stats = db.list_feed_latency_stats_window(from_ms, to_ms).await?;
-    let execution_receipts = db.list_execution_receipts_window(from_ms, to_ms).await?;
+    let raw_events = analytics_db.list_raw_events_window(from_ms, to_ms).await?;
+    let raw_event_source_stats = analytics_db
+        .list_raw_event_source_stats_window(from_ms, to_ms)
+        .await?;
+    let filter_results = runtime_db
+        .list_filter_results_window(from_ms, to_ms)
+        .await?;
+    let filter_timings = runtime_db
+        .list_filter_timings_window(from_ms, to_ms)
+        .await?;
+    let feed_health = analytics_db.list_feed_health_window(from_ms, to_ms).await?;
+    let feed_first_hits = analytics_db
+        .list_feed_first_hits_window(from_ms, to_ms)
+        .await?;
+    let feed_latency_stats = analytics_db
+        .list_feed_latency_stats_window(from_ms, to_ms)
+        .await?;
+    let execution_receipts = analytics_db
+        .list_execution_receipts_window(from_ms, to_ms)
+        .await?;
 
     let feed_breakdown = count_by(raw_events.iter(), |row| row.feed_source.clone());
     let raw_event_source_stats = to_raw_event_source_stats(raw_event_source_stats);
@@ -92,7 +105,10 @@ pub async fn build_runtime_report(
         count_by(execution_receipts.iter(), |row| row.route_label.clone());
 
     let new_token_count = unique_event_mints(&raw_events, "new_token");
-    let buy_event_count = raw_events.iter().filter(|row| row.event_type == "buy").count();
+    let buy_event_count = raw_events
+        .iter()
+        .filter(|row| row.event_type == "buy")
+        .count();
     let pass_count = filter_results.iter().filter(|row| row.passed).count();
     let reject_count = filter_results.len().saturating_sub(pass_count);
     let overall_latency_ms = summarize_latency(filter_timings.iter().map(|row| row.latency_ms));
@@ -183,9 +199,9 @@ pub async fn persist_runtime_report(report: &RuntimeReport, path: &str) -> Resul
     let target = Path::new(path);
     if let Some(parent) = target.parent() {
         if !parent.as_os_str().is_empty() {
-            tokio::fs::create_dir_all(parent)
-                .await
-                .with_context(|| format!("create runtime report dir failed: {}", parent.display()))?;
+            tokio::fs::create_dir_all(parent).await.with_context(|| {
+                format!("create runtime report dir failed: {}", parent.display())
+            })?;
         }
     }
     let bytes = serde_json::to_vec_pretty(report).context("serialize runtime report failed")?;
@@ -226,11 +242,15 @@ fn summarize_latest_feed_statuses(rows: &[FeedHealthRecord]) -> Vec<FeedStatusSu
                 status: row.status.clone(),
                 ts_ms: row.ts_ms,
                 preferred: detail.get("preferred").and_then(|value| parse_bool(value)),
-                score: detail.get("score").and_then(|value| value.parse::<i64>().ok()),
+                score: detail
+                    .get("score")
+                    .and_then(|value| value.parse::<i64>().ok()),
                 first_hits: detail
                     .get("first_hits")
                     .and_then(|value| value.parse::<usize>().ok()),
-                stale_ms: detail.get("stale_ms").and_then(|value| value.parse::<u64>().ok()),
+                stale_ms: detail
+                    .get("stale_ms")
+                    .and_then(|value| value.parse::<u64>().ok()),
             }
         })
         .collect();
@@ -384,8 +404,7 @@ fn summarize_deshred_first_hit_rate(
     let numerator = rows
         .iter()
         .filter(|row| {
-            row.first_feed_source == deshred_feed_label
-                || row.first_feed_source.contains("deshred")
+            row.first_feed_source == deshred_feed_label || row.first_feed_source.contains("deshred")
         })
         .count();
     RateSummary {

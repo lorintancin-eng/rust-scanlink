@@ -120,20 +120,44 @@ pub struct ContributionSummary {
     pub avg_metric_60s: f64,
 }
 
-pub async fn build_replay_report(db: &FilterDb, from_ms: u64, to_ms: u64) -> Result<ReplayReport> {
-    let raw_events = db.list_raw_events_window(from_ms, to_ms).await?;
-    let raw_event_source_stats = db.list_raw_event_source_stats_window(from_ms, to_ms).await?;
-    let filter_results = db.list_filter_results_window(from_ms, to_ms).await?;
-    let filter_timings = db.list_filter_timings_window(from_ms, to_ms).await?;
-    let feed_health = db.list_feed_health_window(from_ms, to_ms).await?;
-    let feed_first_hits = db.list_feed_first_hits_window(from_ms, to_ms).await?;
-    let feed_latency_stats = db.list_feed_latency_stats_window(from_ms, to_ms).await?;
-    let _gate3_snapshots: Vec<Gate3SnapshotRecord> =
-        db.list_gate3_snapshots_window(from_ms, to_ms).await?;
-    let scoring_breakdowns = db.list_scoring_breakdowns_window(from_ms, to_ms).await?;
-    let label_suggestions = db.list_label_suggestions_window(from_ms, to_ms).await?;
-    let outcomes = db.list_post_trade_outcomes_window(from_ms, to_ms).await?;
-    let execution_receipts = db.list_execution_receipts_window(from_ms, to_ms).await?;
+pub async fn build_replay_report(
+    runtime_db: &FilterDb,
+    analytics_db: &FilterDb,
+    from_ms: u64,
+    to_ms: u64,
+) -> Result<ReplayReport> {
+    let raw_events = analytics_db.list_raw_events_window(from_ms, to_ms).await?;
+    let raw_event_source_stats = analytics_db
+        .list_raw_event_source_stats_window(from_ms, to_ms)
+        .await?;
+    let filter_results = runtime_db
+        .list_filter_results_window(from_ms, to_ms)
+        .await?;
+    let filter_timings = runtime_db
+        .list_filter_timings_window(from_ms, to_ms)
+        .await?;
+    let feed_health = analytics_db.list_feed_health_window(from_ms, to_ms).await?;
+    let feed_first_hits = analytics_db
+        .list_feed_first_hits_window(from_ms, to_ms)
+        .await?;
+    let feed_latency_stats = analytics_db
+        .list_feed_latency_stats_window(from_ms, to_ms)
+        .await?;
+    let _gate3_snapshots: Vec<Gate3SnapshotRecord> = analytics_db
+        .list_gate3_snapshots_window(from_ms, to_ms)
+        .await?;
+    let scoring_breakdowns = analytics_db
+        .list_scoring_breakdowns_window(from_ms, to_ms)
+        .await?;
+    let label_suggestions = analytics_db
+        .list_label_suggestions_window(from_ms, to_ms)
+        .await?;
+    let outcomes = analytics_db
+        .list_post_trade_outcomes_window(from_ms, to_ms)
+        .await?;
+    let execution_receipts = analytics_db
+        .list_execution_receipts_window(from_ms, to_ms)
+        .await?;
 
     let feed_breakdown = count_by(raw_events.iter(), |row| row.feed_source.clone());
     let raw_event_source_stats = to_raw_event_source_stats(raw_event_source_stats);
@@ -170,10 +194,8 @@ pub async fn build_replay_report(db: &FilterDb, from_ms: u64, to_ms: u64) -> Res
     );
     let first_hit_lag_ms =
         summarize_latency(feed_first_hits.iter().map(|row| row.lag_to_latest_ms));
-    let first_hit_lag_by_source = summarize_grouped_first_hit_latency(
-        &feed_first_hits,
-        |row| row.first_feed_source.clone(),
-    );
+    let first_hit_lag_by_source =
+        summarize_grouped_first_hit_latency(&feed_first_hits, |row| row.first_feed_source.clone());
     let top_passes = build_top_passes(&filter_results, &filter_timings, &scoring_breakdowns);
     let (dynamic_keyword_contribution, risk_signal_contribution, cluster_contribution) =
         summarize_contributions(&filter_results, &scoring_breakdowns, &outcomes);
@@ -362,7 +384,11 @@ fn summarize_feed_latency(rows: &[FeedLatencyStatRecord]) -> Vec<FeedLatencySumm
 fn summarize_deshred_first_hit_rate(rows: &[FeedFirstHitRecord]) -> RateSummary {
     let numerator = rows
         .iter()
-        .filter(|row| row.first_feed_source.to_ascii_lowercase().contains("deshred"))
+        .filter(|row| {
+            row.first_feed_source
+                .to_ascii_lowercase()
+                .contains("deshred")
+        })
         .count();
     let denominator = rows.len();
     RateSummary {
@@ -458,7 +484,10 @@ fn summarize_contributions(
 
     for row in scoring_breakdowns {
         let parsed: Value = serde_json::from_str(&row.details_json).unwrap_or_default();
-        let passed = passes_by_mint.get(row.mint.as_str()).copied().unwrap_or(false);
+        let passed = passes_by_mint
+            .get(row.mint.as_str())
+            .copied()
+            .unwrap_or(false);
         let metric_60s = outcome_60s_by_mint.get(row.mint.as_str()).copied();
 
         let dynamic_keywords = parsed

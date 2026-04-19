@@ -499,7 +499,7 @@ async fn main() -> Result<()> {
         config.coingecko_api_key.is_some(),
     );
     info!(
-        "Scanner feeds: mode={} | primary_label={} primary_url={} | secondary_label={} secondary_url={} | secondary_auto={} | account_url={} | deshred_label={} deshred_url={} | scanner_live_file={} scanned_file={} | persist_raw_events={} gate3_sequences={} scoring_breakdowns={} labels={} feed_health={} catchup_window_ms={} catchup_max_events={} failover_stale_ms={} health_snapshot_secs={} replay_db={} replay_report={}",
+        "Scanner feeds: mode={} | primary_label={} primary_url={} | secondary_label={} secondary_url={} | secondary_auto={} | account_url={} | deshred_label={} deshred_url={} | scanner_live_file={} scanned_file={} | runtime_db={} analytics_db={} | persist_raw_events={} gate3_sequences={} scoring_breakdowns={} labels={} feed_health={} | analytics_retention_secs raw={} metrics={} exec={} | catchup_window_ms={} catchup_max_events={} failover_stale_ms={} health_snapshot_secs={} replay_db={} replay_report={}",
         config.scanner_mode,
         config.scanner_primary_feed_label,
         config.scanner_grpc_url,
@@ -517,11 +517,16 @@ async fn main() -> Result<()> {
             .unwrap_or("-"),
         config.scanner_live_tokens_file,
         config.scanned_tokens_file,
+        config.filter_db_path,
+        config.analytics_db_path,
         config.persist_raw_scanner_events,
         config.persist_gate3_sequences,
         config.persist_scoring_breakdowns,
         config.persist_label_suggestions,
         config.persist_feed_health,
+        config.analytics_raw_event_retention_secs,
+        config.analytics_metrics_retention_secs,
+        config.analytics_execution_retention_secs,
         config.scanner_catchup_window_ms,
         config.scanner_catchup_max_events,
         config.scanner_failover_stale_ms,
@@ -547,8 +552,9 @@ async fn main() -> Result<()> {
         config.rpc_url.clone(),
         solana_sdk::commitment_config::CommitmentConfig::confirmed(),
     ));
-    let shared_filter_db = FilterDb::new(&config.filter_db_path).await?;
-    let execution_db = Arc::new(shared_filter_db.clone());
+    let runtime_db = FilterDb::new(&config.filter_db_path).await?;
+    let analytics_db = FilterDb::new(&config.analytics_db_path).await?;
+    let execution_db = Arc::new(analytics_db.clone());
     let execution_feedback = Arc::new(RwLock::new(ExecutionFeedback::default()));
 
     if config.execution_feedback_refresh_secs > 0 {
@@ -595,7 +601,8 @@ async fn main() -> Result<()> {
     }
 
     if config.runtime_report_enabled && config.runtime_report_interval_secs > 0 {
-        let runtime_db = execution_db.clone();
+        let runtime_db = Arc::new(runtime_db.clone());
+        let analytics_runtime_db = Arc::new(analytics_db.clone());
         let runtime_cfg = config.clone();
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(Duration::from_secs(
@@ -608,6 +615,7 @@ async fn main() -> Result<()> {
                     .saturating_sub(runtime_cfg.runtime_report_window_secs.saturating_mul(1000));
                 match build_runtime_report(
                     runtime_db.as_ref(),
+                    analytics_runtime_db.as_ref(),
                     runtime_cfg.as_ref(),
                     from_ms,
                     to_ms,
@@ -733,13 +741,15 @@ async fn main() -> Result<()> {
     }
 
     let scanner_cfg = config.clone();
-    let scanner_db = shared_filter_db.clone();
+    let scanner_runtime_db = runtime_db.clone();
+    let scanner_analytics_db = analytics_db.clone();
     let scanner_new_token_tx_task = scanner_new_token_tx.clone();
     let scanner_buy_tx_task = scanner_buy_tx.clone();
     tokio::spawn(async move {
         if let Err(err) = scanner::geyser::start(
             scanner_cfg,
-            Some(scanner_db),
+            Some(scanner_runtime_db),
+            Some(scanner_analytics_db),
             scanner_new_token_tx_task,
             scanner_buy_tx_task,
         )
@@ -750,12 +760,14 @@ async fn main() -> Result<()> {
     });
 
     let filter_cfg = config.clone();
-    let filter_db = shared_filter_db.clone();
+    let filter_runtime_db = runtime_db.clone();
+    let filter_analytics_db = analytics_db.clone();
     let filter_rpc = rpc_client.clone();
     tokio::spawn(async move {
         if let Err(err) = filter::run(
             filter_cfg,
-            filter_db,
+            filter_runtime_db,
+            filter_analytics_db,
             filter_rpc,
             scanner_new_token_rx,
             scanner_buy_rx,
