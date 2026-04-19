@@ -544,6 +544,7 @@ pub async fn run(
                 };
                 handle_gate1_result(
                     &shared,
+                    &internal_tx,
                     &creator_gate_result_tx,
                     &mut candidates,
                     result,
@@ -758,6 +759,7 @@ struct Gate1Decision {
 
 async fn handle_gate1_result(
     shared: &SharedState,
+    internal_tx: &mpsc::UnboundedSender<InternalMessage>,
     creator_gate_result_tx: &mpsc::Sender<CreatorGateResolved>,
     candidates: &mut HashMap<String, Candidate>,
     result: Gate1Result,
@@ -835,6 +837,21 @@ async fn handle_gate1_result(
         },
     );
 
+    if let Some(creator_gate_result) =
+        creator_gate_local_fast_result(shared, &token, gate2_task_spawned_at_ms).await?
+    {
+        handle_creator_gate_resolution(
+            shared,
+            internal_tx,
+            candidates,
+            token.mint.clone(),
+            token,
+            creator_gate_result,
+        )
+        .await;
+        return Ok(());
+    }
+
     let creator_gate_result_tx = creator_gate_result_tx.clone();
     let shared_clone = shared.clone();
     let token_clone = token.clone();
@@ -865,6 +882,75 @@ async fn handle_gate1_result(
     });
 
     Ok(())
+}
+
+async fn creator_gate_local_fast_result(
+    shared: &SharedState,
+    token: &NewToken,
+    task_spawned_at_ms: u64,
+) -> Result<Option<CreatorGateResult>> {
+    let creator_gate_entered_at_ms = now_ms();
+    if let Some(profile) =
+        get_cached_creator_profile(shared, &token.creator, CREATOR_CACHE_TTL_MS).await
+    {
+        let mut result = apply_creator_entity_rules(
+            shared,
+            apply_creator_rules(shared.config.as_ref(), profile),
+        )
+        .await?;
+        result.branch_tag = Some("fresh_cache_hit".to_string());
+        result.creator_gate_entered_at_ms = Some(creator_gate_entered_at_ms);
+        result.cache_lookup_done_at_ms = Some(now_ms());
+        result.refresh_launch_returned_at_ms = None;
+        result.task_spawned_at_ms = task_spawned_at_ms;
+        result.remote_started_at_ms = None;
+        result.result_ready_at_ms = now_ms();
+        return Ok(Some(result));
+    }
+
+    if let Some(profile) =
+        get_persisted_creator_profile(shared, &token.creator, CREATOR_CACHE_TTL_MS).await
+    {
+        let mut result = apply_creator_entity_rules(
+            shared,
+            apply_creator_rules(shared.config.as_ref(), profile),
+        )
+        .await?;
+        result.branch_tag = Some("persisted_cache_hit".to_string());
+        result.creator_gate_entered_at_ms = Some(creator_gate_entered_at_ms);
+        result.cache_lookup_done_at_ms = Some(now_ms());
+        result.refresh_launch_returned_at_ms = None;
+        result.task_spawned_at_ms = task_spawned_at_ms;
+        result.remote_started_at_ms = None;
+        result.result_ready_at_ms = now_ms();
+        return Ok(Some(result));
+    }
+
+    let cached = get_any_creator_profile(shared, &token.creator).await;
+    if shared.config.helius_api_key.is_none() {
+        let mut result = apply_creator_entity_rules(
+            shared,
+            CreatorGateResult {
+                passed: true,
+                reason: "gate2 pass: HELIUS_API_KEY not configured".to_string(),
+                profile: cached,
+                penalty_score: 0,
+                warning_tags: Vec::new(),
+                task_spawned_at_ms,
+                branch_tag: Some("no_api_key_soft_pass".to_string()),
+                creator_gate_entered_at_ms: Some(creator_gate_entered_at_ms),
+                cache_lookup_done_at_ms: Some(now_ms()),
+                refresh_launch_returned_at_ms: None,
+                remote_started_at_ms: None,
+                result_ready_at_ms: 0,
+            },
+        )
+        .await?;
+        result.result_ready_at_ms = now_ms();
+        return Ok(Some(result));
+    }
+
+    Ok(None)
 }
 
 async fn handle_creator_gate_resolution(
@@ -906,7 +992,7 @@ async fn handle_creator_gate_resolution(
     candidate.trace.gate2_remote_started_at_ms = result.remote_started_at_ms;
     candidate.trace.gate2_result_ready_at_ms = Some(result.result_ready_at_ms);
     candidate.trace.gate2_result_applied_at_ms = Some(gate2_applied_at_ms);
-    candidate.trace.gate2_at_ms = Some(gate2_applied_at_ms);
+    candidate.trace.gate2_at_ms = Some(result.result_ready_at_ms);
     if !result.passed {
         let candidate = candidates.remove(&mint).unwrap_or_else(|| unreachable!());
         record_candidate_outcome(
@@ -946,7 +1032,10 @@ async fn handle_creator_gate_resolution(
             },
         );
     }
-    candidate.trace.gate3_open_at_ms.get_or_insert_with(now_ms);
+    candidate
+        .trace
+        .gate3_open_at_ms
+        .get_or_insert(result.result_ready_at_ms);
 
     if let Some(trigger) = should_finalize(candidate, shared).await {
         candidate.status = CandidateStatus::Finalizing;
