@@ -3049,18 +3049,41 @@ async fn build_scoring_context(
     stats: &WindowStats,
     path: Gate3Path,
 ) -> ScoringContext {
-    let participants_score = match stats.unique_sm_wallets.len() {
-        0 => 0,
-        1 => 10,
-        2 => 20,
-        _ => 30,
+    let participants_score = match path {
+        Gate3Path::Fast => match stats.unique_sm_wallets.len() {
+            0 => 0,
+            1 => 20,
+            2 => 26,
+            _ => 30,
+        },
+        Gate3Path::Soft => match stats.unique_sm_wallets.len() {
+            0 => 0,
+            1 => 10,
+            2 => 20,
+            _ => 30,
+        },
     };
-    let capital_score = if stats.sm_sol_total >= 2.0 {
-        20
-    } else if stats.sm_sol_total >= 0.5 {
-        10
-    } else {
-        0
+    let capital_score = match path {
+        Gate3Path::Fast => {
+            if stats.sm_sol_total >= 1.0 {
+                20
+            } else if stats.sm_sol_total >= 0.5 {
+                15
+            } else if stats.sm_sol_total >= 0.2 {
+                10
+            } else {
+                0
+            }
+        }
+        Gate3Path::Soft => {
+            if stats.sm_sol_total >= 2.0 {
+                20
+            } else if stats.sm_sol_total >= 0.5 {
+                10
+            } else {
+                0
+            }
+        }
     };
     let momentum_score = if stats.buy_count >= 15 {
         20
@@ -3087,6 +3110,11 @@ async fn build_scoring_context(
         .await
         .unwrap_or(0.0);
     let buyer_quality_score = (buyer_quality_pct * 15.0).round().clamp(0.0, 15.0) as u32;
+    let buyer_quality_score = if path == Gate3Path::Fast && stats.eligible_buyers <= 1 {
+        buyer_quality_score.max(5)
+    } else {
+        buyer_quality_score
+    };
     let narrative = build_narrative_adjustment(candidate, shared, path);
     let dynamic_narrative_bonus = narrative
         .preheat_bonus
@@ -3095,7 +3123,9 @@ async fn build_scoring_context(
         .min(shared.config.dynamic_narrative_bonus_cap);
     let gate2_penalty_score = candidate.gate2_penalty_score;
     let gate2_warning_tags = candidate.gate2_warning_tags.clone();
-    let funder_diversity_penalty = if stats.eligible_buyers >= GATE3_MIN_UNIQUE_FUNDERS
+    let funder_diversity_penalty = if path == Gate3Path::Fast && stats.eligible_buyers <= 1 {
+        0
+    } else if stats.eligible_buyers >= GATE3_MIN_UNIQUE_FUNDERS
         && stats.unique_funders < GATE3_MIN_UNIQUE_FUNDERS
     {
         SINGLE_FUNDER_SCORE_PENALTY
@@ -5636,7 +5666,7 @@ mod tests {
             gate3_early_concentration_min_buys: 8,
             disable_smart_money_filter: false,
             filter_min_score: 60,
-            filter_fast_min_score: 48,
+            filter_fast_min_score: 30,
             filter_soft_min_score: 58,
             narrative_preheat_bonus_per_hit: 1,
             narrative_base_bonus_per_hit: 1,

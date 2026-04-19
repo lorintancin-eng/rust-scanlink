@@ -394,7 +394,7 @@ impl AppConfig {
             gate3_early_concentration_min_buys: env_parse("GATE3_EARLY_CONCENTRATION_MIN_BUYS", 8),
             disable_smart_money_filter: env_parse("DISABLE_SMART_MONEY_FILTER", false),
             filter_min_score: env_parse("FILTER_MIN_SCORE", 60),
-            filter_fast_min_score: env_parse("FILTER_FAST_MIN_SCORE", 48),
+            filter_fast_min_score: env_parse("FILTER_FAST_MIN_SCORE", 30),
             filter_soft_min_score: env_parse("FILTER_SOFT_MIN_SCORE", 58),
             narrative_preheat_bonus_per_hit: env_parse("NARRATIVE_PREHEAT_BONUS_PER_HIT", 1),
             narrative_base_bonus_per_hit: env_parse("NARRATIVE_BASE_BONUS_PER_HIT", 1),
