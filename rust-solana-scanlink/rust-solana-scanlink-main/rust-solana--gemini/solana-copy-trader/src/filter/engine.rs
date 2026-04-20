@@ -3212,6 +3212,69 @@ async fn build_scoring_context(
     }
 }
 
+fn sniper_single_buyer_reject_reason(
+    config: &AppConfig,
+    candidate: &Candidate,
+    stats: &WindowStats,
+    path: Gate3Path,
+    scoring: &ScoringContext,
+) -> Option<String> {
+    if !config.sniper_single_buyer_filter_enabled || path != Gate3Path::Fast {
+        return None;
+    }
+    if stats.unique_sm_wallets.len() > 1 || stats.eligible_buyers > 1 {
+        return None;
+    }
+
+    let narrative_hits = scoring.narrative.preheat_hits
+        + scoring.narrative.base_hits
+        + scoring.narrative.confirmed_hits;
+    let has_narrative_signal = narrative_hits > 0 || !candidate.narrative_keywords.is_empty();
+    let low_sol = stats.sm_sol_total < config.sniper_single_buyer_min_sol;
+    let low_quality = scoring.buyer_quality_pct < config.sniper_single_buyer_min_buyer_quality_pct;
+    let flat_curve = scoring.curve_progress_pct < config.sniper_single_buyer_max_curve_progress_pct;
+    let high_risk =
+        scoring.runtime_risk.penalty_score > config.sniper_single_buyer_max_runtime_risk_penalty;
+
+    if low_sol && flat_curve && low_quality && !has_narrative_signal {
+        return Some(format!(
+            "gate4 reject: sniper single-buyer microcap noise | matched={} | eligible={} | sol={:.2}/{:.2} | buyer_quality_pct={:.2}/{:.2} | curve_progress_pct={:.2}/{:.2} | risk_penalty={} | narrative_hits={} | narrative_keywords={}",
+            stats.unique_sm_wallets.len(),
+            stats.eligible_buyers,
+            stats.sm_sol_total,
+            config.sniper_single_buyer_min_sol,
+            scoring.buyer_quality_pct,
+            config.sniper_single_buyer_min_buyer_quality_pct,
+            scoring.curve_progress_pct,
+            config.sniper_single_buyer_max_curve_progress_pct,
+            scoring.runtime_risk.penalty_score,
+            narrative_hits,
+            if candidate.narrative_keywords.is_empty() {
+                "-".to_string()
+            } else {
+                candidate.narrative_keywords.join("|")
+            }
+        ));
+    }
+
+    if low_sol && flat_curve && high_risk {
+        return Some(format!(
+            "gate4 reject: sniper single-buyer risk-heavy microcap | matched={} | eligible={} | sol={:.2}/{:.2} | curve_progress_pct={:.2}/{:.2} | risk_penalty={}/{} | narrative_hits={}",
+            stats.unique_sm_wallets.len(),
+            stats.eligible_buyers,
+            stats.sm_sol_total,
+            config.sniper_single_buyer_min_sol,
+            scoring.curve_progress_pct,
+            config.sniper_single_buyer_max_curve_progress_pct,
+            scoring.runtime_risk.penalty_score,
+            config.sniper_single_buyer_max_runtime_risk_penalty,
+            narrative_hits
+        ));
+    }
+
+    None
+}
+
 async fn score_candidate(shared: &SharedState, mut candidate: Candidate) -> ScoreDecision {
     let stats = smart_money_stats(&candidate, shared).await;
     let Some(trigger) = gate3_trigger_from_stats(shared.config.as_ref(), &stats) else {
@@ -3292,6 +3355,30 @@ async fn score_candidate(shared: &SharedState, mut candidate: Candidate) -> Scor
             candidate.narrative_keywords.join("|")
         }
     );
+
+    if let Some(filter_reason) = sniper_single_buyer_reject_reason(
+        shared.config.as_ref(),
+        &candidate,
+        &stats,
+        trigger.path,
+        &scoring,
+    ) {
+        return ScoreDecision {
+            passed: false,
+            gate: "gate4".to_string(),
+            score: scoring.total_score,
+            quality_score: scoring.quality_score,
+            urgency_score: scoring.urgency_score,
+            execution_confidence: scoring.execution_confidence,
+            reason: format!("{} | {}", filter_reason, reason),
+            signal: None,
+            mode: smart_money_mode_label(stats.mode).to_string(),
+            path: "sniper_single_buyer_filter".to_string(),
+            matched_buyers: stats.unique_sm_wallets.len(),
+            early_buy_count: stats.buy_count,
+            gate4_at_ms: candidate.trace.gate4_at_ms,
+        };
+    }
 
     // Sniper mode bypass: once Gate3 triggers, do not let Gate4 score veto execution.
     let trigger_trade = select_trigger_trade(&candidate, shared)
@@ -5671,6 +5758,11 @@ mod tests {
             gate3_creator_self_buy_min_external_sol: 0.75,
             gate3_early_concentration_reject: true,
             gate3_early_concentration_min_buys: 8,
+            sniper_single_buyer_filter_enabled: true,
+            sniper_single_buyer_min_sol: 0.35,
+            sniper_single_buyer_min_buyer_quality_pct: 0.20,
+            sniper_single_buyer_max_curve_progress_pct: 0.50,
+            sniper_single_buyer_max_runtime_risk_penalty: 4,
             disable_smart_money_filter: false,
             filter_min_score: 60,
             filter_fast_min_score: 30,
@@ -6005,6 +6097,195 @@ mod tests {
         let reason =
             gate3_reject_reason(&candidate, &stats, &cfg).expect("creator self-buy reject");
         assert!(reason.contains("creator self-buy"));
+    }
+
+    #[test]
+    fn sniper_single_buyer_filter_rejects_low_signal_microcap_noise() {
+        let cfg = base_config();
+        let candidate = Candidate {
+            token: NewToken {
+                mint: "mint".to_string(),
+                name: "name".to_string(),
+                symbol: "sym".to_string(),
+                uri: String::new(),
+                creator: "creator".to_string(),
+                bonding_curve: String::new(),
+                signature: String::new(),
+                slot: 0,
+                detected_at_ms: 0,
+                instruction_data: Vec::new(),
+                instruction_accounts: Vec::new(),
+                feed_source: "test".to_string(),
+                is_v2: true,
+            },
+            created_at: Instant::now(),
+            detected_at_ms: 0,
+            status: CandidateStatus::Active,
+            gate1_risk: Gate1RiskProfile::default(),
+            narrative_keywords: Vec::new(),
+            dynamic_narrative_keywords: Vec::new(),
+            narrative_keyword_matches: Vec::new(),
+            gate2_penalty_score: 0,
+            gate2_warning_tags: Vec::new(),
+            early_buys: Vec::new(),
+            buy_signatures: HashSet::new(),
+            creator_profile: None,
+            buyer_profiles: HashMap::new(),
+            pending_buyer_profiles: HashSet::new(),
+            trace: CandidateTrace::default(),
+        };
+        let stats = WindowStats {
+            mode: SmartMoneyMode::EarlyBuyerFallback,
+            fast_threshold: 0,
+            soft_threshold: 0,
+            unique_sm_wallets: ["buyer".to_string()].into_iter().collect(),
+            sm_sol_total: 0.24,
+            total_eligible_sol: 0.24,
+            fastest_sm_ms: Some(4),
+            fast_reached_at_ms: Some(4),
+            soft_reached_at_ms: None,
+            buy_count: 1,
+            eligible_buyers: 1,
+            unique_funders: 0,
+            creator_funder_match_count: 0,
+            creator_funder_match_sol: 0.0,
+            max_single_buyer_share: 1.0,
+            max_single_buyer: Some("buyer".to_string()),
+            creator_buy_count: 0,
+            creator_buy_sol: 0.0,
+            largest_funder_cluster_size: 0,
+            largest_funder_cluster_share: 0.0,
+            hotlist_funder_hits: 0,
+            hotlist_funder_diversity: 0,
+            elapsed_ms: 4,
+        };
+        let scoring = ScoringContext {
+            participants_score: 20,
+            capital_score: 10,
+            momentum_score: 0,
+            curve_score: 0,
+            buyer_quality_score: 5,
+            dynamic_narrative_bonus: 0,
+            narrative: NarrativeAdjustment::default(),
+            gate2_penalty_score: 0,
+            gate2_warning_tags: Vec::new(),
+            funder_diversity_penalty: 0,
+            runtime_risk: RuntimeRiskProfile {
+                penalty_score: 2,
+                signals: Vec::new(),
+            },
+            cluster: ClusterAdjustment::default(),
+            curve_progress_pct: 0.0,
+            buyer_quality_pct: 0.0,
+            quality_score: 33,
+            urgency_score: 0,
+            execution_confidence: 33,
+            total_score: 33,
+            required_score: 30,
+        };
+
+        let reason =
+            sniper_single_buyer_reject_reason(&cfg, &candidate, &stats, Gate3Path::Fast, &scoring)
+                .expect("single buyer noise should reject");
+        assert!(reason.contains("microcap noise"));
+    }
+
+    #[test]
+    fn sniper_single_buyer_filter_allows_stronger_single_buyer_signal() {
+        let cfg = base_config();
+        let candidate = Candidate {
+            token: NewToken {
+                mint: "mint".to_string(),
+                name: "name".to_string(),
+                symbol: "sym".to_string(),
+                uri: String::new(),
+                creator: "creator".to_string(),
+                bonding_curve: String::new(),
+                signature: String::new(),
+                slot: 0,
+                detected_at_ms: 0,
+                instruction_data: Vec::new(),
+                instruction_accounts: Vec::new(),
+                feed_source: "test".to_string(),
+                is_v2: true,
+            },
+            created_at: Instant::now(),
+            detected_at_ms: 0,
+            status: CandidateStatus::Active,
+            gate1_risk: Gate1RiskProfile::default(),
+            narrative_keywords: vec!["trump".to_string()],
+            dynamic_narrative_keywords: Vec::new(),
+            narrative_keyword_matches: Vec::new(),
+            gate2_penalty_score: 0,
+            gate2_warning_tags: Vec::new(),
+            early_buys: Vec::new(),
+            buy_signatures: HashSet::new(),
+            creator_profile: None,
+            buyer_profiles: HashMap::new(),
+            pending_buyer_profiles: HashSet::new(),
+            trace: CandidateTrace::default(),
+        };
+        let stats = WindowStats {
+            mode: SmartMoneyMode::EarlyBuyerFallback,
+            fast_threshold: 0,
+            soft_threshold: 0,
+            unique_sm_wallets: ["buyer".to_string()].into_iter().collect(),
+            sm_sol_total: 0.42,
+            total_eligible_sol: 0.42,
+            fastest_sm_ms: Some(9),
+            fast_reached_at_ms: Some(9),
+            soft_reached_at_ms: None,
+            buy_count: 1,
+            eligible_buyers: 1,
+            unique_funders: 0,
+            creator_funder_match_count: 0,
+            creator_funder_match_sol: 0.0,
+            max_single_buyer_share: 1.0,
+            max_single_buyer: Some("buyer".to_string()),
+            creator_buy_count: 0,
+            creator_buy_sol: 0.0,
+            largest_funder_cluster_size: 0,
+            largest_funder_cluster_share: 0.0,
+            hotlist_funder_hits: 0,
+            hotlist_funder_diversity: 0,
+            elapsed_ms: 9,
+        };
+        let scoring = ScoringContext {
+            participants_score: 20,
+            capital_score: 15,
+            momentum_score: 0,
+            curve_score: 5,
+            buyer_quality_score: 5,
+            dynamic_narrative_bonus: 1,
+            narrative: NarrativeAdjustment {
+                preheat_hits: 1,
+                ..NarrativeAdjustment::default()
+            },
+            gate2_penalty_score: 0,
+            gate2_warning_tags: Vec::new(),
+            funder_diversity_penalty: 0,
+            runtime_risk: RuntimeRiskProfile {
+                penalty_score: 2,
+                signals: Vec::new(),
+            },
+            cluster: ClusterAdjustment::default(),
+            curve_progress_pct: 0.8,
+            buyer_quality_pct: 0.0,
+            quality_score: 40,
+            urgency_score: 1,
+            execution_confidence: 41,
+            total_score: 41,
+            required_score: 30,
+        };
+
+        assert!(sniper_single_buyer_reject_reason(
+            &cfg,
+            &candidate,
+            &stats,
+            Gate3Path::Fast,
+            &scoring,
+        )
+        .is_none());
     }
 
     #[test]

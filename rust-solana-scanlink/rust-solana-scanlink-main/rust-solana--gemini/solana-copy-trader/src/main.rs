@@ -449,7 +449,7 @@ async fn main() -> Result<()> {
 
     info!("Execution plan: {}", execution_plan.summary());
     info!(
-        "Gate3 windows: fast={}ms soft={}ms hard={}ms | thresholds: buyers_fast={} buyers_soft={} sol_fast={:.2} sol_soft={:.2} max_share={:.2} self_buy_max_sol={:.2} self_buy_max_share={:.2} self_buy_hard_sol={:.2} self_buy_hard_share={:.2} self_buy_min_external_buyers={} self_buy_min_external_sol={:.2} | gate4 fast_min={} soft_min={} global_min={} | smart_money_disabled={} | helius={} | creator_gate_timeout_ms={} sniper_fast_timeout_ms={} creator_gate_remote_concurrency={} creator_gate_cache_miss_retry_ms={} | hotlists: wallets={} funders={} blocked={}",
+        "Gate3 windows: fast={}ms soft={}ms hard={}ms | thresholds: buyers_fast={} buyers_soft={} sol_fast={:.2} sol_soft={:.2} max_share={:.2} self_buy_max_sol={:.2} self_buy_max_share={:.2} self_buy_hard_sol={:.2} self_buy_hard_share={:.2} self_buy_min_external_buyers={} self_buy_min_external_sol={:.2} | sniper_single_buyer_filter={} min_sol={:.2} min_quality={:.2} max_curve={:.2}% max_risk={} | gate4 fast_min={} soft_min={} global_min={} | smart_money_disabled={} | helius={} | creator_gate_timeout_ms={} sniper_fast_timeout_ms={} creator_gate_remote_concurrency={} creator_gate_cache_miss_retry_ms={} | hotlists: wallets={} funders={} blocked={}",
         config.smart_money_fast_window_ms,
         config.smart_money_soft_window_ms,
         config.gate3_hard_reject_ms,
@@ -464,6 +464,11 @@ async fn main() -> Result<()> {
         config.gate3_creator_self_buy_hard_share,
         config.gate3_creator_self_buy_min_external_buyers,
         config.gate3_creator_self_buy_min_external_sol,
+        config.sniper_single_buyer_filter_enabled,
+        config.sniper_single_buyer_min_sol,
+        config.sniper_single_buyer_min_buyer_quality_pct,
+        config.sniper_single_buyer_max_curve_progress_pct,
+        config.sniper_single_buyer_max_runtime_risk_penalty,
         config.filter_fast_min_score,
         config.filter_soft_min_score,
         config.filter_min_score,
