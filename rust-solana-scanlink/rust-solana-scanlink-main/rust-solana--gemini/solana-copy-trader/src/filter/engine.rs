@@ -3229,16 +3229,20 @@ fn sniper_single_buyer_reject_reason(
     let narrative_hits = scoring.narrative.preheat_hits
         + scoring.narrative.base_hits
         + scoring.narrative.confirmed_hits;
-    let has_narrative_signal = narrative_hits > 0 || !candidate.narrative_keywords.is_empty();
+    let strong_narrative_hits = scoring.narrative.base_hits + scoring.narrative.confirmed_hits;
+    let has_strong_narrative_signal = strong_narrative_hits > 0;
     let low_sol = stats.sm_sol_total < config.sniper_single_buyer_min_sol;
     let low_quality = scoring.buyer_quality_pct < config.sniper_single_buyer_min_buyer_quality_pct;
     let flat_curve = scoring.curve_progress_pct < config.sniper_single_buyer_max_curve_progress_pct;
     let high_risk =
         scoring.runtime_risk.penalty_score > config.sniper_single_buyer_max_runtime_risk_penalty;
+    let stronger_single_buyer_sol_floor = (config.sniper_single_buyer_min_sol + 0.15).min(1.0);
+    let stronger_single_buyer_quality_floor =
+        (config.sniper_single_buyer_min_buyer_quality_pct + 0.10).min(1.0);
 
-    if low_sol && flat_curve && low_quality && !has_narrative_signal {
+    if low_sol && flat_curve && low_quality && !has_strong_narrative_signal {
         return Some(format!(
-            "gate4 reject: sniper single-buyer microcap noise | matched={} | eligible={} | sol={:.2}/{:.2} | buyer_quality_pct={:.2}/{:.2} | curve_progress_pct={:.2}/{:.2} | risk_penalty={} | narrative_hits={} | narrative_keywords={}",
+            "gate4 reject: sniper single-buyer microcap noise | matched={} | eligible={} | sol={:.2}/{:.2} | buyer_quality_pct={:.2}/{:.2} | curve_progress_pct={:.2}/{:.2} | risk_penalty={} | narrative_hits={} | narrative_base_confirmed={} | narrative_keywords={}",
             stats.unique_sm_wallets.len(),
             stats.eligible_buyers,
             stats.sm_sol_total,
@@ -3249,6 +3253,7 @@ fn sniper_single_buyer_reject_reason(
             config.sniper_single_buyer_max_curve_progress_pct,
             scoring.runtime_risk.penalty_score,
             narrative_hits,
+            strong_narrative_hits,
             if candidate.narrative_keywords.is_empty() {
                 "-".to_string()
             } else {
@@ -3257,18 +3262,26 @@ fn sniper_single_buyer_reject_reason(
         ));
     }
 
-    if low_sol && flat_curve && high_risk {
+    if flat_curve
+        && !has_strong_narrative_signal
+        && high_risk
+        && stats.sm_sol_total < stronger_single_buyer_sol_floor
+        && scoring.buyer_quality_pct < stronger_single_buyer_quality_floor
+    {
         return Some(format!(
-            "gate4 reject: sniper single-buyer risk-heavy microcap | matched={} | eligible={} | sol={:.2}/{:.2} | curve_progress_pct={:.2}/{:.2} | risk_penalty={}/{} | narrative_hits={}",
+            "gate4 reject: sniper single-buyer risk-heavy microcap | matched={} | eligible={} | sol={:.2}/{:.2} | buyer_quality_pct={:.2}/{:.2} | curve_progress_pct={:.2}/{:.2} | risk_penalty={}/{} | narrative_hits={} | narrative_base_confirmed={}",
             stats.unique_sm_wallets.len(),
             stats.eligible_buyers,
             stats.sm_sol_total,
-            config.sniper_single_buyer_min_sol,
+            stronger_single_buyer_sol_floor,
+            scoring.buyer_quality_pct,
+            stronger_single_buyer_quality_floor,
             scoring.curve_progress_pct,
             config.sniper_single_buyer_max_curve_progress_pct,
             scoring.runtime_risk.penalty_score,
             config.sniper_single_buyer_max_runtime_risk_penalty,
-            narrative_hits
+            narrative_hits,
+            strong_narrative_hits
         ));
     }
 
@@ -5759,8 +5772,8 @@ mod tests {
             gate3_early_concentration_reject: true,
             gate3_early_concentration_min_buys: 8,
             sniper_single_buyer_filter_enabled: true,
-            sniper_single_buyer_min_sol: 0.35,
-            sniper_single_buyer_min_buyer_quality_pct: 0.20,
+            sniper_single_buyer_min_sol: 0.45,
+            sniper_single_buyer_min_buyer_quality_pct: 0.30,
             sniper_single_buyer_max_curve_progress_pct: 0.50,
             sniper_single_buyer_max_runtime_risk_penalty: 4,
             disable_smart_money_filter: false,
@@ -6252,9 +6265,107 @@ mod tests {
         };
         let scoring = ScoringContext {
             participants_score: 20,
-            capital_score: 15,
+            capital_score: 10,
             momentum_score: 0,
-            curve_score: 5,
+            curve_score: 0,
+            buyer_quality_score: 5,
+            dynamic_narrative_bonus: 1,
+            narrative: NarrativeAdjustment {
+                base_hits: 1,
+                ..NarrativeAdjustment::default()
+            },
+            gate2_penalty_score: 0,
+            gate2_warning_tags: Vec::new(),
+            funder_diversity_penalty: 0,
+            runtime_risk: RuntimeRiskProfile {
+                penalty_score: 2,
+                signals: Vec::new(),
+            },
+            cluster: ClusterAdjustment::default(),
+            curve_progress_pct: 0.0,
+            buyer_quality_pct: 0.0,
+            quality_score: 30,
+            urgency_score: 1,
+            execution_confidence: 31,
+            total_score: 31,
+            required_score: 30,
+        };
+
+        assert!(sniper_single_buyer_reject_reason(
+            &cfg,
+            &candidate,
+            &stats,
+            Gate3Path::Fast,
+            &scoring,
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn sniper_single_buyer_filter_rejects_preheat_only_microcap_noise() {
+        let cfg = base_config();
+        let candidate = Candidate {
+            token: NewToken {
+                mint: "mint".to_string(),
+                name: "name".to_string(),
+                symbol: "sym".to_string(),
+                uri: String::new(),
+                creator: "creator".to_string(),
+                bonding_curve: String::new(),
+                signature: String::new(),
+                slot: 0,
+                detected_at_ms: 0,
+                instruction_data: Vec::new(),
+                instruction_accounts: Vec::new(),
+                feed_source: "test".to_string(),
+                is_v2: true,
+            },
+            created_at: Instant::now(),
+            detected_at_ms: 0,
+            status: CandidateStatus::Active,
+            gate1_risk: Gate1RiskProfile::default(),
+            narrative_keywords: vec!["asteroid".to_string()],
+            dynamic_narrative_keywords: Vec::new(),
+            narrative_keyword_matches: Vec::new(),
+            gate2_penalty_score: 0,
+            gate2_warning_tags: Vec::new(),
+            early_buys: Vec::new(),
+            buy_signatures: HashSet::new(),
+            creator_profile: None,
+            buyer_profiles: HashMap::new(),
+            pending_buyer_profiles: HashSet::new(),
+            trace: CandidateTrace::default(),
+        };
+        let stats = WindowStats {
+            mode: SmartMoneyMode::EarlyBuyerFallback,
+            fast_threshold: 0,
+            soft_threshold: 0,
+            unique_sm_wallets: ["buyer".to_string()].into_iter().collect(),
+            sm_sol_total: 0.36,
+            total_eligible_sol: 0.36,
+            fastest_sm_ms: Some(6),
+            fast_reached_at_ms: Some(6),
+            soft_reached_at_ms: None,
+            buy_count: 1,
+            eligible_buyers: 1,
+            unique_funders: 0,
+            creator_funder_match_count: 0,
+            creator_funder_match_sol: 0.0,
+            max_single_buyer_share: 1.0,
+            max_single_buyer: Some("buyer".to_string()),
+            creator_buy_count: 0,
+            creator_buy_sol: 0.0,
+            largest_funder_cluster_size: 0,
+            largest_funder_cluster_share: 0.0,
+            hotlist_funder_hits: 0,
+            hotlist_funder_diversity: 0,
+            elapsed_ms: 6,
+        };
+        let scoring = ScoringContext {
+            participants_score: 20,
+            capital_score: 10,
+            momentum_score: 0,
+            curve_score: 0,
             buyer_quality_score: 5,
             dynamic_narrative_bonus: 1,
             narrative: NarrativeAdjustment {
@@ -6269,23 +6380,20 @@ mod tests {
                 signals: Vec::new(),
             },
             cluster: ClusterAdjustment::default(),
-            curve_progress_pct: 0.8,
+            curve_progress_pct: 0.0,
             buyer_quality_pct: 0.0,
-            quality_score: 40,
+            quality_score: 30,
             urgency_score: 1,
-            execution_confidence: 41,
-            total_score: 41,
+            execution_confidence: 31,
+            total_score: 31,
             required_score: 30,
         };
 
-        assert!(sniper_single_buyer_reject_reason(
-            &cfg,
-            &candidate,
-            &stats,
-            Gate3Path::Fast,
-            &scoring,
-        )
-        .is_none());
+        let reason =
+            sniper_single_buyer_reject_reason(&cfg, &candidate, &stats, Gate3Path::Fast, &scoring)
+                .expect("preheat-only single buyer noise should reject");
+        assert!(reason.contains("microcap noise"));
+        assert!(reason.contains("narrative_base_confirmed=0"));
     }
 
     #[test]

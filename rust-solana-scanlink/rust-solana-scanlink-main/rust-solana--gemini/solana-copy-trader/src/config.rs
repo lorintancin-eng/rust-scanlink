@@ -415,10 +415,10 @@ impl AppConfig {
                 "SNIPER_SINGLE_BUYER_FILTER_ENABLED",
                 true,
             ),
-            sniper_single_buyer_min_sol: env_parse("SNIPER_SINGLE_BUYER_MIN_SOL", 0.35),
+            sniper_single_buyer_min_sol: env_parse("SNIPER_SINGLE_BUYER_MIN_SOL", 0.45),
             sniper_single_buyer_min_buyer_quality_pct: env_parse(
                 "SNIPER_SINGLE_BUYER_MIN_BUYER_QUALITY_PCT",
-                0.20,
+                0.30,
             ),
             sniper_single_buyer_max_curve_progress_pct: env_parse(
                 "SNIPER_SINGLE_BUYER_MAX_CURVE_PROGRESS_PCT",
